@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   type AccessAudit,
   type CallReceipt,
+  type DispatchIdentity,
   GROUP_CHAT_CHECK_IDS,
   type GroupChatCheckId,
   type GroupChatCommand,
@@ -32,6 +33,10 @@ export interface GroupChatCheck {
  */
 export interface GroupChatJudgeContext {
   readonly findSourceLiterals: (terms: readonly string[]) => Promise<readonly string[]>;
+  readonly restartHost: (driver: GroupChatHostDriver) => Promise<{
+    readonly previous: { readonly pid: number; readonly commit: string };
+    readonly current: { readonly pid: number; readonly commit: string };
+  }>;
 }
 
 const groupChatCheckDefinitions: Omit<GroupChatCheck, "uses">[] = [
@@ -81,6 +86,33 @@ const groupChatCheckDefinitions: Omit<GroupChatCheck, "uses">[] = [
     ],
   },
   {
+    id: "GC-06",
+    title: "住户接力有界，重试、换代与重启不续杯",
+    scenario: [
+      "用 B=1 与 B=3 两份有限策略驱动同根住户接力，正文、消息 id 与发送者均变化",
+      "刺激 pass、失败、同操作重试、自报新根与跨进程重启，再读回回合高水位",
+      "上限后另发人类新触发；缺失或非法配置须禁止自动接力并留下系统原因",
+    ],
+  },
+  {
+    id: "GC-07",
+    title: "人类 stop/continue 走独立控制通道",
+    scenario: [
+      "先证明普通队列非空且有真实 held permit，再在不释放普通队列时提交授权 stop",
+      "引用的停、住户伪造与越权人类均不得改 latch；accepted/effective 分开",
+      "不可达与已发生外部副作用诚实外显；continue 解锁新许可但不复活旧许可",
+    ],
+  },
+  {
+    id: "GC-08",
+    title: "受压决定耐久，发送方离线后仍拿得到反馈",
+    scenario: [
+      "分别触发 batch、未纳入、stop 阻止与派发失败，发送方先离线再 query/wake",
+      "按 operation/sender 回读稳定原因码与计数；反馈不得带被拦原文或跨私域",
+      "注入下一次决定落盘失败；失败不得消费许可，恢复重试不得重复计数",
+    ],
+  },
+  {
     id: "GC-09",
     title: "系统收据只报阶段，不冒充成员已读或理解",
     scenario: [
@@ -90,12 +122,39 @@ const groupChatCheckDefinitions: Omit<GroupChatCheck, "uses">[] = [
     ],
   },
   {
+    id: "GC-10",
+    title: "投影显式标出缺口、截断与授权回源",
+    scenario: [
+      "对获准事件分别请求 batch 省略、最近子集和单条截断投影",
+      "截断长度、单位、保留范围与 source ref 必须进入模型实际可见上下文",
+      "隐藏双世界不得改可见计数/错误；撤权后旧引用与缓存不能继续回源",
+    ],
+  },
+  {
+    id: "GC-12",
+    title: "撤权、换代与 stop cutoff 后迟到结果 fail-closed",
+    scenario: [
+      "排队后撤成员资格并真正尝试投递，旧 roster version 不得续权",
+      "hold gen1 结果、换成 gen2 后实际送回旧结果；逐字段伪造完整目标身份",
+      "stop 生效后送回旧许可结果，再 continue 并只接受新许可结果",
+    ],
+  },
+  {
     id: "GC-15",
     title: "隐藏房间对未授权方不泄露存在及跨域内容",
     scenario: [
       "三个世界：隐藏房间内容不同的两个，加一个没有隐藏房间的，其余操作完全相同",
       "未授权住户读隐藏房间、以成员资格读另一住户的 scope、向错误房间重放公开载荷",
       "新成员不配置历史授权：按原账位置和事件 id 判，入群后的公开事件全可见，入群前的一条都不可见",
+    ],
+  },
+  {
+    id: "GC-16",
+    title: "单成员失败或失联不饿死房间与控制面",
+    scenario: [
+      "A 持续失败或真实 hold 到受控 deadline，B、人类与控制通道仍继续",
+      "按配置封顶 retry；同步快抛错不能冒充真实 wedge/timeout 证据",
+      "跨进程重启后失败记录与回合高水位不回退，反馈保留且不冒充成员在场",
     ],
   },
 ];
@@ -123,6 +182,30 @@ const methodsByCheck: Record<GroupChatCheckId, readonly (keyof GroupChatHostDriv
   ],
   "GC-04": ["startHost", "resetScenario", "perform", "readRoster", "readRosterPath"],
   "GC-05": ["startHost", "resetScenario", "perform", "readMentionDecisions", "readCallLedger"],
+  "GC-06": [
+    "startHost",
+    "restartHost",
+    "resetScenario",
+    "perform",
+    "readRoundRecords",
+    "readRoomEvents",
+  ],
+  "GC-07": [
+    "startHost",
+    "resetScenario",
+    "perform",
+    "readScheduler",
+    "readControlRecords",
+    "readMemberResults",
+  ],
+  "GC-08": [
+    "startHost",
+    "restartHost",
+    "resetScenario",
+    "perform",
+    "readDeliveryDecisions",
+    "readSenderFeedback",
+  ],
   "GC-09": [
     "startHost",
     "resetScenario",
@@ -133,6 +216,22 @@ const methodsByCheck: Record<GroupChatCheckId, readonly (keyof GroupChatHostDriv
     "readReactions",
     "readMemories",
   ],
+  "GC-10": [
+    "startHost",
+    "resetScenario",
+    "perform",
+    "readProjectionReceipts",
+    "readProjectionContext",
+    "readSourceReads",
+  ],
+  "GC-12": [
+    "startHost",
+    "resetScenario",
+    "perform",
+    "readRoster",
+    "readDeliveryDecisions",
+    "readMemberResults",
+  ],
   "GC-15": [
     "startHost",
     "resetScenario",
@@ -141,6 +240,19 @@ const methodsByCheck: Record<GroupChatCheckId, readonly (keyof GroupChatHostDriv
     "readSurface",
     "readResidentContext",
     "readAccessAudit",
+  ],
+  "GC-16": [
+    "startHost",
+    "restartHost",
+    "resetScenario",
+    "perform",
+    "readRoundRecords",
+    "readScheduler",
+    "readMemberAttempts",
+    "readSenderFeedback",
+    "readRoomEvents",
+    "readControlRecords",
+    "readSystemReceipts",
   ],
 };
 
@@ -546,6 +658,88 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
           "每次刺激恰好一条路由决定；只有结构化目标产生呼叫且目标正确；@名、裸名、非法目标和关闸都零呼叫；决定与呼叫账双向对得上",
       };
     }
+    case "GC-06": {
+      const e = evidence as GroupChatEvidenceById["GC-06"];
+      if (
+        e.boundedWorlds.length !== 2 ||
+        e.boundedWorlds.map(({ budget }) => budget).join() !== "1,3"
+      )
+        return fail("未用 B=1 与 B=3 两个世界刺激有限回合边界");
+      for (const world of e.boundedWorlds) {
+        if (world.permitted !== world.budget || world.blocked < 1)
+          return fail(`B=${world.budget} 没有恰好放行 B 次并截住第 B+1 次`);
+        if (!world.oneRoot) return fail(`B=${world.budget} 的住户链逃逸到另一个根`);
+        if (!world.policyVersionStable) return fail(`B=${world.budget} 的决定没有固定策略版本`);
+      }
+      if (!e.passRecorded || !e.failureRecorded) return fail("pass 或实际失败尝试没有可查记录");
+      if (e.retryAddedDispatch) return fail("同操作重试重复计数或重复派发");
+      if (e.identityChangesResetBudget) return fail("换发送者、消息身份或代际重置了同根预算");
+      if (!e.generationChangeStimulated) return fail("换代负例没有携带并读回新的目标 generation");
+      if (e.selfRootAccepted) return fail("住户自报新根获得了额外预算");
+      if (!e.restartPidChanged || !e.restartCommitStable)
+        return fail("重启没有换真实进程，或前后代码 commit 不同");
+      if (e.highWaterAfterRestart !== e.highWaterBeforeRestart)
+        return fail("重启洗掉了房间回合高水位");
+      if (!e.humanAfterLimitAccepted) return fail("机器人上限吞掉了新的人类触发");
+      if (e.invalidConfigDispatched || !e.invalidConfigReasoned)
+        return fail("缺失/非法有限配置仍自动接力，或没有系统原因");
+      return {
+        passed: true,
+        detail: "B=1/B=3 同根有界；重试/身份/代际不续杯；重启续账；人类新触发与配置失败外显",
+      };
+    }
+    case "GC-07": {
+      const e = evidence as GroupChatEvidenceById["GC-07"];
+      if (e.ordinaryQueueDepthBeforeControl < 1 || !e.heldBeforeControl)
+        return fail("stop 负例没有先建立非空普通队列与真实在途许可");
+      if (!e.acceptedAndEffectiveSeparated) return fail("控制接收与实际生效被合成一张回执");
+      if (!e.stopAcceptedBeforeQueueRelease || !e.stopEffective)
+        return fail("合法 stop 没有在普通队列释放前经独立通道接收并生效");
+      if (e.oldPermitCommitted) return fail("stop cutoff 前的旧许可结果仍被提交");
+      if (e.falseControlsChangedLatch) return fail("引用文本、住户伪造或越权控制改变了 latch");
+      if (!e.unreachableReportedIncomplete) return fail("目标不可达时伪报控制已生效");
+      if (e.externalEffectClaimedReversed) return fail("已发生的外部副作用被伪报撤回");
+      if (!e.continueEffectiveWhileQueueBlocked || !e.postContinueNewPermitCommitted)
+        return fail("continue 等待普通队列或没有解锁一枚新的许可");
+      return {
+        passed: true,
+        detail: "非空队列与 held permit 下 stop/continue 独立；伪造控制无效；双回执与 cutoff 诚实",
+      };
+    }
+    case "GC-08": {
+      const e = evidence as GroupChatEvidenceById["GC-08"];
+      const expectedStates = ["batched", "not-included", "stop-blocked", "dispatch-failed"];
+      for (const state of expectedStates) {
+        const rows = e.decisions.filter((row) => row.state === state);
+        if (
+          rows.length !== 1 ||
+          !rows[0]?.operationId ||
+          !rows[0]?.senderId ||
+          !rows[0]?.reasonCode ||
+          !Number.isSafeInteger(rows[0]?.count) ||
+          (rows[0]?.count ?? 0) < 1
+        )
+          return fail(`${state} 决定缺操作归属、稳定原因码或计数`);
+      }
+      if (e.offlineFeedbackMarkedDelivered) return fail("发送方离线时反馈已冒充 delivered");
+      if (
+        e.deliveredFeedback.length !== expectedStates.length ||
+        e.deliveredFeedback.some(
+          (feedback) => feedback.phase !== "delivered" || feedback.deliveryReceipt === null,
+        )
+      )
+        return fail("query/wake 没有交付四类结构化反馈与真实 delivery receipt");
+      if (e.crossSenderFeedback.length > 0) return fail("反馈跨发送方或私域递送");
+      if (e.leakedBlockedBody) return fail("反馈夹带了被拦原文");
+      if (!e.stableReasonsAcrossRestart) return fail("同一决定的原因码在重启后漂移");
+      if (e.persistFailureConsumedPermit) return fail("决定落盘失败仍消费了许可");
+      if (e.persistedDecisionCountAfterRetry !== 1)
+        return fail("决定落盘恢复后没有恰好留一份持久决定/计数");
+      return {
+        passed: true,
+        detail: "四类决定可归属；离线待取；query/wake 真反馈；零原文/跨域泄漏；落盘失败可恢复",
+      };
+    }
     case "GC-09": {
       const e = evidence as GroupChatEvidenceById["GC-09"];
       const systemReceipts = e.receipts.filter((receipt) => receipt.actor === "system");
@@ -590,6 +784,76 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         detail: "收据署名系统且阶段准确；未代发 reaction；装入不写记忆；本人 reaction 保留作者",
       };
     }
+    case "GC-10": {
+      const e = evidence as GroupChatEvidenceById["GC-10"];
+      const completeProjection = (projection: GroupChatEvidenceById["GC-10"]["batch"]) =>
+        projection !== null &&
+        projection.sourceRange[0].length > 0 &&
+        projection.sourceRange[1].length > 0 &&
+        projection.watermark.length > 0 &&
+        projection.policyVersion.length > 0 &&
+        projection.complete === false;
+      if (!completeProjection(e.batch) || (e.batch?.omittedEventIds.length ?? 0) < 1)
+        return fail("batch 投影没有外显授权范围、水位、策略与省略缺口");
+      if (!completeProjection(e.latest) || (e.latest?.omittedEventIds.length ?? 0) < 1)
+        return fail("最近子集被冒充完整房间史");
+      const truncation = e.truncated?.truncations[0];
+      if (
+        !completeProjection(e.truncated) ||
+        truncation === undefined ||
+        truncation.originalLength <= truncation.keptEnd - truncation.keptStart ||
+        truncation.unit !== "characters" ||
+        truncation.sourceRef.length === 0 ||
+        !truncation.modelVisible
+      )
+        return fail("单条截断缺原长、单位、保留范围、回源引用或模型可见标记");
+      for (const value of [
+        truncation.sourceRef,
+        String(truncation.originalLength),
+        truncation.unit,
+        `${truncation.keptStart}:${truncation.keptEnd}`,
+      ]) {
+        if (!e.projectionContext.includes(value))
+          return fail("截断元数据没有进入模型实际可见上下文");
+      }
+      if (e.hiddenWorldFingerprints.length !== 3 || new Set(e.hiddenWorldFingerprints).size !== 1)
+        return fail("隐藏内容或其存在通过投影计数、错误或回执泄漏");
+      if (
+        e.grantedRead?.outcome !== "granted" ||
+        e.grantedRead.eventId !== truncation.eventId ||
+        !e.grantedRead.body?.includes("TEST-GC10-LONG-")
+      )
+        return fail("授权时 source ref 没有回到同一原事件");
+      if (
+        e.deniedRead?.outcome !== "denied" ||
+        e.deniedRead.eventId !== null ||
+        e.deniedRead.body !== null
+      )
+        return fail("撤权后旧 source ref 或缓存仍可回源");
+      return {
+        passed: true,
+        detail: "batch/latest 缺口透明；截断元数据模型可见；隐藏世界不泄漏；回源逐次重验授权",
+      };
+    }
+    case "GC-12": {
+      const e = evidence as GroupChatEvidenceById["GC-12"];
+      if (e.revokedDeliveryCommitted || !e.revokedDeliveryReasoned || !e.rosterVersionAdvanced)
+        return fail("实际投递前没有按新成员表/权限重验，或拒绝没有可归属证据");
+      if (!e.staleResultActuallyReturned)
+        return fail("旧 generation 结果没有实际送回宿主，迟到负例空转");
+      if (e.staleResultCommitted || !e.staleResultReasoned)
+        return fail("旧 scope/window generation 的结果进入了新窗或没有拒绝证据");
+      if (!e.stoppedResultActuallyReturned)
+        return fail("stop cutoff 后的旧许可结果没有实际送回宿主");
+      if (e.stoppedResultCommitted || !e.postContinueResultCommitted)
+        return fail("stop 前许可在 continue 后复活，或新许可没有正常提交");
+      if (e.forgedTupleAttempts !== 6 || e.forgedTupleCommits !== 0 || e.currentTupleCommits !== 1)
+        return fail("完整目标六字段的伪造负例或当前身份正对照不成立");
+      return {
+        passed: true,
+        detail: "成员撤权在发送前重验；旧代际与 cutoff 结果实返实拒；六字段绑定且新许可可提交",
+      };
+    }
     case "GC-15": {
       const e = evidence as GroupChatEvidenceById["GC-15"];
       if (
@@ -618,6 +882,29 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         passed: true,
         detail:
           "三世界差分无隐藏域痕迹；跨住户 scope 读取被拒且零泄漏；新成员无默认历史；公开载荷不跨房",
+      };
+    }
+    case "GC-16": {
+      const e = evidence as GroupChatEvidenceById["GC-16"];
+      if (
+        e.failuresAfterRestart < e.failuresBeforeRestart ||
+        e.highWaterAfterRestart < e.highWaterBeforeRestart
+      )
+        return fail("partial restart 洗掉了故障记录或已消费回合高水位");
+      if (e.failedMemberAttempts.length < 1) return fail("故障成员没有留下实际失败/未决尝试");
+      if (!e.normalMemberCompleted || !e.humanContinued || !e.controlContinued)
+        return fail("单成员故障饿死了正常成员、人类消息或控制通道");
+      if (!e.heldWasActuallyInFlight) return fail("同步快抛错冒充了不交许可的 wedge/timeout 场景");
+      if (!e.heldTimedOut) return fail("失联成员没有在受控 scheduler 的 deadline 后有界收口");
+      if (!e.attemptsWithinBound) return fail("故障成员发生无界自动重试");
+      if (!e.restartPidChanged || !e.restartCommitStable)
+        return fail("故障恢复没有换真实进程，或前后代码 commit 不同");
+      if (!e.failureFeedbackRetained) return fail("成员失败反馈在离线/重启后丢失");
+      if (e.falsePresenceClaims.length > 0) return fail("故障/未决结果冒充模型在场或讨论有产出");
+      return {
+        passed: true,
+        detail:
+          "失败与真实 wedge 均有界；B、人类、控制继续；重启保留 attempt/high-water/反馈且不假在场",
       };
     }
   }
@@ -1031,6 +1318,457 @@ export async function runGroupChatCheck(
         structuredTargetId: target,
       });
     }
+    case "GC-06": {
+      if (context === undefined) throw new Error("GC-06 needs restartHost judge support");
+      const boundedWorlds: GroupChatEvidenceById["GC-06"]["boundedWorlds"][number][] = [];
+      for (const budget of [1, 3]) {
+        await driver.resetScenario(id, fixture);
+        await act({
+          kind: "configure-orchestration",
+          rootId: fixture.roots.first,
+          policyVersion: `test-policy:B${budget}`,
+          turnBudget: budget,
+          deadlineTicks: 2,
+          maxMemberAttempts: 2,
+        });
+        await act({
+          kind: "human-trigger",
+          operationId: `gc06-human-${budget}`,
+          rootId: fixture.roots.first,
+          body: `TEST-GC06-HUMAN-B${budget}`,
+        });
+        for (let index = 0; index <= budget; index += 1) {
+          const residentId = index % 2 === 0 ? fixture.residentIds.a : fixture.residentIds.b;
+          await act({ kind: "set-member-behavior", residentId, behavior: "complete" });
+          await act({
+            kind: "member-turn",
+            operationId: `gc06-B${budget}-turn-${index + 1}`,
+            rootId: fixture.roots.first,
+            residentId,
+            body: `TEST-GC06-B${budget}-TURN-${index + 1}`,
+          });
+        }
+        const records = await driver.readRoundRecords();
+        const residentRecords = records.filter((record) => record.senderId !== fixture.humanId);
+        boundedWorlds.push({
+          budget,
+          permitted: residentRecords.filter((record) => record.decision === "permitted").length,
+          blocked: residentRecords.filter((record) => record.decision === "blocked").length,
+          oneRoot: residentRecords.every((record) => record.rootId === fixture.roots.first),
+          policyVersionStable: residentRecords.every(
+            (record) => record.policyVersion === `test-policy:B${budget}`,
+          ),
+        });
+      }
+
+      await driver.resetScenario(id, fixture);
+      await act({
+        kind: "configure-orchestration",
+        rootId: fixture.roots.first,
+        policyVersion: "test-policy:edges",
+        turnBudget: 2,
+        deadlineTicks: 2,
+        maxMemberAttempts: 2,
+      });
+      await act({
+        kind: "human-trigger",
+        operationId: "gc06-edge-human",
+        rootId: fixture.roots.first,
+        body: "TEST-GC06-EDGE-HUMAN",
+      });
+      await act({
+        kind: "set-member-behavior",
+        residentId: fixture.residentIds.a,
+        behavior: "pass",
+      });
+      await act({
+        kind: "member-turn",
+        operationId: "gc06-pass",
+        rootId: fixture.roots.first,
+        residentId: fixture.residentIds.a,
+        body: "TEST-GC06-PASS",
+      });
+      await act({
+        kind: "set-member-behavior",
+        residentId: fixture.residentIds.b,
+        behavior: "fail",
+      });
+      await act({
+        kind: "member-turn",
+        operationId: "gc06-fail",
+        rootId: fixture.roots.first,
+        residentId: fixture.residentIds.b,
+        body: "TEST-GC06-FAIL",
+      });
+      const beforeRetryRecords = await driver.readRoundRecords();
+      const beforeRetryEvents = await driver.readRoomEvents(fixture.roomId);
+      await act({ kind: "retry-operation", operationId: "gc06-fail" });
+      const afterRetryRecords = await driver.readRoundRecords();
+      const afterRetryEvents = await driver.readRoomEvents(fixture.roomId);
+      await act({
+        kind: "set-member-behavior",
+        residentId: fixture.residentIds.a,
+        behavior: "complete",
+      });
+      await act({
+        kind: "member-turn",
+        operationId: "gc06-identity-change",
+        rootId: fixture.roots.first,
+        residentId: fixture.residentIds.a,
+        body: "TEST-GC06-IDENTITY-CHANGE",
+        target: {
+          residentId: fixture.residentIds.a,
+          scopeId: "test-scope:gc06",
+          scopeGeneration: 2,
+          windowId: "test-window:gc06",
+          generation: 2,
+          dispatchId: "test-dispatch:gc06-generation-2",
+        },
+      });
+      await act({
+        kind: "member-turn",
+        operationId: "gc06-self-root",
+        rootId: fixture.roots.first,
+        claimedRootId: fixture.roots.second,
+        residentId: fixture.residentIds.a,
+        body: "TEST-GC06-SELF-ROOT",
+      });
+      const beforeRestart = await driver.readRoundRecords();
+      const highWaterBeforeRestart = Math.max(0, ...beforeRestart.map((row) => row.consumedTurns));
+      const restarted = await context.restartHost(driver);
+      await act({
+        kind: "member-turn",
+        operationId: "gc06-after-restart",
+        rootId: fixture.roots.first,
+        residentId: fixture.residentIds.a,
+        body: "TEST-GC06-AFTER-RESTART",
+      });
+      const afterRestart = await driver.readRoundRecords();
+      const highWaterAfterRestart =
+        afterRestart.find((row) => row.operationId === "gc06-after-restart")?.consumedTurns ?? -1;
+      await act({
+        kind: "human-trigger",
+        operationId: "gc06-human-after-limit",
+        rootId: fixture.roots.second,
+        body: "TEST-GC06-HUMAN-AFTER-LIMIT",
+      });
+      const finalEdgeRecords = await driver.readRoundRecords();
+
+      await driver.resetScenario(id, fixture);
+      await act({
+        kind: "configure-orchestration",
+        rootId: fixture.roots.first,
+        policyVersion: "test-policy:invalid",
+        turnBudget: null,
+        deadlineTicks: 2,
+        maxMemberAttempts: 2,
+      });
+      await act({
+        kind: "human-trigger",
+        operationId: "gc06-invalid-human",
+        rootId: fixture.roots.first,
+        body: "TEST-GC06-INVALID-HUMAN",
+      });
+      await act({
+        kind: "member-turn",
+        operationId: "gc06-invalid-config",
+        rootId: fixture.roots.first,
+        residentId: fixture.residentIds.a,
+        body: "TEST-GC06-INVALID-CONFIG",
+      });
+      const invalidRecords = await driver.readRoundRecords();
+      const invalid = invalidRecords.filter((row) => row.operationId === "gc06-invalid-config");
+
+      return evaluateGroupChatEvidence(id, {
+        boundedWorlds,
+        retryAddedDispatch:
+          afterRetryEvents.length !== beforeRetryEvents.length ||
+          Math.max(0, ...afterRetryRecords.map((row) => row.consumedTurns)) !==
+            Math.max(0, ...beforeRetryRecords.map((row) => row.consumedTurns)),
+        passRecorded: beforeRestart.some(
+          (row) => row.operationId === "gc06-pass" && row.decision === "passed",
+        ),
+        failureRecorded: beforeRestart.some(
+          (row) => row.operationId === "gc06-fail" && row.decision === "failed",
+        ),
+        identityChangesResetBudget: finalEdgeRecords.some(
+          (row) => row.operationId === "gc06-identity-change" && row.decision === "permitted",
+        ),
+        generationChangeStimulated: finalEdgeRecords.some(
+          (row) =>
+            row.operationId === "gc06-identity-change" &&
+            row.target?.scopeGeneration === 2 &&
+            row.target.generation === 2,
+        ),
+        selfRootAccepted: finalEdgeRecords.some(
+          (row) => row.operationId === "gc06-self-root" && row.decision !== "blocked",
+        ),
+        restartPidChanged: restarted.previous.pid !== restarted.current.pid,
+        restartCommitStable: restarted.previous.commit === restarted.current.commit,
+        highWaterBeforeRestart,
+        highWaterAfterRestart,
+        humanAfterLimitAccepted: finalEdgeRecords.some(
+          (row) => row.operationId === "gc06-human-after-limit" && row.decision === "human-trigger",
+        ),
+        invalidConfigDispatched: invalid.some((row) => row.decision === "permitted"),
+        invalidConfigReasoned: invalid.some(
+          (row) => row.decision === "blocked" && (row.reasonCode?.length ?? 0) > 0,
+        ),
+      });
+    }
+    case "GC-07": {
+      const target = {
+        residentId: fixture.residentIds.a,
+        scopeId: "test-scope:gc07",
+        scopeGeneration: 1,
+        windowId: "test-window:gc07",
+        generation: 1,
+        dispatchId: "test-dispatch:gc07-old",
+      } as const;
+      await act({ kind: "set-delivery-target", target });
+      await act({ kind: "fill-ordinary-queue", depth: 3 });
+      await act({
+        kind: "set-member-behavior",
+        residentId: fixture.residentIds.a,
+        behavior: "hold",
+      });
+      await act({
+        kind: "configure-orchestration",
+        rootId: fixture.roots.first,
+        policyVersion: "test-policy:control",
+        turnBudget: 4,
+        deadlineTicks: 2,
+        maxMemberAttempts: 1,
+      });
+      await act({
+        kind: "human-trigger",
+        operationId: "gc07-human",
+        rootId: fixture.roots.first,
+        body: "TEST-GC07-HUMAN",
+      });
+      await act({
+        kind: "member-turn",
+        operationId: "gc07-old-permit",
+        rootId: fixture.roots.first,
+        residentId: fixture.residentIds.a,
+        body: "TEST-GC07-OLD-PERMIT",
+        target,
+      });
+      const beforeControl = await driver.readScheduler();
+      await act({
+        kind: "mark-external-effect",
+        operationId: "gc07-effect",
+        targetId: fixture.residentIds.a,
+      });
+      for (const command of [
+        {
+          kind: "submit-control" as const,
+          controlId: "gc07-quoted-stop",
+          issuerId: fixture.humanId,
+          targetId: fixture.residentIds.a,
+          action: "stop" as const,
+          structured: false,
+          binding: "test-control-binding:owner",
+        },
+        {
+          kind: "submit-control" as const,
+          controlId: "gc07-resident-forgery",
+          issuerId: fixture.residentIds.b,
+          targetId: fixture.residentIds.a,
+          action: "stop" as const,
+          structured: true,
+          binding: "test-control-binding:resident",
+        },
+        {
+          kind: "submit-control" as const,
+          controlId: "gc07-unauthorized-human",
+          issuerId: fixture.unauthorizedHumanId,
+          targetId: fixture.residentIds.a,
+          action: "stop" as const,
+          structured: true,
+          binding: "test-control-binding:outsider",
+        },
+      ])
+        await act(command);
+      const afterFalseControls = await driver.readScheduler();
+      await act({
+        kind: "submit-control",
+        controlId: "gc07-authorized-stop",
+        issuerId: fixture.humanId,
+        targetId: fixture.residentIds.a,
+        action: "stop",
+        structured: true,
+        binding: "test-control-binding:owner",
+      });
+      await act({
+        kind: "return-member-result",
+        operationId: "gc07-old-permit",
+        target,
+        body: "TEST-GC07-LATE-RESULT",
+      });
+      await act({
+        kind: "submit-control",
+        controlId: "gc07-unreachable",
+        issuerId: fixture.humanId,
+        targetId: fixture.residentIds.c,
+        action: "stop",
+        structured: true,
+        binding: "test-control-binding:owner",
+      });
+      await act({
+        kind: "submit-control",
+        controlId: "gc07-continue",
+        issuerId: fixture.humanId,
+        targetId: fixture.residentIds.a,
+        action: "continue",
+        structured: true,
+        binding: "test-control-binding:owner",
+      });
+      const newTarget = { ...target, dispatchId: "test-dispatch:gc07-new" };
+      await act({ kind: "set-delivery-target", target: newTarget });
+      await act({
+        kind: "member-turn",
+        operationId: "gc07-new-permit",
+        rootId: fixture.roots.first,
+        residentId: fixture.residentIds.a,
+        body: "TEST-GC07-NEW-PERMIT",
+        target: newTarget,
+      });
+      await act({
+        kind: "return-member-result",
+        operationId: "gc07-new-permit",
+        target: newTarget,
+        body: "TEST-GC07-NEW-RESULT",
+      });
+      const controls = await driver.readControlRecords();
+      const results = await driver.readMemberResults();
+      const finalScheduler = await driver.readScheduler();
+      const authorizedStop = controls.filter((row) => row.controlId === "gc07-authorized-stop");
+      return evaluateGroupChatEvidence(id, {
+        ordinaryQueueDepthBeforeControl: beforeControl.ordinaryQueueDepth,
+        heldBeforeControl: beforeControl.heldOperationIds.includes("gc07-old-permit"),
+        stopAcceptedBeforeQueueRelease:
+          authorizedStop.some((row) => row.phase === "accepted") &&
+          finalScheduler.ordinaryQueueDepth === beforeControl.ordinaryQueueDepth,
+        stopEffective: authorizedStop.some((row) => row.phase === "effective"),
+        oldPermitCommitted: results.some(
+          (row) => row.operationId === "gc07-old-permit" && row.phase === "committed",
+        ),
+        falseControlsChangedLatch:
+          afterFalseControls.stoppedResidentIds.length !== beforeControl.stoppedResidentIds.length,
+        acceptedAndEffectiveSeparated:
+          authorizedStop.some((row) => row.phase === "accepted") &&
+          authorizedStop.some((row) => row.phase === "effective") &&
+          new Set(authorizedStop.map((row) => row.sequence)).size === authorizedStop.length,
+        unreachableReportedIncomplete: controls.some(
+          (row) => row.controlId === "gc07-unreachable" && row.phase === "incomplete",
+        ),
+        externalEffectClaimedReversed: authorizedStop.some((row) => row.externalEffectReversed),
+        continueEffectiveWhileQueueBlocked:
+          controls.some((row) => row.controlId === "gc07-continue" && row.phase === "effective") &&
+          finalScheduler.ordinaryQueueDepth === beforeControl.ordinaryQueueDepth,
+        postContinueNewPermitCommitted: results.some(
+          (row) => row.operationId === "gc07-new-permit" && row.phase === "committed",
+        ),
+      });
+    }
+    case "GC-08": {
+      if (context === undefined) throw new Error("GC-08 needs restartHost judge support");
+      const sender = fixture.residentIds.a;
+      await act({
+        kind: "configure-orchestration",
+        rootId: fixture.roots.first,
+        policyVersion: "test-policy:feedback",
+        turnBudget: 8,
+        deadlineTicks: 2,
+        maxMemberAttempts: 2,
+      });
+      await act({
+        kind: "human-trigger",
+        operationId: "gc08-human",
+        rootId: fixture.roots.first,
+        body: "TEST-GC08-HUMAN",
+      });
+      await act({ kind: "set-sender-online", residentId: sender, online: false });
+      const stimuli = [
+        ["batch", "batch", "gc08-batch"],
+        ["not-included", "not-included", "gc08-not-included"],
+        ["stopped", "stop-blocked", "gc08-stopped"],
+        ["normal", "dispatch-failed", "gc08-dispatch-failed"],
+      ] as const;
+      for (const [mode, _state, operationId] of stimuli) {
+        await act({ kind: "set-pressure", residentId: sender, mode });
+        if (operationId === "gc08-dispatch-failed")
+          await act({ kind: "inject-next-fault", fault: "member-dispatch", residentId: sender });
+        await act({
+          kind: "member-turn",
+          operationId,
+          rootId: fixture.roots.first,
+          residentId: sender,
+          body: `${operationId} ${fixture.canaries.blocked}`,
+        });
+      }
+      const decisionsBeforeRestart = await driver.readDeliveryDecisions();
+      const pendingFeedback = await driver.readSenderFeedback(sender);
+      const otherFeedbackBefore = await driver.readSenderFeedback(fixture.residentIds.b);
+      const restarted = await context.restartHost(driver);
+      const decisionsAfterRestart = await driver.readDeliveryDecisions();
+      await act({ kind: "query-feedback", residentId: sender, via: "query" });
+      const deliveredFeedback = await driver.readSenderFeedback(sender);
+      const crossSenderFeedback = [
+        ...otherFeedbackBefore,
+        ...(await driver.readSenderFeedback(fixture.residentIds.b)),
+      ];
+
+      await act({ kind: "set-pressure", residentId: sender, mode: "batch" });
+      await act({ kind: "inject-next-fault", fault: "decision-persist" });
+      await act({
+        kind: "member-turn",
+        operationId: "gc08-persist-failure",
+        rootId: fixture.roots.first,
+        residentId: sender,
+        body: "TEST-GC08-PERSIST-FAILURE",
+      });
+      const afterPersistFailure = await driver.readDeliveryDecisions();
+      await act({ kind: "retry-operation", operationId: "gc08-persist-failure" });
+      const afterPersistRetry = await driver.readDeliveryDecisions();
+      const persisted = afterPersistRetry.filter(
+        (row) => row.operationId === "gc08-persist-failure" && row.state !== "persist-failed",
+      );
+      const reasonMap = (rows: readonly { operationId: string; reasonCode: string }[]) =>
+        new Map(
+          rows
+            .filter((row) => stimuli.some(([, , operationId]) => operationId === row.operationId))
+            .map((row) => [row.operationId, row.reasonCode]),
+        );
+      const reasonsBefore = reasonMap(decisionsBeforeRestart);
+      const reasonsAfter = reasonMap(decisionsAfterRestart);
+      return evaluateGroupChatEvidence(id, {
+        decisions: decisionsBeforeRestart.filter((row) =>
+          stimuli.some(([, , operationId]) => operationId === row.operationId),
+        ),
+        offlineFeedbackMarkedDelivered: pendingFeedback.some(
+          (feedback) => feedback.phase === "delivered",
+        ),
+        deliveredFeedback: deliveredFeedback.filter((feedback) =>
+          stimuli.some(([, , operationId]) => operationId === feedback.operationId),
+        ),
+        crossSenderFeedback,
+        leakedBlockedBody: deliveredFeedback.some((feedback) =>
+          (feedback.body ?? "").includes(fixture.canaries.blocked),
+        ),
+        stableReasonsAcrossRestart:
+          restarted.previous.pid !== restarted.current.pid &&
+          reasonsBefore.size === stimuli.length &&
+          [...reasonsBefore].every(
+            ([operationId, reason]) => reasonsAfter.get(operationId) === reason,
+          ),
+        persistFailureConsumedPermit: afterPersistFailure.some(
+          (row) => row.operationId === "gc08-persist-failure" && row.permitConsumed,
+        ),
+        persistedDecisionCountAfterRetry: persisted.length,
+      });
+    }
     case "GC-09": {
       const eventMarker = "TEST-GC09-RECEIPT-EVENT";
       const commitMarker = "TEST-GC09-CONTEXT-COMMIT";
@@ -1079,6 +1817,308 @@ export async function runGroupChatCheck(
         reactionAuthorsBeforeResidentReacted: reactionsBefore,
         reactionAuthorsAfterResidentReacted: reactionsAfter,
         memoryRecordsAddedByContextCommit: memoriesAfterCommit - memoriesAtStart,
+      });
+    }
+    case "GC-10": {
+      const runWorld = async (hiddenBodies: readonly string[]) => {
+        await driver.resetScenario(id, fixture);
+        await act({ kind: "set-room-access", residentId: fixture.residentIds.a, allowed: true });
+        const publicEvents = [
+          ["gc10-event-1", "TEST-GC10-PUBLIC-ONE"],
+          ["gc10-event-2", "TEST-GC10-PUBLIC-TWO"],
+          ["gc10-event-3", "TEST-GC10-LONG-".repeat(12)],
+          ["gc10-event-4", "TEST-GC10-PUBLIC-FOUR"],
+        ] as const;
+        for (const [eventId, body] of publicEvents)
+          await act({ kind: "seed-projection-event", eventId, body, authorized: true });
+        for (const [index, body] of hiddenBodies.entries())
+          await act({
+            kind: "seed-projection-event",
+            eventId: `gc10-hidden-${index + 1}`,
+            body,
+            authorized: false,
+          });
+        await act({
+          kind: "request-projection",
+          projectionId: "gc10-batch",
+          viewerId: fixture.residentIds.a,
+          mode: "batch",
+        });
+        await act({
+          kind: "request-projection",
+          projectionId: "gc10-latest",
+          viewerId: fixture.residentIds.a,
+          mode: "latest",
+        });
+        await act({
+          kind: "request-projection",
+          projectionId: "gc10-truncate",
+          viewerId: fixture.residentIds.a,
+          mode: "truncate",
+          maxCharacters: 24,
+        });
+        const receipts = await driver.readProjectionReceipts();
+        const contextText = await driver.readProjectionContext(fixture.residentIds.a);
+        return { receipts, contextText };
+      };
+      const worldA = await runWorld([`${fixture.canaries.hiddenProjection}:A`]);
+      const batch = worldA.receipts.find((row) => row.projectionId === "gc10-batch") ?? null;
+      const latest = worldA.receipts.find((row) => row.projectionId === "gc10-latest") ?? null;
+      const truncated = worldA.receipts.find((row) => row.projectionId === "gc10-truncate") ?? null;
+      const sourceRef = truncated?.truncations[0]?.sourceRef ?? "missing-source-ref";
+      await act({
+        kind: "attempt-source-read",
+        viewerId: fixture.residentIds.a,
+        sourceRef,
+      });
+      const grantedRead =
+        (await driver.readSourceReads()).find((row) => row.sourceRef === sourceRef) ?? null;
+      await act({ kind: "set-room-access", residentId: fixture.residentIds.a, allowed: false });
+      await act({
+        kind: "attempt-source-read",
+        viewerId: fixture.residentIds.a,
+        sourceRef,
+      });
+      const deniedRead =
+        (await driver.readSourceReads()).filter((row) => row.sourceRef === sourceRef).at(-1) ??
+        null;
+      const worldB = await runWorld([
+        `${fixture.canaries.hiddenProjection}:B`,
+        `${fixture.canaries.hiddenProjection}:C`,
+      ]);
+      const worldNone = await runWorld([]);
+      const fingerprint = (world: typeof worldA) =>
+        JSON.stringify({ receipts: world.receipts, contextText: world.contextText });
+      return evaluateGroupChatEvidence(id, {
+        batch,
+        latest,
+        truncated,
+        projectionContext: worldA.contextText,
+        hiddenWorldFingerprints: [fingerprint(worldA), fingerprint(worldB), fingerprint(worldNone)],
+        grantedRead,
+        deniedRead,
+      });
+    }
+    case "GC-12": {
+      const baseTarget = {
+        residentId: fixture.residentIds.a,
+        scopeId: "test-scope:gc12",
+        scopeGeneration: 1,
+        windowId: "test-window:gc12",
+        generation: 1,
+        dispatchId: "test-dispatch:gc12",
+      } as const;
+      const prepareWorld = async (target: DispatchIdentity) => {
+        await act({
+          kind: "configure-orchestration",
+          rootId: fixture.roots.first,
+          policyVersion: "test-policy:revocation",
+          turnBudget: 8,
+          deadlineTicks: 2,
+          maxMemberAttempts: 2,
+        });
+        await act({
+          kind: "human-trigger",
+          operationId: `gc12-human:${target.dispatchId}`,
+          rootId: fixture.roots.first,
+          body: "TEST-GC12-HUMAN",
+        });
+        await act({ kind: "set-room-membership", residentId: fixture.residentIds.a, active: true });
+        await act({ kind: "set-delivery-target", target });
+      };
+      await prepareWorld(baseTarget);
+      await act({ kind: "set-pressure", residentId: fixture.residentIds.a, mode: "cooling" });
+      await act({
+        kind: "member-turn",
+        operationId: "gc12-revoked-delivery",
+        rootId: fixture.roots.first,
+        residentId: fixture.residentIds.a,
+        body: "TEST-GC12-QUEUED",
+        target: baseTarget,
+      });
+      const rosterBefore = await driver.readRoster();
+      await act({ kind: "set-room-membership", residentId: fixture.residentIds.a, active: false });
+      const rosterAfter = await driver.readRoster();
+      await act({ kind: "attempt-delivery", operationId: "gc12-revoked-delivery" });
+      const revokedDecisions = await driver.readDeliveryDecisions();
+
+      await driver.resetScenario(id, fixture);
+      await prepareWorld(baseTarget);
+      await act({
+        kind: "set-member-behavior",
+        residentId: fixture.residentIds.a,
+        behavior: "hold",
+      });
+      await act({
+        kind: "member-turn",
+        operationId: "gc12-stale-result",
+        rootId: fixture.roots.first,
+        residentId: fixture.residentIds.a,
+        body: "TEST-GC12-GEN1",
+        target: baseTarget,
+      });
+      const nextTarget = {
+        ...baseTarget,
+        scopeGeneration: 2,
+        generation: 2,
+        dispatchId: "test-dispatch:gc12-generation-2",
+      };
+      await act({ kind: "set-delivery-target", target: nextTarget });
+      await act({
+        kind: "return-member-result",
+        operationId: "gc12-stale-result",
+        target: baseTarget,
+        body: "TEST-GC12-LATE-GEN1",
+      });
+      const staleResults = await driver.readMemberResults();
+
+      await driver.resetScenario(id, fixture);
+      await prepareWorld(nextTarget);
+      await act({ kind: "fill-ordinary-queue", depth: 2 });
+      await act({
+        kind: "set-member-behavior",
+        residentId: fixture.residentIds.a,
+        behavior: "hold",
+      });
+      await act({
+        kind: "member-turn",
+        operationId: "gc12-cutoff-old",
+        rootId: fixture.roots.first,
+        residentId: fixture.residentIds.a,
+        body: "TEST-GC12-CUTOFF-OLD",
+        target: nextTarget,
+      });
+      await act({
+        kind: "submit-control",
+        controlId: "gc12-stop",
+        issuerId: fixture.humanId,
+        targetId: fixture.residentIds.a,
+        action: "stop",
+        structured: true,
+        binding: "test-control-binding:owner",
+      });
+      await act({
+        kind: "return-member-result",
+        operationId: "gc12-cutoff-old",
+        target: nextTarget,
+        body: "TEST-GC12-CUTOFF-LATE",
+      });
+      await act({
+        kind: "submit-control",
+        controlId: "gc12-continue",
+        issuerId: fixture.humanId,
+        targetId: fixture.residentIds.a,
+        action: "continue",
+        structured: true,
+        binding: "test-control-binding:owner",
+      });
+      const continuedTarget = { ...nextTarget, dispatchId: "test-dispatch:gc12-after-continue" };
+      await act({ kind: "set-delivery-target", target: continuedTarget });
+      await act({
+        kind: "member-turn",
+        operationId: "gc12-cutoff-new",
+        rootId: fixture.roots.first,
+        residentId: fixture.residentIds.a,
+        body: "TEST-GC12-CUTOFF-NEW",
+        target: continuedTarget,
+      });
+      await act({
+        kind: "return-member-result",
+        operationId: "gc12-cutoff-new",
+        target: continuedTarget,
+        body: "TEST-GC12-NEW-RESULT",
+      });
+      const cutoffResults = await driver.readMemberResults();
+
+      await driver.resetScenario(id, fixture);
+      await prepareWorld(baseTarget);
+      await act({
+        kind: "set-member-behavior",
+        residentId: fixture.residentIds.a,
+        behavior: "hold",
+      });
+      await act({
+        kind: "member-turn",
+        operationId: "gc12-tuple",
+        rootId: fixture.roots.first,
+        residentId: fixture.residentIds.a,
+        body: "TEST-GC12-TUPLE",
+        target: baseTarget,
+      });
+      const forgedTargets = [
+        { ...baseTarget, residentId: fixture.residentIds.b },
+        { ...baseTarget, scopeId: "test-scope:forged" },
+        { ...baseTarget, scopeGeneration: 2 },
+        { ...baseTarget, windowId: "test-window:forged" },
+        { ...baseTarget, generation: 2 },
+        { ...baseTarget, dispatchId: "test-dispatch:forged" },
+      ];
+      for (const target of forgedTargets)
+        await act({
+          kind: "return-member-result",
+          operationId: "gc12-tuple",
+          target,
+          body: "TEST-GC12-FORGED-TUPLE",
+        });
+      await act({
+        kind: "return-member-result",
+        operationId: "gc12-tuple",
+        target: baseTarget,
+        body: "TEST-GC12-CURRENT-TUPLE",
+      });
+      const tupleResults = await driver.readMemberResults();
+      return evaluateGroupChatEvidence(id, {
+        revokedDeliveryCommitted: revokedDecisions.some(
+          (row) =>
+            row.operationId === "gc12-revoked-delivery" &&
+            (row.state === "dispatched" || row.state === "context-committed"),
+        ),
+        revokedDeliveryReasoned: revokedDecisions.some(
+          (row) =>
+            row.operationId === "gc12-revoked-delivery" &&
+            row.state === "rejected" &&
+            row.reasonCode.length > 0,
+        ),
+        rosterVersionAdvanced: rosterAfter.version > rosterBefore.version,
+        staleResultActuallyReturned: staleResults.some(
+          (row) => row.operationId === "gc12-stale-result" && row.phase === "returned",
+        ),
+        staleResultCommitted: staleResults.some(
+          (row) => row.operationId === "gc12-stale-result" && row.phase === "committed",
+        ),
+        staleResultReasoned: staleResults.some(
+          (row) =>
+            row.operationId === "gc12-stale-result" &&
+            row.phase === "rejected" &&
+            (row.reasonCode?.length ?? 0) > 0,
+        ),
+        stoppedResultActuallyReturned: cutoffResults.some(
+          (row) => row.operationId === "gc12-cutoff-old" && row.phase === "returned",
+        ),
+        stoppedResultCommitted: cutoffResults.some(
+          (row) => row.operationId === "gc12-cutoff-old" && row.phase === "committed",
+        ),
+        postContinueResultCommitted: cutoffResults.some(
+          (row) => row.operationId === "gc12-cutoff-new" && row.phase === "committed",
+        ),
+        forgedTupleAttempts: tupleResults.filter(
+          (row) =>
+            row.operationId === "gc12-tuple" &&
+            row.phase === "returned" &&
+            JSON.stringify(row.target) !== JSON.stringify(baseTarget),
+        ).length,
+        forgedTupleCommits: tupleResults.filter(
+          (row) =>
+            row.operationId === "gc12-tuple" &&
+            row.phase === "committed" &&
+            JSON.stringify(row.target) !== JSON.stringify(baseTarget),
+        ).length,
+        currentTupleCommits: tupleResults.filter(
+          (row) =>
+            row.operationId === "gc12-tuple" &&
+            row.phase === "committed" &&
+            JSON.stringify(row.target) === JSON.stringify(baseTarget),
+        ).length,
       });
     }
     case "GC-15": {
@@ -1259,6 +2299,150 @@ export async function runGroupChatCheck(
         crossRoomReplayAccepted: worlds.some((world) =>
           hasMarker(world.hiddenEvents, markers.replay),
         ),
+      });
+    }
+    case "GC-16": {
+      if (context === undefined) throw new Error("GC-16 needs restartHost judge support");
+      const a = fixture.residentIds.a;
+      const b = fixture.residentIds.b;
+      await act({
+        kind: "configure-orchestration",
+        rootId: fixture.roots.first,
+        policyVersion: "test-policy:fault-isolation",
+        turnBudget: 8,
+        deadlineTicks: 2,
+        maxMemberAttempts: 2,
+      });
+      await act({ kind: "set-room-membership", residentId: a, active: true });
+      await act({ kind: "set-room-membership", residentId: b, active: true });
+      await act({ kind: "set-sender-online", residentId: a, online: false });
+      await act({
+        kind: "human-trigger",
+        operationId: "gc16-human-before",
+        rootId: fixture.roots.first,
+        body: "TEST-GC16-HUMAN-BEFORE",
+      });
+      await act({ kind: "set-member-behavior", residentId: a, behavior: "fail" });
+      await act({
+        kind: "member-turn",
+        operationId: "gc16-failing-member",
+        rootId: fixture.roots.first,
+        residentId: a,
+        body: "TEST-GC16-A-FAILS",
+      });
+      await act({ kind: "advance-scheduler", ticks: 10 });
+      await act({ kind: "set-member-behavior", residentId: b, behavior: "complete" });
+      await act({
+        kind: "member-turn",
+        operationId: "gc16-normal-member",
+        rootId: fixture.roots.first,
+        residentId: b,
+        body: "TEST-GC16-B-CONTINUES",
+      });
+      await act({
+        kind: "human-trigger",
+        operationId: "gc16-human-after",
+        rootId: fixture.roots.second,
+        body: "TEST-GC16-HUMAN-AFTER",
+      });
+      await act({
+        kind: "submit-control",
+        controlId: "gc16-control-stop",
+        issuerId: fixture.humanId,
+        targetId: b,
+        action: "stop",
+        structured: true,
+        binding: "test-control-binding:owner",
+      });
+      await act({
+        kind: "submit-control",
+        controlId: "gc16-control-continue",
+        issuerId: fixture.humanId,
+        targetId: b,
+        action: "continue",
+        structured: true,
+        binding: "test-control-binding:owner",
+      });
+      await act({ kind: "set-member-behavior", residentId: a, behavior: "hold" });
+      await act({
+        kind: "member-turn",
+        operationId: "gc16-held-member",
+        rootId: fixture.roots.second,
+        residentId: a,
+        body: "TEST-GC16-A-HOLDS",
+      });
+      const heldSnapshot = await driver.readScheduler();
+      const attemptsBeforeDeadline = await driver.readMemberAttempts();
+      await act({ kind: "advance-scheduler", ticks: 2 });
+      const attemptsBeforeRestart = await driver.readMemberAttempts();
+      const roundsBeforeRestart = await driver.readRoundRecords();
+      const highWaterBeforeRestart = Math.max(
+        0,
+        ...roundsBeforeRestart.map((row) => row.consumedTurns),
+      );
+      const restarted = await context.restartHost(driver);
+      await act({ kind: "set-member-behavior", residentId: b, behavior: "complete" });
+      await act({
+        kind: "member-turn",
+        operationId: "gc16-after-restart",
+        rootId: fixture.roots.first,
+        residentId: b,
+        body: "TEST-GC16-AFTER-RESTART",
+      });
+      const attemptsAfterRestart = await driver.readMemberAttempts();
+      const roundsAfterRestart = await driver.readRoundRecords();
+      const highWaterAfterRestart =
+        roundsAfterRestart.find((row) => row.operationId === "gc16-after-restart")?.consumedTurns ??
+        -1;
+      await act({ kind: "query-feedback", residentId: a, via: "wake" });
+      const feedback = await driver.readSenderFeedback(a);
+      const events = await driver.readRoomEvents(fixture.roomId);
+      const controls = await driver.readControlRecords();
+      const receipts = await driver.readSystemReceipts();
+      const failingAttempts = attemptsAfterRestart.filter(
+        (row) => row.operationId === "gc16-failing-member",
+      );
+      const suspicious = /👀|typing|seen|understood|productive|有产出|已读|正在输入/iu;
+      return evaluateGroupChatEvidence(id, {
+        failedMemberAttempts: attemptsAfterRestart.filter(
+          (row) => row.memberId === a && (row.outcome === "failed" || row.outcome === "unknown"),
+        ),
+        normalMemberCompleted:
+          attemptsAfterRestart.some(
+            (row) => row.operationId === "gc16-normal-member" && row.outcome === "completed",
+          ) && hasMarker(events, "TEST-GC16-B-CONTINUES"),
+        humanContinued: hasMarker(events, "TEST-GC16-HUMAN-AFTER"),
+        controlContinued: controls.some(
+          (row) => row.controlId === "gc16-control-continue" && row.phase === "effective",
+        ),
+        heldWasActuallyInFlight:
+          heldSnapshot.heldOperationIds.includes("gc16-held-member") &&
+          attemptsBeforeDeadline.some(
+            (row) => row.operationId === "gc16-held-member" && row.outcome === "in-flight",
+          ),
+        heldTimedOut: attemptsBeforeRestart.some(
+          (row) => row.operationId === "gc16-held-member" && row.outcome === "unknown",
+        ),
+        attemptsWithinBound: failingAttempts.length <= 2,
+        restartPidChanged: restarted.previous.pid !== restarted.current.pid,
+        restartCommitStable: restarted.previous.commit === restarted.current.commit,
+        failuresBeforeRestart: attemptsBeforeRestart.filter(
+          (row) => row.memberId === a && (row.outcome === "failed" || row.outcome === "unknown"),
+        ).length,
+        failuresAfterRestart: attemptsAfterRestart.filter(
+          (row) => row.memberId === a && (row.outcome === "failed" || row.outcome === "unknown"),
+        ).length,
+        highWaterBeforeRestart,
+        highWaterAfterRestart,
+        failureFeedbackRetained: feedback.some(
+          (row) =>
+            row.operationId === "gc16-failing-member" &&
+            row.phase === "delivered" &&
+            row.deliveryReceipt !== null,
+        ),
+        falsePresenceClaims: receipts
+          .map((receipt) => `${receipt.phase} ${receipt.claim ?? ""}`)
+          .filter((claim) => suspicious.test(claim)),
       });
     }
   }

@@ -17,19 +17,31 @@ import {
   type AccessAudit,
   type CallReceipt,
   type ContextCommit,
+  type ControlRecord,
+  type DeliveryDecisionRecord,
   type DeliveryRecord,
+  type DispatchIdentity,
   GROUP_CHAT_CHECK_IDS,
   type GroupChatCheckId,
   type GroupChatCommand,
   type GroupChatHostDriver,
+  type MemberAttemptRecord,
+  type MemberBehavior,
+  type MemberResultRecord,
   type MemoryRecord,
   type MentionDecision,
+  type PressureMode,
+  type ProjectionReceipt,
   type ResidentId,
   type ResidentReaction,
   type RoomEvent,
   type RosterPath,
   type RosterProjection,
   type RosterSnapshot,
+  type RoundRecord,
+  type SchedulerSnapshot,
+  type SenderFeedbackRecord,
+  type SourceReadAudit,
   type SurfaceSnapshot,
   type SystemReceipt,
   cloneGroupChatDriverBoundary,
@@ -44,6 +56,7 @@ import {
   isRepoEntryFile,
   provenanceFailedResults,
   readProcessInfo,
+  restartedHostProvenanceProblem,
   missingDriverResults as runnerMissingDriverResults,
   scoreGroupChatResults,
 } from "./group-chat-run.ts";
@@ -103,6 +116,63 @@ interface TestOptions {
   readonly newcomerSeesPreJoinIds?: boolean;
   readonly newcomerMissesPostJoin?: boolean;
   readonly duplicatePositions?: boolean;
+  readonly ignoreTurnBudget?: boolean;
+  readonly duplicateRetry?: boolean;
+  readonly omitPassRecord?: boolean;
+  readonly omitFailureRecord?: boolean;
+  readonly resetBudgetOnIdentityChange?: boolean;
+  readonly omitRoundTarget?: boolean;
+  readonly acceptSelfDeclaredRoot?: boolean;
+  readonly resetRoundOnRestart?: boolean;
+  readonly reuseRestartPid?: boolean;
+  readonly changeRestartCommit?: boolean;
+  readonly dispatchWithInvalidPolicy?: boolean;
+  readonly emptyOrdinaryQueue?: boolean;
+  readonly controlSharesOrdinaryQueue?: boolean;
+  readonly acceptFalseControl?: boolean;
+  readonly mergeControlReceipts?: boolean;
+  readonly reportUnreachableEffective?: boolean;
+  readonly claimExternalEffectReversed?: boolean;
+  readonly continueDeadlocks?: boolean;
+  readonly acceptPreCutoffResult?: boolean;
+  readonly markOfflineFeedbackDelivered?: boolean;
+  readonly feedbackNoteOnly?: boolean;
+  readonly leakBlockedBody?: boolean;
+  readonly crossDeliverFeedback?: boolean;
+  readonly unstableReasonAfterRestart?: boolean;
+  readonly consumeOnDecisionPersistFailure?: boolean;
+  readonly duplicateDecisionOnRetry?: boolean;
+  readonly omitProjectionGaps?: boolean;
+  readonly truncationMetadataNotModelVisible?: boolean;
+  readonly leakHiddenProjection?: boolean;
+  readonly allowRevokedSourceRead?: boolean;
+  readonly wrongSourceRead?: boolean;
+  readonly useStaleRoster?: boolean;
+  readonly skipReturnedResultRecord?: boolean;
+  readonly acceptStaleTarget?: boolean;
+  readonly acceptForgedTarget?: boolean;
+  readonly starveOtherMembers?: boolean;
+  readonly synchronousHoldFailure?: boolean;
+  readonly neverTimeoutHeld?: boolean;
+  readonly unboundedMemberRetries?: boolean;
+  readonly washFailuresOnRestart?: boolean;
+  readonly dropFailureFeedback?: boolean;
+  readonly falseFailurePresenceReceipt?: boolean;
+}
+
+interface SyntheticSubmission {
+  readonly operationId: string;
+  readonly rootId: string;
+  readonly residentId: ResidentId;
+  readonly body: string;
+  readonly target: DispatchIdentity | null;
+  persistFailed: boolean;
+}
+
+interface ProjectionSource {
+  readonly eventId: string;
+  readonly body: string;
+  readonly authorized: boolean;
 }
 
 /** Test-only host model; production runner never imports this adapter. */
@@ -131,17 +201,80 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   private gateTurnOpen = true;
   private crossResidentPrivateReads = 0;
   private unauthorizedReadResults: string[] = [];
+  private hostPid = 12345;
+  private hostCommit = "synthetic-test-only";
+  private scenarioId: GroupChatCheckId = "GC-01";
+  private sequence = 0;
+  private roundRecords: RoundRecord[] = [];
+  private policy: {
+    rootId: string;
+    policyVersion: string;
+    turnBudget: number | null;
+    deadlineTicks: number;
+    maxMemberAttempts: number;
+  } | null = null;
+  private knownRoots = new Set<string>();
+  private consumedByRoot = new Map<string, number>();
+  private submissions = new Map<string, SyntheticSubmission>();
+  private memberBehaviors = new Map<ResidentId, MemberBehavior>();
+  private pressure = new Map<ResidentId, PressureMode>();
+  private schedulerTick = 0;
+  private ordinaryQueueDepth = 0;
+  private held = new Map<
+    string,
+    SyntheticSubmission & { readonly startedAt: number; readonly issuedControlSequence: number }
+  >();
+  private stopped = new Set<ResidentId>();
+  private controlRecords: ControlRecord[] = [];
+  private lastStopSequence = new Map<ResidentId, number>();
+  private externalEffects = new Set<ResidentId>();
+  private deliveryDecisions: DeliveryDecisionRecord[] = [];
+  private feedback: SenderFeedbackRecord[] = [];
+  private senderOnline = new Map<ResidentId, boolean>();
+  private nextDecisionPersistFault = false;
+  private nextDispatchFaultFor: ResidentId | null = null;
+  private projectionSources: ProjectionSource[] = [];
+  private projectionReceipts: ProjectionReceipt[] = [];
+  private projectionContexts = new Map<ResidentId, string[]>();
+  private sourceReads: SourceReadAudit[] = [];
+  private roomAccess = new Map<ResidentId, boolean>();
+  private roomMembers = new Set<ResidentId>([fixture.residentIds.a, fixture.residentIds.b]);
+  private currentTarget: DispatchIdentity | null = null;
+  private attempts: MemberAttemptRecord[] = [];
+  private results: MemberResultRecord[] = [];
 
   constructor(options: TestOptions = {}) {
     this.options = options;
   }
 
   async startHost() {
-    return { pid: 12345, commit: "synthetic-test-only" };
+    return { pid: this.hostPid, commit: this.hostCommit };
+  }
+  async restartHost() {
+    if (!this.options.reuseRestartPid) this.hostPid += 1;
+    if (this.options.changeRestartCommit) this.hostCommit = "synthetic-test-changed";
+    if (this.options.resetRoundOnRestart) this.consumedByRoot.clear();
+    if (this.options.washFailuresOnRestart) {
+      this.attempts = this.attempts.filter((row) => row.outcome === "completed");
+      this.roundRecords = this.roundRecords.filter((row) => row.decision !== "failed");
+      this.feedback = [];
+    }
+    if (this.options.unstableReasonAfterRestart) {
+      this.deliveryDecisions = this.deliveryDecisions.map((row) => ({
+        ...row,
+        reasonCode: `${row.reasonCode}:changed`,
+      }));
+      this.feedback = this.feedback.map((row) => ({
+        ...row,
+        reasonCode: `${row.reasonCode}:changed`,
+      }));
+    }
+    return { pid: this.hostPid, commit: this.hostCommit };
   }
   async stopHost(): Promise<void> {}
 
-  async resetScenario(_id: GroupChatCheckId): Promise<void> {
+  async resetScenario(id: GroupChatCheckId): Promise<void> {
+    this.scenarioId = id;
     this.events = [];
     this.eventTime.clear();
     this.roomCounters.clear();
@@ -170,6 +303,35 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
     this.gateTurnOpen = true;
     this.crossResidentPrivateReads = 0;
     this.unauthorizedReadResults = [];
+    this.sequence = 0;
+    this.roundRecords = [];
+    this.policy = null;
+    this.knownRoots.clear();
+    this.consumedByRoot.clear();
+    this.submissions.clear();
+    this.memberBehaviors.clear();
+    this.pressure.clear();
+    this.schedulerTick = 0;
+    this.ordinaryQueueDepth = 0;
+    this.held.clear();
+    this.stopped.clear();
+    this.controlRecords = [];
+    this.lastStopSequence.clear();
+    this.externalEffects.clear();
+    this.deliveryDecisions = [];
+    this.feedback = [];
+    this.senderOnline.clear();
+    this.nextDecisionPersistFault = false;
+    this.nextDispatchFaultFor = null;
+    this.projectionSources = [];
+    this.projectionReceipts = [];
+    this.projectionContexts.clear();
+    this.sourceReads = [];
+    this.roomAccess.clear();
+    this.roomMembers = new Set([fixture.residentIds.a, fixture.residentIds.b]);
+    this.currentTarget = null;
+    this.attempts = [];
+    this.results = [];
   }
 
   /** Per-room event ids: a global counter would itself reveal hidden-room traffic (GC-15). */
@@ -193,6 +355,331 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
     this.decisions.push(recorded);
     if (this.options.duplicateDecision && decision.outcome === "accepted")
       this.decisions.push({ ...recorded });
+  }
+
+  private nextSequence(): number {
+    this.sequence += 1;
+    return this.sequence;
+  }
+
+  private consumed(rootId: string): number {
+    return this.consumedByRoot.get(rootId) ?? 0;
+  }
+
+  private appendRound(
+    input: Omit<RoundRecord, "sequence" | "consumedTurns" | "policyVersion" | "target"> & {
+      readonly target?: DispatchIdentity | null;
+    },
+  ): void {
+    this.roundRecords.push({
+      sequence: this.nextSequence(),
+      consumedTurns: this.consumed(input.rootId),
+      policyVersion: this.policy?.policyVersion ?? null,
+      ...input,
+      target: this.options.omitRoundTarget ? null : (input.target ?? null),
+    });
+  }
+
+  private sameTarget(left: DispatchIdentity | null, right: DispatchIdentity | null): boolean {
+    return JSON.stringify(left) === JSON.stringify(right);
+  }
+
+  private appendDecision(
+    input: Omit<DeliveryDecisionRecord, "sequence" | "count" | "rosterVersion">,
+  ): void {
+    const count =
+      this.deliveryDecisions.filter(
+        (row) => row.operationId === input.operationId && row.state !== "persist-failed",
+      ).length + (input.state === "persist-failed" ? 0 : 1);
+    this.deliveryDecisions.push({
+      sequence: this.nextSequence(),
+      count,
+      rosterVersion: this.rosterVersion,
+      ...input,
+    });
+  }
+
+  private appendFeedback(submission: SyntheticSubmission, reasonCode: string, count = 1): void {
+    if (this.options.dropFailureFeedback && this.scenarioId === "GC-16") return;
+    const online = this.senderOnline.get(submission.residentId) ?? true;
+    this.feedback.push({
+      operationId: submission.operationId,
+      senderId: submission.residentId,
+      roomId: fixture.roomId,
+      scopeId: submission.target?.scopeId ?? "test-scope:room",
+      reasonCode,
+      count,
+      phase: online || this.options.markOfflineFeedbackDelivered ? "delivered" : "pending",
+      deliveryReceipt:
+        online || this.options.markOfflineFeedbackDelivered
+          ? `feedback-receipt:${submission.operationId}`
+          : null,
+      body: this.options.leakBlockedBody ? submission.body : null,
+    });
+  }
+
+  private appendAttempt(
+    operationId: string,
+    memberId: ResidentId,
+    outcome: MemberAttemptRecord["outcome"],
+    reasonCode: string | null,
+  ): void {
+    const attempt =
+      this.attempts.filter((row) => row.operationId === operationId && row.memberId === memberId)
+        .length + 1;
+    this.attempts.push({
+      sequence: this.nextSequence(),
+      operationId,
+      memberId,
+      attempt,
+      outcome,
+      reasonCode,
+    });
+  }
+
+  private decisionForPressure(submission: SyntheticSubmission, mode: PressureMode): void {
+    const state =
+      mode === "batch"
+        ? "batched"
+        : mode === "not-included"
+          ? "not-included"
+          : mode === "stopped"
+            ? "stop-blocked"
+            : "queued";
+    const reasonCode =
+      mode === "batch"
+        ? "ROOM_BATCHED"
+        : mode === "not-included"
+          ? "ROOM_NOT_INCLUDED"
+          : mode === "stopped"
+            ? "ROOM_STOPPED"
+            : "ROOM_COOLING";
+    this.appendDecision({
+      operationId: submission.operationId,
+      senderId: submission.residentId,
+      state,
+      reasonCode,
+      permitConsumed: mode !== "cooling",
+      target: submission.target,
+    });
+    if (mode !== "cooling") this.appendFeedback(submission, reasonCode);
+  }
+
+  private processMemberTurn(submission: SyntheticSubmission, claimedRootId?: string): void {
+    const policyValid =
+      this.policy !== null &&
+      Number.isSafeInteger(this.policy.turnBudget) &&
+      (this.policy.turnBudget ?? 0) > 0;
+    if (!policyValid && !this.options.dispatchWithInvalidPolicy) {
+      this.appendRound({
+        operationId: submission.operationId,
+        rootId: submission.rootId,
+        senderId: submission.residentId,
+        decision: "blocked",
+        reasonCode: "ROOM_POLICY_INVALID",
+        target: submission.target,
+      });
+      return;
+    }
+    if (
+      claimedRootId !== undefined &&
+      claimedRootId !== submission.rootId &&
+      !this.options.acceptSelfDeclaredRoot
+    ) {
+      this.appendRound({
+        operationId: submission.operationId,
+        rootId: submission.rootId,
+        senderId: submission.residentId,
+        decision: "blocked",
+        reasonCode: "ROOM_ROOT_FORGED",
+        target: submission.target,
+      });
+      return;
+    }
+    if (!this.knownRoots.has(submission.rootId) && !this.options.acceptSelfDeclaredRoot) {
+      this.appendRound({
+        operationId: submission.operationId,
+        rootId: submission.rootId,
+        senderId: submission.residentId,
+        decision: "blocked",
+        reasonCode: "ROOM_ROOT_UNKNOWN",
+        target: submission.target,
+      });
+      return;
+    }
+    const pressure = this.pressure.get(submission.residentId) ?? "normal";
+    if (this.nextDecisionPersistFault) {
+      this.nextDecisionPersistFault = false;
+      submission.persistFailed = true;
+      this.appendDecision({
+        operationId: submission.operationId,
+        senderId: submission.residentId,
+        state: "persist-failed",
+        reasonCode: "ROOM_DECISION_PERSIST_FAILED",
+        permitConsumed: this.options.consumeOnDecisionPersistFailure === true,
+        target: submission.target,
+      });
+      if (this.options.consumeOnDecisionPersistFailure) {
+        this.consumedByRoot.set(submission.rootId, this.consumed(submission.rootId) + 1);
+      }
+      return;
+    }
+    if (pressure !== "normal") {
+      this.decisionForPressure(submission, pressure);
+      return;
+    }
+    if (this.nextDispatchFaultFor === submission.residentId) {
+      this.nextDispatchFaultFor = null;
+      this.appendDecision({
+        operationId: submission.operationId,
+        senderId: submission.residentId,
+        state: "dispatch-failed",
+        reasonCode: "ROOM_DISPATCH_FAILED",
+        permitConsumed: true,
+        target: submission.target,
+      });
+      this.appendFeedback(submission, "ROOM_DISPATCH_FAILED");
+      this.appendAttempt(
+        submission.operationId,
+        submission.residentId,
+        "failed",
+        "ROOM_DISPATCH_FAILED",
+      );
+      return;
+    }
+    if (
+      this.options.resetBudgetOnIdentityChange &&
+      submission.operationId === "gc06-identity-change" &&
+      this.roundRecords.some(
+        (row) => row.senderId !== submission.residentId && row.senderId !== fixture.humanId,
+      )
+    ) {
+      this.consumedByRoot.set(submission.rootId, 0);
+    }
+    const budget = this.policy?.turnBudget ?? (this.options.dispatchWithInvalidPolicy ? 1 : 0);
+    if (!this.options.ignoreTurnBudget && this.consumed(submission.rootId) >= budget) {
+      this.appendRound({
+        operationId: submission.operationId,
+        rootId: submission.rootId,
+        senderId: submission.residentId,
+        decision: "blocked",
+        reasonCode: "ROOM_TURN_BUDGET_EXHAUSTED",
+        target: submission.target,
+      });
+      return;
+    }
+    if (this.stopped.has(submission.residentId)) {
+      this.appendRound({
+        operationId: submission.operationId,
+        rootId: submission.rootId,
+        senderId: submission.residentId,
+        decision: "blocked",
+        reasonCode: "ROOM_MEMBER_STOPPED",
+        target: submission.target,
+      });
+      return;
+    }
+    this.consumedByRoot.set(submission.rootId, this.consumed(submission.rootId) + 1);
+    const behavior = this.memberBehaviors.get(submission.residentId) ?? "complete";
+    if (behavior === "pass") {
+      if (!this.options.omitPassRecord)
+        this.appendRound({
+          operationId: submission.operationId,
+          rootId: submission.rootId,
+          senderId: submission.residentId,
+          decision: "passed",
+          reasonCode: null,
+          target: submission.target,
+        });
+      return;
+    }
+    if (behavior === "fail") {
+      if (!this.options.omitFailureRecord)
+        this.appendRound({
+          operationId: submission.operationId,
+          rootId: submission.rootId,
+          senderId: submission.residentId,
+          decision: "failed",
+          reasonCode: "ROOM_MEMBER_FAILED",
+          target: submission.target,
+        });
+      this.appendAttempt(
+        submission.operationId,
+        submission.residentId,
+        "failed",
+        "ROOM_MEMBER_FAILED",
+      );
+      this.appendDecision({
+        operationId: submission.operationId,
+        senderId: submission.residentId,
+        state: "dispatch-failed",
+        reasonCode: "ROOM_MEMBER_FAILED",
+        permitConsumed: true,
+        target: submission.target,
+      });
+      this.appendFeedback(submission, "ROOM_MEMBER_FAILED");
+      if (this.options.falseFailurePresenceReceipt)
+        this.receipts.push({ actor: "system", phase: "seen", claim: "成员已读且讨论有产出" });
+      return;
+    }
+    if (behavior === "hold") {
+      if (this.options.synchronousHoldFailure) {
+        this.appendRound({
+          operationId: submission.operationId,
+          rootId: submission.rootId,
+          senderId: submission.residentId,
+          decision: "failed",
+          reasonCode: "SYNCHRONOUS_THROW",
+          target: submission.target,
+        });
+        this.appendAttempt(
+          submission.operationId,
+          submission.residentId,
+          "failed",
+          "SYNCHRONOUS_THROW",
+        );
+        return;
+      }
+      this.appendRound({
+        operationId: submission.operationId,
+        rootId: submission.rootId,
+        senderId: submission.residentId,
+        decision: "held",
+        reasonCode: null,
+        target: submission.target,
+      });
+      this.appendAttempt(submission.operationId, submission.residentId, "in-flight", null);
+      this.held.set(submission.operationId, {
+        ...submission,
+        startedAt: this.schedulerTick,
+        issuedControlSequence: this.sequence,
+      });
+      return;
+    }
+    if (
+      this.options.starveOtherMembers &&
+      submission.operationId === "gc16-normal-member" &&
+      submission.residentId === fixture.residentIds.b &&
+      this.attempts.some(
+        (row) => row.memberId === fixture.residentIds.a && row.outcome !== "completed",
+      )
+    )
+      return;
+    this.appendRound({
+      operationId: submission.operationId,
+      rootId: submission.rootId,
+      senderId: submission.residentId,
+      decision: "permitted",
+      reasonCode: null,
+      target: submission.target,
+    });
+    this.appendAttempt(submission.operationId, submission.residentId, "completed", null);
+    this.addEvent({
+      roomId: fixture.roomId,
+      authorId: submission.residentId,
+      body: submission.body,
+      visibility: "public",
+    });
   }
 
   async perform(command: GroupChatCommand): Promise<void> {
@@ -489,6 +976,382 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
         }
         return;
       }
+      case "configure-orchestration":
+        this.policy = {
+          rootId: command.rootId,
+          policyVersion: command.policyVersion,
+          turnBudget: command.turnBudget,
+          deadlineTicks: command.deadlineTicks,
+          maxMemberAttempts: command.maxMemberAttempts,
+        };
+        return;
+      case "human-trigger":
+        this.knownRoots.add(command.rootId);
+        if (!this.consumedByRoot.has(command.rootId)) this.consumedByRoot.set(command.rootId, 0);
+        this.appendRound({
+          operationId: command.operationId,
+          rootId: command.rootId,
+          senderId: fixture.humanId,
+          decision: "human-trigger",
+          reasonCode: null,
+        });
+        this.addEvent({
+          roomId: fixture.roomId,
+          authorId: fixture.humanId,
+          body: command.body,
+          visibility: "public",
+        });
+        return;
+      case "member-turn": {
+        const effectiveRoot =
+          this.options.acceptSelfDeclaredRoot && command.claimedRootId !== undefined
+            ? command.claimedRootId
+            : command.rootId;
+        if (this.options.acceptSelfDeclaredRoot && command.claimedRootId !== undefined) {
+          this.knownRoots.add(effectiveRoot);
+          if (!this.consumedByRoot.has(effectiveRoot)) this.consumedByRoot.set(effectiveRoot, 0);
+        }
+        const submission: SyntheticSubmission = {
+          operationId: command.operationId,
+          rootId: effectiveRoot,
+          residentId: command.residentId,
+          body: command.body,
+          target: command.target ?? this.currentTarget,
+          persistFailed: false,
+        };
+        this.submissions.set(command.operationId, submission);
+        this.processMemberTurn(submission, command.claimedRootId);
+        return;
+      }
+      case "retry-operation": {
+        const submission = this.submissions.get(command.operationId);
+        if (submission === undefined) return;
+        if (submission.persistFailed) {
+          submission.persistFailed = false;
+          this.processMemberTurn(submission);
+          if (this.options.duplicateDecisionOnRetry) this.processMemberTurn(submission);
+          return;
+        }
+        if (this.options.duplicateRetry) {
+          this.consumedByRoot.set(submission.rootId, this.consumed(submission.rootId) + 1);
+          this.appendRound({
+            operationId: submission.operationId,
+            rootId: submission.rootId,
+            senderId: submission.residentId,
+            decision: "permitted",
+            reasonCode: null,
+            target: submission.target,
+          });
+          this.addEvent({
+            roomId: fixture.roomId,
+            authorId: submission.residentId,
+            body: submission.body,
+            visibility: "public",
+          });
+          return;
+        }
+        this.appendRound({
+          operationId: submission.operationId,
+          rootId: submission.rootId,
+          senderId: submission.residentId,
+          decision: "retry-replayed",
+          reasonCode: null,
+          target: submission.target,
+        });
+        return;
+      }
+      case "set-member-behavior":
+        this.memberBehaviors.set(command.residentId, command.behavior);
+        return;
+      case "set-pressure":
+        this.pressure.set(command.residentId, command.mode);
+        return;
+      case "advance-scheduler": {
+        this.schedulerTick += command.ticks;
+        for (const [operationId, submission] of this.submissions) {
+          const failures = this.attempts.filter(
+            (row) => row.operationId === operationId && row.outcome === "failed",
+          ).length;
+          if (failures > 0) {
+            const limit = this.options.unboundedMemberRetries
+              ? failures + command.ticks
+              : (this.policy?.maxMemberAttempts ?? 1);
+            for (let attempt = failures; attempt < limit; attempt += 1) {
+              this.appendAttempt(
+                operationId,
+                submission.residentId,
+                "failed",
+                "ROOM_MEMBER_FAILED",
+              );
+              if (!this.options.unboundedMemberRetries) break;
+            }
+          }
+        }
+        for (const [operationId, held] of [...this.held]) {
+          const deadline = this.policy?.deadlineTicks ?? 1;
+          if (this.schedulerTick - held.startedAt < deadline || this.options.neverTimeoutHeld)
+            continue;
+          this.appendAttempt(operationId, held.residentId, "unknown", "ROOM_MEMBER_DEADLINE");
+          this.appendDecision({
+            operationId,
+            senderId: held.residentId,
+            state: "dispatch-failed",
+            reasonCode: "ROOM_MEMBER_DEADLINE",
+            permitConsumed: true,
+            target: held.target,
+          });
+          this.appendFeedback(held, "ROOM_MEMBER_DEADLINE");
+          this.held.delete(operationId);
+        }
+        return;
+      }
+      case "fill-ordinary-queue":
+        this.ordinaryQueueDepth = this.options.emptyOrdinaryQueue ? 0 : command.depth;
+        return;
+      case "submit-control": {
+        const valid =
+          command.structured &&
+          command.binding === "test-control-binding:owner" &&
+          command.issuerId === fixture.humanId;
+        if (!valid && !this.options.acceptFalseControl) {
+          this.controlRecords.push({
+            sequence: this.nextSequence(),
+            controlId: command.controlId,
+            issuerId: command.issuerId,
+            targetId: command.targetId,
+            action: command.action,
+            phase: "rejected",
+            cutoffId: null,
+            externalEffectReversed: false,
+          });
+          return;
+        }
+        const cutoffId = `control-cutoff:${command.controlId}`;
+        const accepted: ControlRecord = {
+          sequence: this.nextSequence(),
+          controlId: command.controlId,
+          issuerId: command.issuerId,
+          targetId: command.targetId,
+          action: command.action,
+          phase: "accepted",
+          cutoffId,
+          externalEffectReversed:
+            this.options.claimExternalEffectReversed === true &&
+            this.externalEffects.has(command.targetId),
+        };
+        if (!this.options.mergeControlReceipts) this.controlRecords.push(accepted);
+        const reachable = this.roomMembers.has(command.targetId);
+        const blockedByOrdinaryQueue =
+          this.options.controlSharesOrdinaryQueue && this.ordinaryQueueDepth > 0;
+        const continueBlocked = this.options.continueDeadlocks && command.action === "continue";
+        let phase: ControlRecord["phase"] = "effective";
+        if (!reachable && !this.options.reportUnreachableEffective) phase = "incomplete";
+        if (blockedByOrdinaryQueue || continueBlocked) phase = "accepted";
+        const effective: ControlRecord = {
+          ...accepted,
+          sequence: this.nextSequence(),
+          phase,
+        };
+        this.controlRecords.push(effective);
+        if (phase === "effective") {
+          if (command.action === "stop") {
+            this.stopped.add(command.targetId);
+            this.lastStopSequence.set(command.targetId, effective.sequence);
+          } else {
+            this.stopped.delete(command.targetId);
+          }
+        }
+        return;
+      }
+      case "mark-external-effect":
+        this.externalEffects.add(command.targetId);
+        return;
+      case "set-sender-online":
+        this.senderOnline.set(command.residentId, command.online);
+        return;
+      case "query-feedback": {
+        if (this.options.feedbackNoteOnly) return;
+        this.feedback = this.feedback.map((row) =>
+          row.senderId === command.residentId
+            ? {
+                ...row,
+                phase: "delivered" as const,
+                deliveryReceipt: `feedback-receipt:${row.operationId}:${command.via}`,
+              }
+            : row,
+        );
+        return;
+      }
+      case "inject-next-fault":
+        if (command.fault === "decision-persist") this.nextDecisionPersistFault = true;
+        else this.nextDispatchFaultFor = command.residentId ?? fixture.residentIds.a;
+        return;
+      case "seed-projection-event":
+        this.projectionSources.push({
+          eventId: command.eventId,
+          body: command.body,
+          authorized: command.authorized,
+        });
+        return;
+      case "request-projection": {
+        const authorized = this.projectionSources.filter((item) => item.authorized);
+        const hidden = this.projectionSources.filter((item) => !item.authorized);
+        const included =
+          command.mode === "batch"
+            ? authorized.filter((_item, index) => index === 0 || index === authorized.length - 1)
+            : command.mode === "latest"
+              ? authorized.slice(-2)
+              : authorized.slice(2, 3);
+        const omitted = this.options.omitProjectionGaps
+          ? []
+          : authorized.filter((item) => !included.includes(item));
+        const truncate = command.mode === "truncate" ? included[0] : undefined;
+        const maxCharacters = command.maxCharacters ?? 24;
+        const truncations =
+          truncate === undefined
+            ? []
+            : [
+                {
+                  eventId: truncate.eventId,
+                  originalLength: truncate.body.length,
+                  unit: "characters" as const,
+                  keptStart: 0,
+                  keptEnd: Math.min(maxCharacters, truncate.body.length),
+                  sourceRef: `room-source:${truncate.eventId}`,
+                  modelVisible: !this.options.truncationMetadataNotModelVisible,
+                },
+              ];
+        const leakSuffix = this.options.leakHiddenProjection ? `:${hidden.length}` : "";
+        const receipt: ProjectionReceipt = {
+          projectionId: command.projectionId,
+          viewerId: command.viewerId,
+          sourceRange: [authorized[0]?.eventId ?? "none", authorized.at(-1)?.eventId ?? "none"],
+          watermark: `watermark:${authorized.at(-1)?.eventId ?? "none"}${leakSuffix}`,
+          policyVersion: "test-projection-policy:v1",
+          includedEventIds: included.map((item) => item.eventId),
+          omittedEventIds: omitted.map((item) => item.eventId),
+          complete: false,
+          errorCode: null,
+          truncations,
+        };
+        this.projectionReceipts.push(receipt);
+        const context = this.projectionContexts.get(command.viewerId) ?? [];
+        for (const item of included) {
+          context.push(command.mode === "truncate" ? item.body.slice(0, maxCharacters) : item.body);
+        }
+        for (const item of truncations) {
+          if (item.modelVisible) {
+            context.push(
+              `${item.sourceRef} ${item.originalLength} ${item.unit} ${item.keptStart}:${item.keptEnd}`,
+            );
+          }
+        }
+        this.projectionContexts.set(command.viewerId, context);
+        return;
+      }
+      case "attempt-source-read": {
+        const eventId = command.sourceRef.startsWith("room-source:")
+          ? command.sourceRef.slice("room-source:".length)
+          : "";
+        const source = this.projectionSources.find((item) => item.eventId === eventId);
+        const allowed =
+          (this.roomAccess.get(command.viewerId) ?? false) || this.options.allowRevokedSourceRead;
+        this.sourceReads.push({
+          sourceRef: command.sourceRef,
+          viewerId: command.viewerId,
+          outcome: allowed && source?.authorized ? "granted" : "denied",
+          eventId:
+            allowed && source?.authorized
+              ? this.options.wrongSourceRead
+                ? "wrong-event"
+                : source.eventId
+              : null,
+          body:
+            allowed && source?.authorized
+              ? this.options.wrongSourceRead
+                ? "wrong-body"
+                : source.body
+              : null,
+          errorCode: allowed && source?.authorized ? null : "not-found",
+        });
+        return;
+      }
+      case "set-room-access":
+        this.roomAccess.set(command.residentId, command.allowed);
+        return;
+      case "set-room-membership": {
+        const had = this.roomMembers.has(command.residentId);
+        if (command.active) {
+          this.roomMembers.add(command.residentId);
+          this.roster.add(command.residentId);
+        } else {
+          this.roomMembers.delete(command.residentId);
+          this.roster.delete(command.residentId);
+        }
+        if (had !== command.active) this.rosterVersion += 1;
+        return;
+      }
+      case "attempt-delivery": {
+        const submission = this.submissions.get(command.operationId);
+        if (submission === undefined) return;
+        const allowed =
+          this.roomMembers.has(submission.residentId) || this.options.useStaleRoster === true;
+        this.appendDecision({
+          operationId: submission.operationId,
+          senderId: submission.residentId,
+          state: allowed ? "context-committed" : "rejected",
+          reasonCode: allowed ? "ROOM_CONTEXT_COMMITTED" : "ROOM_MEMBER_REVOKED",
+          permitConsumed: allowed,
+          target: submission.target,
+        });
+        return;
+      }
+      case "set-delivery-target":
+        this.currentTarget = command.target;
+        return;
+      case "return-member-result": {
+        const held = this.held.get(command.operationId);
+        if (held === undefined) return;
+        if (!this.options.skipReturnedResultRecord) {
+          this.results.push({
+            sequence: this.nextSequence(),
+            operationId: command.operationId,
+            target: command.target,
+            phase: "returned",
+            reasonCode: null,
+          });
+        }
+        const targetMatchesPermit = this.sameTarget(command.target, held.target);
+        const targetCurrent = this.sameTarget(command.target, this.currentTarget);
+        const stoppedAfterIssue =
+          (this.lastStopSequence.get(held.residentId) ?? 0) > held.issuedControlSequence;
+        const accepted =
+          (targetMatchesPermit && targetCurrent && !stoppedAfterIssue) ||
+          this.options.acceptStaleTarget === true ||
+          (this.options.acceptForgedTarget === true && command.operationId === "gc12-tuple") ||
+          (this.options.acceptPreCutoffResult === true && stoppedAfterIssue);
+        this.results.push({
+          sequence: this.nextSequence(),
+          operationId: command.operationId,
+          target: command.target,
+          phase: accepted ? "committed" : "rejected",
+          reasonCode: accepted
+            ? null
+            : stoppedAfterIssue
+              ? "ROOM_CONTROL_CUTOFF"
+              : "ROOM_DISPATCH_IDENTITY_STALE",
+        });
+        if (accepted) {
+          this.addEvent({
+            roomId: fixture.roomId,
+            authorId: held.residentId,
+            body: command.body,
+            visibility: "public",
+          });
+          this.held.delete(command.operationId);
+        }
+        return;
+      }
       case "set-resident":
         return;
     }
@@ -588,10 +1451,53 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   async readReactions(): Promise<readonly ResidentReaction[]> {
     return this.reactions;
   }
+  async readRoundRecords(): Promise<readonly RoundRecord[]> {
+    return structuredClone(this.roundRecords);
+  }
+  async readScheduler(): Promise<SchedulerSnapshot> {
+    return {
+      tick: this.schedulerTick,
+      ordinaryQueueDepth: this.ordinaryQueueDepth,
+      heldOperationIds: [...this.held.keys()],
+      stoppedResidentIds: [...this.stopped],
+    };
+  }
+  async readControlRecords(): Promise<readonly ControlRecord[]> {
+    return structuredClone(this.controlRecords);
+  }
+  async readDeliveryDecisions(): Promise<readonly DeliveryDecisionRecord[]> {
+    return structuredClone(this.deliveryDecisions);
+  }
+  async readSenderFeedback(residentId: ResidentId): Promise<readonly SenderFeedbackRecord[]> {
+    if (this.options.crossDeliverFeedback) return structuredClone(this.feedback);
+    return structuredClone(this.feedback.filter((row) => row.senderId === residentId));
+  }
+  async readProjectionReceipts(): Promise<readonly ProjectionReceipt[]> {
+    return structuredClone(this.projectionReceipts);
+  }
+  async readProjectionContext(residentId: ResidentId): Promise<string> {
+    return (this.projectionContexts.get(residentId) ?? []).join("\n");
+  }
+  async readSourceReads(): Promise<readonly SourceReadAudit[]> {
+    return structuredClone(this.sourceReads);
+  }
+  async readMemberAttempts(): Promise<readonly MemberAttemptRecord[]> {
+    return structuredClone(this.attempts);
+  }
+  async readMemberResults(): Promise<readonly MemberResultRecord[]> {
+    return structuredClone(this.results);
+  }
 }
 
 /** No member-id literals found under src/ (the runner supplies the real scan). */
-const judge: GroupChatJudgeContext = { findSourceLiterals: async () => [] };
+const judge: GroupChatJudgeContext = {
+  findSourceLiterals: async () => [],
+  restartHost: async (driver) => {
+    const previous = await driver.startHost();
+    const current = await driver.restartHost();
+    return { previous, current };
+  },
+};
 
 const check = (id: GroupChatCheckId, options: TestOptions = {}) =>
   runGroupChatCheck(id, new SyntheticGroupChatHost(options), judge);
@@ -724,8 +1630,8 @@ const honestClaims = [
   "不到一秒就已读完配置",
 ];
 
-describe("#191 group-chat acceptance: judge-driven synthetic host checks", () => {
-  it("freezes exactly the seven PR1 lamps and synthetic fixtures", () => {
+describe("#191/#192 group-chat acceptance: judge-driven synthetic host checks", () => {
+  it("freezes exactly the thirteen stacked red lamps and synthetic fixtures", () => {
     expect(groupChatChecks.map(({ id }) => id)).toEqual(GROUP_CHAT_CHECK_IDS);
     expect(fixture.roomId).toMatch(/^test-room:/);
     expect(Object.values(fixture.residentIds).every((id) => id.startsWith("test-resident:"))).toBe(
@@ -891,6 +1797,7 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
         scanned = terms;
         return ["src/group-chat/router.ts"];
       },
+      restartHost: judge.restartHost,
     });
     expect(result.passed).toBe(false);
     expect(result.detail).toContain("src/group-chat/router.ts");
@@ -1070,7 +1977,7 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     expect((await raw.readRoomEvents())[0]?.body).toBe("TEST-CLONE-BOUNDARY");
   });
 
-  it("reports absent production adapter as seven expected red lamps", () => {
+  it("reports absent production adapter as thirteen expected red lamps", () => {
     const results = runnerMissingDriverResults();
     expect(results.map(({ id }) => id)).toEqual(GROUP_CHAT_CHECK_IDS);
     expect(
@@ -1108,20 +2015,112 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     }));
     expect(scoreGroupChatResults(stubbedResults)).toEqual({
       trueGreen: 0,
-      stubGreen: 7,
+      stubGreen: 13,
       strictPass: false,
     });
 
     const realResults = stubbedResults.map((result) => ({ ...result, stubbed: false }));
     expect(scoreGroupChatResults(realResults)).toEqual({
-      trueGreen: 7,
+      trueGreen: 13,
       stubGreen: 0,
       strictPass: true,
     });
   });
 });
 
-describe("#191 runner: real-host provenance and static source scan", () => {
+describe("#192 stacked red oracle: each A-D behavior has a single-mutation red", () => {
+  it.each([
+    ["GC-06A", "GC-06", { ignoreTurnBudget: true }, "恰好放行 B 次"],
+    ["GC-06B retry", "GC-06", { duplicateRetry: true }, "重试重复"],
+    ["GC-06B pass", "GC-06", { omitPassRecord: true }, "pass"],
+    ["GC-06B failure", "GC-06", { omitFailureRecord: true }, "失败尝试"],
+    ["GC-06B identity", "GC-06", { resetBudgetOnIdentityChange: true }, "重置了同根预算"],
+    ["GC-06B generation", "GC-06", { omitRoundTarget: true }, "换代负例"],
+    ["GC-06B root", "GC-06", { acceptSelfDeclaredRoot: true }, "自报新根"],
+    ["GC-06C", "GC-06", { resetRoundOnRestart: true }, "高水位"],
+    ["GC-06C pid", "GC-06", { reuseRestartPid: true }, "换真实进程"],
+    ["GC-06C commit", "GC-06", { changeRestartCommit: true }, "commit"],
+    ["GC-06D", "GC-06", { dispatchWithInvalidPolicy: true }, "非法有限配置"],
+    ["GC-07A empty", "GC-07", { emptyOrdinaryQueue: true }, "非空普通队列"],
+    ["GC-07A shared", "GC-07", { controlSharesOrdinaryQueue: true }, "接收与实际生效"],
+    ["GC-07B", "GC-07", { acceptFalseControl: true }, "伪造"],
+    ["GC-07C receipts", "GC-07", { mergeControlReceipts: true }, "接收与实际生效"],
+    ["GC-07C unreachable", "GC-07", { reportUnreachableEffective: true }, "不可达"],
+    ["GC-07C effect", "GC-07", { claimExternalEffectReversed: true }, "副作用"],
+    ["GC-07D", "GC-07", { continueDeadlocks: true }, "continue"],
+    ["GC-08A", "GC-08", { unstableReasonAfterRestart: true }, "原因码"],
+    ["GC-08B offline", "GC-08", { markOfflineFeedbackDelivered: true }, "离线"],
+    ["GC-08B note", "GC-08", { feedbackNoteOnly: true }, "delivery receipt"],
+    ["GC-08C body", "GC-08", { leakBlockedBody: true }, "被拦原文"],
+    ["GC-08C cross", "GC-08", { crossDeliverFeedback: true }, "跨发送方"],
+    ["GC-08D consume", "GC-08", { consumeOnDecisionPersistFailure: true }, "仍消费"],
+    ["GC-08D duplicate", "GC-08", { duplicateDecisionOnRetry: true }, "恰好留一份"],
+    ["GC-10A", "GC-10", { omitProjectionGaps: true }, "省略缺口"],
+    ["GC-10B", "GC-10", { truncationMetadataNotModelVisible: true }, "模型可见"],
+    ["GC-10C", "GC-10", { leakHiddenProjection: true }, "隐藏内容"],
+    ["GC-10D revoke", "GC-10", { allowRevokedSourceRead: true }, "撤权后"],
+    ["GC-10D source", "GC-10", { wrongSourceRead: true }, "同一原事件"],
+    ["GC-12A", "GC-12", { useStaleRoster: true }, "成员表"],
+    ["GC-12B stimulus", "GC-12", { skipReturnedResultRecord: true }, "实际送回"],
+    ["GC-12B accept", "GC-12", { acceptStaleTarget: true }, "旧 scope/window"],
+    ["GC-12C", "GC-12", { acceptPreCutoffResult: true }, "stop 前许可"],
+    ["GC-12D", "GC-12", { acceptForgedTarget: true }, "六字段"],
+    ["GC-16A", "GC-16", { starveOtherMembers: true }, "饿死"],
+    ["GC-16B sync", "GC-16", { synchronousHoldFailure: true }, "同步快抛错"],
+    ["GC-16B deadline", "GC-16", { neverTimeoutHeld: true }, "deadline"],
+    ["GC-16C retry", "GC-16", { unboundedMemberRetries: true }, "无界"],
+    ["GC-16C restart", "GC-16", { washFailuresOnRestart: true }, "partial restart"],
+    ["GC-16C high-water", "GC-16", { resetRoundOnRestart: true }, "高水位"],
+    ["GC-16D feedback", "GC-16", { dropFailureFeedback: true }, "失败反馈"],
+    ["GC-16D receipt", "GC-16", { falseFailurePresenceReceipt: true }, "冒充"],
+  ] as const)("%s makes %s red for %j", async (_caseId, id, options, reason) => {
+    const result = await check(id, options);
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain(reason);
+  });
+
+  it("keeps synthetic positive controls explicitly outside real-host provenance", async () => {
+    for (const id of ["GC-06", "GC-07", "GC-08", "GC-10", "GC-12", "GC-16"] as const) {
+      const result = await check(id);
+      expect(result.passed, `${id}: ${result.detail}`).toBe(true);
+    }
+    const run = await new SyntheticGroupChatHost().startHost();
+    expect(
+      hostProvenanceProblem(run, {
+        headCommit: "0123456789abcdef0123456789abcdef01234567",
+        judgePid: process.pid,
+        judgeExecutable: realpathSync(process.execPath),
+        repoRoot: fileURLToPath(new URL("..", import.meta.url)),
+        readProcess: () => null,
+      }),
+    ).not.toBeNull();
+  });
+
+  it("deep-copies new orchestration readbacks as well as commands", async () => {
+    const raw = new SyntheticGroupChatHost();
+    const driver = cloneGroupChatDriverBoundary(raw);
+    await driver.resetScenario("GC-06", fixture);
+    await driver.perform({
+      kind: "configure-orchestration",
+      rootId: fixture.roots.first,
+      policyVersion: "test-policy:clone",
+      turnBudget: 1,
+      deadlineTicks: 1,
+      maxMemberAttempts: 1,
+    });
+    await driver.perform({
+      kind: "human-trigger",
+      operationId: "clone-human",
+      rootId: fixture.roots.first,
+      body: "TEST-CLONE-ORCHESTRATION",
+    });
+    const records = await driver.readRoundRecords();
+    (records[0] as { reasonCode: string | null }).reasonCode = "mutated";
+    expect((await raw.readRoundRecords())[0]?.reasonCode).toBeNull();
+  });
+});
+
+describe("#191/#192 runner: real-host provenance and static source scan", () => {
   const head = "0123456789abcdef0123456789abcdef01234567";
   const judgePid = 4242;
   const node = "/opt/test-node/bin/node";
@@ -1306,6 +2305,24 @@ describe("#191 runner: real-host provenance and static source scan", () => {
       expect(readProcessInfo(pid)).toBeNull();
     },
   );
+
+  it("fails restart provenance when the previous host pid is still alive or reused", () => {
+    const previous = { pid: 5000, commit: head };
+    const current = { pid: 5001, commit: head };
+    const factsFor = (alivePids: readonly number[]): HostProvenanceFacts => ({
+      headCommit: head,
+      judgePid,
+      judgeExecutable: node,
+      repoRoot,
+      readProcess: (pid) =>
+        alivePids.includes(pid) ? hostProcess({ ancestors: [judgePid, 1] }) : null,
+    });
+    expect(restartedHostProvenanceProblem(previous, current, factsFor([5000, 5001]))).toMatch(
+      /still alive/,
+    );
+    expect(restartedHostProvenanceProblem(previous, previous, factsFor([5001]))).toMatch(/reused/);
+    expect(restartedHostProvenanceProblem(previous, current, factsFor([5001]))).toBeNull();
+  });
 
   it.todo(
     "writes a durable challenge straight into the host's room ledger and reads it back through the adapter (needs the #191 adapter's data-root contract)",

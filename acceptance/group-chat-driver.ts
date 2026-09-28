@@ -1,5 +1,5 @@
 /**
- * Host adapter contract for #191 group-chat acceptance. The judge issues
+ * Host adapter contract for #191/#192 group-chat acceptance. The judge issues
  * concrete operations and independently reads host-owned ledgers/projections;
  * an adapter never returns a pre-composed pass/fail evidence card.
  */
@@ -9,8 +9,14 @@ export const GROUP_CHAT_CHECK_IDS = [
   "GC-03",
   "GC-04",
   "GC-05",
+  "GC-06",
+  "GC-07",
+  "GC-08",
   "GC-09",
+  "GC-10",
+  "GC-12",
   "GC-15",
+  "GC-16",
 ] as const;
 
 export type GroupChatCheckId = (typeof GROUP_CHAT_CHECK_IDS)[number];
@@ -22,11 +28,25 @@ export type ResidentId =
   | "test-resident:novel-e";
 export type DeliveryState = "loaded" | "queued" | "not-targeted";
 export type RosterPath = "broadcast" | "mention" | "projection" | "feedback" | "status";
+export type MemberBehavior = "complete" | "pass" | "fail" | "hold";
+export type PressureMode = "normal" | "batch" | "not-included" | "stopped" | "cooling";
+
+export interface DispatchIdentity {
+  readonly residentId: ResidentId;
+  readonly scopeId: string;
+  readonly scopeGeneration: number;
+  readonly windowId: string;
+  readonly generation: number;
+  readonly dispatchId: string;
+}
 
 export const groupChatSyntheticFixture = Object.freeze({
   roomId: "test-room:gc-191",
+  otherRoomId: "test-room:gc-192-other",
   hiddenRoomId: "test-room:gc-191-hidden",
   humanId: "test-human:owner",
+  unauthorizedHumanId: "test-human:unauthorized",
+  roots: Object.freeze({ first: "test-root:one", second: "test-root:two" }),
   residentIds: Object.freeze({
     a: "test-resident:a",
     b: "test-resident:b",
@@ -41,6 +61,8 @@ export const groupChatSyntheticFixture = Object.freeze({
     privateC: "TEST-PRIVATE-CANARY:c",
     draft: "TEST-PRIVATE-CANARY:draft",
     tool: "TEST-PRIVATE-CANARY:tool",
+    blocked: "TEST-PRIVATE-CANARY:blocked-body",
+    hiddenProjection: "TEST-PRIVATE-CANARY:hidden-projection",
   }),
 });
 
@@ -131,7 +153,105 @@ export type GroupChatCommand =
       readonly viewerId: ResidentId;
       readonly ownerId: ResidentId;
     }
-  | { readonly kind: "set-resident"; readonly residentId: ResidentId };
+  | { readonly kind: "set-resident"; readonly residentId: ResidentId }
+  | {
+      readonly kind: "configure-orchestration";
+      readonly rootId: string;
+      readonly policyVersion: string;
+      readonly turnBudget: number | null;
+      readonly deadlineTicks: number;
+      readonly maxMemberAttempts: number;
+    }
+  | {
+      readonly kind: "human-trigger";
+      readonly operationId: string;
+      readonly rootId: string;
+      readonly body: string;
+    }
+  | {
+      readonly kind: "member-turn";
+      readonly operationId: string;
+      readonly rootId: string;
+      readonly claimedRootId?: string;
+      readonly residentId: ResidentId;
+      readonly body: string;
+      readonly target?: DispatchIdentity;
+    }
+  | { readonly kind: "retry-operation"; readonly operationId: string }
+  | {
+      readonly kind: "set-member-behavior";
+      readonly residentId: ResidentId;
+      readonly behavior: MemberBehavior;
+    }
+  | {
+      readonly kind: "set-pressure";
+      readonly residentId: ResidentId;
+      readonly mode: PressureMode;
+    }
+  | { readonly kind: "advance-scheduler"; readonly ticks: number }
+  | { readonly kind: "fill-ordinary-queue"; readonly depth: number }
+  | {
+      readonly kind: "submit-control";
+      readonly controlId: string;
+      readonly issuerId: string;
+      readonly targetId: ResidentId;
+      readonly action: "stop" | "continue";
+      readonly structured: boolean;
+      /** Synthetic credential/binding handle; the host decides whether it authorizes control. */
+      readonly binding: string;
+    }
+  | {
+      readonly kind: "mark-external-effect";
+      readonly operationId: string;
+      readonly targetId: ResidentId;
+    }
+  | {
+      readonly kind: "set-sender-online";
+      readonly residentId: ResidentId;
+      readonly online: boolean;
+    }
+  | {
+      readonly kind: "query-feedback";
+      readonly residentId: ResidentId;
+      readonly via: "query" | "wake";
+    }
+  | {
+      readonly kind: "inject-next-fault";
+      readonly fault: "decision-persist" | "member-dispatch";
+      readonly residentId?: ResidentId;
+    }
+  | {
+      readonly kind: "seed-projection-event";
+      readonly eventId: string;
+      readonly body: string;
+      readonly authorized: boolean;
+    }
+  | {
+      readonly kind: "request-projection";
+      readonly projectionId: string;
+      readonly viewerId: ResidentId;
+      readonly mode: "batch" | "latest" | "truncate";
+      readonly maxCharacters?: number;
+    }
+  | {
+      readonly kind: "attempt-source-read";
+      readonly viewerId: ResidentId;
+      readonly sourceRef: string;
+    }
+  | { readonly kind: "set-room-access"; readonly residentId: ResidentId; readonly allowed: boolean }
+  | {
+      readonly kind: "set-room-membership";
+      readonly residentId: ResidentId;
+      readonly active: boolean;
+    }
+  | { readonly kind: "attempt-delivery"; readonly operationId: string }
+  | { readonly kind: "set-delivery-target"; readonly target: DispatchIdentity }
+  | {
+      readonly kind: "return-member-result";
+      readonly operationId: string;
+      readonly target: DispatchIdentity;
+      readonly body: string;
+    };
 
 export interface RoomEvent {
   readonly id: string;
@@ -200,6 +320,126 @@ export interface AccessAudit {
 export interface ResidentReaction {
   readonly residentId: string;
   readonly eventMarker: string;
+}
+
+/** Acceptance readback vocabulary: adapters map production records into these semantic facts. */
+export interface RoundRecord {
+  readonly sequence: number;
+  readonly operationId: string;
+  readonly rootId: string;
+  readonly senderId: string;
+  readonly policyVersion: string | null;
+  readonly decision:
+    | "human-trigger"
+    | "permitted"
+    | "passed"
+    | "failed"
+    | "held"
+    | "blocked"
+    | "retry-replayed";
+  readonly consumedTurns: number;
+  readonly reasonCode: string | null;
+  readonly target: DispatchIdentity | null;
+}
+
+export interface SchedulerSnapshot {
+  readonly tick: number;
+  readonly ordinaryQueueDepth: number;
+  readonly heldOperationIds: readonly string[];
+  readonly stoppedResidentIds: readonly ResidentId[];
+}
+
+export interface ControlRecord {
+  readonly sequence: number;
+  readonly controlId: string;
+  readonly issuerId: string;
+  readonly targetId: ResidentId;
+  readonly action: "stop" | "continue";
+  readonly phase: "accepted" | "effective" | "rejected" | "incomplete";
+  readonly cutoffId: string | null;
+  readonly externalEffectReversed: boolean;
+}
+
+export interface DeliveryDecisionRecord {
+  readonly sequence: number;
+  readonly operationId: string;
+  readonly senderId: ResidentId;
+  readonly state:
+    | "queued"
+    | "batched"
+    | "not-included"
+    | "stop-blocked"
+    | "dispatch-failed"
+    | "persist-failed"
+    | "dispatched"
+    | "context-committed"
+    | "rejected";
+  readonly reasonCode: string;
+  readonly count: number;
+  readonly permitConsumed: boolean;
+  readonly rosterVersion: number;
+  readonly target: DispatchIdentity | null;
+}
+
+export interface SenderFeedbackRecord {
+  readonly operationId: string;
+  readonly senderId: ResidentId;
+  readonly roomId: string;
+  readonly scopeId: string;
+  readonly reasonCode: string;
+  readonly count: number;
+  readonly phase: "pending" | "delivered";
+  readonly deliveryReceipt: string | null;
+  readonly body: string | null;
+}
+
+export interface ProjectionTruncation {
+  readonly eventId: string;
+  readonly originalLength: number;
+  readonly unit: "characters";
+  readonly keptStart: number;
+  readonly keptEnd: number;
+  readonly sourceRef: string;
+  readonly modelVisible: boolean;
+}
+
+export interface ProjectionReceipt {
+  readonly projectionId: string;
+  readonly viewerId: ResidentId;
+  readonly sourceRange: readonly [string, string];
+  readonly watermark: string;
+  readonly policyVersion: string;
+  readonly includedEventIds: readonly string[];
+  readonly omittedEventIds: readonly string[];
+  readonly complete: boolean;
+  readonly errorCode: string | null;
+  readonly truncations: readonly ProjectionTruncation[];
+}
+
+export interface SourceReadAudit {
+  readonly sourceRef: string;
+  readonly viewerId: ResidentId;
+  readonly outcome: "granted" | "denied";
+  readonly eventId: string | null;
+  readonly body: string | null;
+  readonly errorCode: string | null;
+}
+
+export interface MemberAttemptRecord {
+  readonly sequence: number;
+  readonly operationId: string;
+  readonly memberId: ResidentId;
+  readonly attempt: number;
+  readonly outcome: "in-flight" | "failed" | "unknown" | "completed";
+  readonly reasonCode: string | null;
+}
+
+export interface MemberResultRecord {
+  readonly sequence: number;
+  readonly operationId: string;
+  readonly target: DispatchIdentity;
+  readonly phase: "returned" | "committed" | "rejected";
+  readonly reasonCode: string | null;
 }
 
 /** One GC-04 world: add a single newcomer, then read every roster-driven path back. */
@@ -281,6 +521,51 @@ export interface GroupChatEvidenceById {
     rewrittenCallReceiptIds: readonly string[];
     structuredTargetId: ResidentId;
   };
+  "GC-06": {
+    boundedWorlds: readonly {
+      budget: number;
+      permitted: number;
+      blocked: number;
+      oneRoot: boolean;
+      policyVersionStable: boolean;
+    }[];
+    retryAddedDispatch: boolean;
+    passRecorded: boolean;
+    failureRecorded: boolean;
+    identityChangesResetBudget: boolean;
+    generationChangeStimulated: boolean;
+    selfRootAccepted: boolean;
+    restartPidChanged: boolean;
+    restartCommitStable: boolean;
+    highWaterBeforeRestart: number;
+    highWaterAfterRestart: number;
+    humanAfterLimitAccepted: boolean;
+    invalidConfigDispatched: boolean;
+    invalidConfigReasoned: boolean;
+  };
+  "GC-07": {
+    ordinaryQueueDepthBeforeControl: number;
+    heldBeforeControl: boolean;
+    stopAcceptedBeforeQueueRelease: boolean;
+    stopEffective: boolean;
+    oldPermitCommitted: boolean;
+    falseControlsChangedLatch: boolean;
+    acceptedAndEffectiveSeparated: boolean;
+    unreachableReportedIncomplete: boolean;
+    externalEffectClaimedReversed: boolean;
+    continueEffectiveWhileQueueBlocked: boolean;
+    postContinueNewPermitCommitted: boolean;
+  };
+  "GC-08": {
+    decisions: readonly DeliveryDecisionRecord[];
+    offlineFeedbackMarkedDelivered: boolean;
+    deliveredFeedback: readonly SenderFeedbackRecord[];
+    crossSenderFeedback: readonly SenderFeedbackRecord[];
+    leakedBlockedBody: boolean;
+    stableReasonsAcrossRestart: boolean;
+    persistFailureConsumedPermit: boolean;
+    persistedDecisionCountAfterRetry: number;
+  };
   "GC-09": {
     receipts: readonly SystemReceipt[];
     prematureReceiptPhases: readonly string[];
@@ -289,6 +574,29 @@ export interface GroupChatEvidenceById {
     reactionAuthorsBeforeResidentReacted: readonly string[];
     reactionAuthorsAfterResidentReacted: readonly string[];
     memoryRecordsAddedByContextCommit: number;
+  };
+  "GC-10": {
+    batch: ProjectionReceipt | null;
+    latest: ProjectionReceipt | null;
+    truncated: ProjectionReceipt | null;
+    projectionContext: string;
+    hiddenWorldFingerprints: readonly string[];
+    grantedRead: SourceReadAudit | null;
+    deniedRead: SourceReadAudit | null;
+  };
+  "GC-12": {
+    revokedDeliveryCommitted: boolean;
+    revokedDeliveryReasoned: boolean;
+    rosterVersionAdvanced: boolean;
+    staleResultActuallyReturned: boolean;
+    staleResultCommitted: boolean;
+    staleResultReasoned: boolean;
+    stoppedResultActuallyReturned: boolean;
+    stoppedResultCommitted: boolean;
+    postContinueResultCommitted: boolean;
+    forgedTupleAttempts: number;
+    forgedTupleCommits: number;
+    currentTupleCommits: number;
   };
   "GC-15": {
     authorizedPublicSurface: string;
@@ -301,6 +609,23 @@ export interface GroupChatEvidenceById {
     newResidentHistory: readonly GroupChatNewcomerHistoryEvidence[];
     crossRoomReplayAccepted: boolean;
   };
+  "GC-16": {
+    failedMemberAttempts: readonly MemberAttemptRecord[];
+    normalMemberCompleted: boolean;
+    humanContinued: boolean;
+    controlContinued: boolean;
+    heldWasActuallyInFlight: boolean;
+    heldTimedOut: boolean;
+    attemptsWithinBound: boolean;
+    restartPidChanged: boolean;
+    restartCommitStable: boolean;
+    failuresBeforeRestart: number;
+    failuresAfterRestart: number;
+    highWaterBeforeRestart: number;
+    highWaterAfterRestart: number;
+    failureFeedbackRetained: boolean;
+    falsePresenceClaims: readonly string[];
+  };
 }
 
 /**
@@ -311,6 +636,7 @@ export interface GroupChatHostDriver {
   readonly kind: "mist-host";
   /** Launch the host as a child process of this judge run (see GroupChatHostRun). */
   startHost(): Promise<GroupChatHostRun>;
+  restartHost(): Promise<GroupChatHostRun>;
   /** Resolve only after the host process has exited; every readback must reject afterwards. */
   stopHost(): Promise<void>;
   resetScenario(id: GroupChatCheckId, fixture: typeof groupChatSyntheticFixture): Promise<void>;
@@ -329,6 +655,16 @@ export interface GroupChatHostDriver {
   readSurface(roomId: string, viewerId: string): Promise<SurfaceSnapshot>;
   readAccessAudit(): Promise<AccessAudit>;
   readReactions(): Promise<readonly ResidentReaction[]>;
+  readRoundRecords(): Promise<readonly RoundRecord[]>;
+  readScheduler(): Promise<SchedulerSnapshot>;
+  readControlRecords(): Promise<readonly ControlRecord[]>;
+  readDeliveryDecisions(): Promise<readonly DeliveryDecisionRecord[]>;
+  readSenderFeedback(residentId: ResidentId): Promise<readonly SenderFeedbackRecord[]>;
+  readProjectionReceipts(): Promise<readonly ProjectionReceipt[]>;
+  readProjectionContext(residentId: ResidentId): Promise<string>;
+  readSourceReads(): Promise<readonly SourceReadAudit[]>;
+  readMemberAttempts(): Promise<readonly MemberAttemptRecord[]>;
+  readMemberResults(): Promise<readonly MemberResultRecord[]>;
 }
 
 /** Clone both arguments and return values at the adapter boundary (#196/#200 pattern). */

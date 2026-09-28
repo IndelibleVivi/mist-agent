@@ -1,5 +1,5 @@
 /**
- * #191 PR1: executable contract for GC-01..05, GC-09 and GC-15.
+ * #191/#192 stacked red contract for GC-01..10, GC-12, GC-15 and GC-16.
  *
  *   npm run acceptance:group-chat        # report expected reds if no host adapter
  *   npm run acceptance:group-chat:strict # nonzero unless all real-host checks pass
@@ -58,7 +58,7 @@ export function missingDriverResults(): GroupChatRunResult[] {
     title,
     passed: false,
     stubbed: false,
-    detail: "real-host driver missing (expected PR1 red; no host behavior exercised)",
+    detail: "real-host driver missing (expected stacked red; no host behavior exercised)",
   }));
 }
 
@@ -147,6 +147,25 @@ export function hostProvenanceProblem(
   if (!/^[0-9a-f]{7,40}$/u.test(commit)) return `host source "${run.commit}" is not a commit id`;
   if (!facts.headCommit.trim().toLowerCase().startsWith(commit))
     return `host source ${run.commit} is not the checked-out HEAD ${facts.headCommit.trim()}`;
+  return null;
+}
+
+/**
+ * A restart must produce a genuinely new process of the same source: new pid, previous pid
+ * gone, and the fresh run passes the same provenance check at the same commit.
+ */
+export function restartedHostProvenanceProblem(
+  previous: GroupChatHostRun,
+  current: GroupChatHostRun,
+  facts: HostProvenanceFacts,
+): string | null {
+  if (current.pid === previous.pid) return "host restart reused the previous process id";
+  if (facts.readProcess(previous.pid)?.alive === true)
+    return `previous host process ${previous.pid} is still alive after restart`;
+  const currentProblem = hostProvenanceProblem(current, facts);
+  if (currentProblem !== null) return currentProblem;
+  if (current.commit.trim().toLowerCase() !== previous.commit.trim().toLowerCase())
+    return "host restart changed the source commit";
   return null;
 }
 
@@ -329,9 +348,19 @@ async function runHostChecks(loaded: LoadedDriver): Promise<GroupChatRunResult[]
     throw new HostProvenanceError(`real-host provenance check failed: ${problem}`);
   }
 
+  let activeHost = host;
   const context = {
     findSourceLiterals: (terms: readonly string[]) =>
       findSourceLiterals(SOURCE_ROOT, terms, REPO_ROOT),
+    restartHost: async (restartDriver: GroupChatHostDriver) => {
+      const previous = activeHost;
+      const current = await restartDriver.restartHost();
+      const restartProblem = restartedHostProvenanceProblem(previous, current, facts);
+      if (restartProblem !== null)
+        throw new Error(`restarted real-host provenance check failed: ${restartProblem}`);
+      activeHost = current;
+      return { previous, current };
+    },
   };
   const results: GroupChatRunResult[] = [];
   try {
@@ -358,12 +387,12 @@ async function runHostChecks(loaded: LoadedDriver): Promise<GroupChatRunResult[]
   } finally {
     await driver.stopHost();
   }
-  const stopProblem = await hostStopProblem(driver, host.pid, facts.readProcess);
+  const stopProblem = await hostStopProblem(driver, activeHost.pid, facts.readProcess);
   if (stopProblem !== null)
     throw new HostProvenanceError(
       `real-host provenance check failed after stopHost(): ${stopProblem}`,
     );
-  console.log(`真实宿主进程 PID ${host.pid}；代码 ${host.commit}`);
+  console.log(`真实宿主进程 PID ${activeHost.pid}；代码 ${activeHost.commit}`);
   console.log(
     "宿主来源已由判卷核对：判卷子进程、同一 node、src/ 入口、当前 HEAD、停机后进程退出且读回拒绝。判卷绕过 adapter 直写原账再读回的挑战，待 #191 adapter 定下数据根后补。",
   );
@@ -372,7 +401,7 @@ async function runHostChecks(loaded: LoadedDriver): Promise<GroupChatRunResult[]
 
 async function main(): Promise<void> {
   const driver = await loadDriver();
-  console.log("Mist #191 群聊验收：GC-01～05、GC-09、GC-15");
+  console.log("Mist #191/#192 群聊验收：GC-01～10、GC-12、GC-15、GC-16");
   console.log(`合成夹具：${groupChatSyntheticFixture.roomId}；不读取真实聊天/记忆/凭据`);
   console.log("");
 
@@ -400,7 +429,10 @@ async function main(): Promise<void> {
   console.log(
     `真实宿主通过 ${driver === null ? 0 : score.trueGreen} / ${results.length}${score.stubGreen > 0 ? `；桩灯 ${score.stubGreen}` : ""}`,
   );
-  if (driver === null) console.log("这轮只确认 PR1 的预期红灯；没有执行宿主正向/负向验收。");
+  if (driver === null)
+    console.log(
+      "这轮只确认 #192 六灯 stacked 于已合入 #202 的预期红灯；没有执行宿主正向/负向验收。",
+    );
   if (provenanceFailed) {
     console.log("宿主来源核对未通过：这是坏 adapter，不是缺驱动的起点，报告模式同样非零退出。");
     process.exitCode = 1;

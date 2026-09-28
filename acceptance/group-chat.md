@@ -2,8 +2,8 @@
 
 对应 [#157](https://github.com/mist-agent-harness/mist-agent/issues/157) 和
 [设计图](../docs/design/group-chat-phase-0.md)。全部未勾选：这是未实现的语义规格。
-PR1 已接入可复跑判卷器：`npm run acceptance:group-chat`；严格模式为
-`npm run acceptance:group-chat:strict`。在真实宿主 adapter 尚不存在时，七灯报告
+PR1 与 #192 第一笔 stacked 红灯已接入同一个可复跑判卷器：`npm run acceptance:group-chat`；
+严格模式为 `npm run acceptance:group-chat:strict`。在真实宿主 adapter 尚不存在时，十三灯报告
 `real-host driver missing` 红灯；这只证明验收入口和基线，不代表宿主行为已运行或失败。
 
 PR1 冻结 GC-01～05、GC-09、GC-15 的合成场景与证据判据，不实现群聊写口，也不使用
@@ -18,6 +18,37 @@ GC-05、GC-09、GC-15 均因 `real-host driver missing` 报预期红，真实宿
 这证明新验收入口能显式报告缺驱动基线，不证明宿主行为已运行或失败。正向形状的单测
 只是判卷器自检，既不算宿主正向对照，也不点亮任何 GC 灯。首个群聊写口 PR 仍须补真实
 宿主 adapter，并通过授权正向和拒绝负例；GC-03/GC-09 的完整账本/投递结论继续留后。
+
+## #192 第一笔 stacked 红测（2026-09-27 初稿，2026-09-28 重基到 #202 合入后的 main）
+
+本笔 stack 在 main `9f8e3b326424f062d92e53337a721e7fbbdea866`（#202 已合入）之上；
+只扩写同一组 driver/judge 文件，不建立第二套 runner、房间账或生产 adapter。
+#191 的房间原账、成员注册表和结构化 mention 合入前，只冻结 API-agnostic 行为 oracle；
+`src/group-chat-acceptance-driver.ts` 及所有真实宿主正向证据仍须等待 #191 的实际接口。
+
+新增 GC-06、GC-07、GC-08、GC-10、GC-12、GC-16 六灯。报告模式退出码为 0，十三灯均因
+`real-host driver missing` 报预期红，真实宿主通过 `0/13`；strict 模式退出非 0。没有导出
+`STUBBED`，也没有修改下表的冻结输入、层级、通过判据或灯位。
+
+合成 judge 自测只证明判卷可证伪，不算宿主正向对照：
+
+- GC-06 A-D：B=1/B=3 同根有界；pass/失败/重试/身份与自报根不续杯；新进程同 commit
+  续高水位；人类新触发与非法配置边界。
+- GC-07 A-D：先读回非空普通队列与真实 held permit，再测独立 stop；伪造/越权控制无效；
+  accepted/effective 分离且不撤销既有副作用；continue 不死锁也不复活旧许可。
+- GC-08 A-D：batch/未纳入/stop/派发失败四类决定；离线 feedback 必须待取并带真实 delivery
+  receipt；零原文与跨私域泄漏；决定落盘失败不消费许可、恢复不双计数。
+- GC-10 A-D：batch 与 latest 缺口、水位和策略显式；单条截断元数据进入模型可见上下文；
+  隐藏三世界不泄漏；source ref 每次重验授权，撤权后旧引用失效。
+- GC-12 A-D：旧 roster 不续权；旧 generation 结果必须实际注入后被拒；stop cutoff 后旧许可
+  实返实拒、continue 只开新许可；六字段 target 逐字段伪造均拒并保留当前身份正对照。
+- GC-16 A-D：持续失败不饿死 B/人类/控制；真实 in-flight wedge 经 controlled scheduler 截止，
+  同步快抛错不能冒充；retry 有界且 partial restart 不洗 failure/high-water；反馈与回执不假在场。
+
+所有 command 入参与 host readback 继续在 driver 边界统一 `structuredClone`。时间只由 controlled
+scheduler 推进，不用 sleep；重启必须返回新 PID、同 checkout commit，并再次通过 runner 的
+provenance 核验。故障注入只触发 ledger append/member transport 失败，被验宿主仍负责身份、
+权限、编排、提交与耐久回读。
 
 ## PR1 判卷边界（2026-09-27 按 #202 初审修订，09-28 按第二、三轮复审及批准意见再修订）
 
