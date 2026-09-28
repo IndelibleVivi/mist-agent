@@ -52,7 +52,7 @@ runner 边界，十三灯全部按坏 adapter 判红、report 与 strict 都非�
 scenario error。故障注入只触发 ledger append/member transport 失败，被验宿主仍负责身份、
 权限、编排、提交与耐久回读。
 
-## PR1 判卷边界（2026-09-27 按 #202 初审修订，09-28 按第二、三轮复审及批准意见再修订）
+## PR1 判卷边界（2026-09-27 按 #202 初审修订，09-28 按第二、三轮复审、批准意见及 #206 复审再修订）
 
 - 宿主来源：`kind: "mist-host"` 只是类型标签。跑灯前判卷自己读进程事实（Linux 读 `/proc`，
   其他 POSIX 用 `ps`）：`startHost()` 报的进程活着、是本次判卷进程的后代、跑的是判卷同一个
@@ -63,6 +63,12 @@ scenario error。故障注入只触发 ledger append/member transport 失败，�
   留着 todo）。桩灯沿用仓内 `STUBBED` 惯例：申报的方法所在灯记黄，不计真绿。
 - GC-02：四个越界负例（缺公开声明、缺房间、缺绑定、夹带私有字段）都由同一发送方住户 A 提交，
   每条只缺或多一项。人类入口是否也须显式声明公开，设计图没有单列，PR1 不判。
+- 可信 owner binding 分层（#206 复审）：`groupChatSyntheticFixture.trustedOwnerBinding` 是判卷
+  持有的 setup grant，只经 `resetScenario(id, fixture)` 登记给宿主；`perform()` 命令里的
+  `binding` 字段永远是不可信请求输入，宿主只拿它与当轮已登记的 grant 比对。同一个字符串只
+  塞进命令、没有 setup grant 时不得写入；判卷自己发出的合法绑定一律从夹具读取，不在判卷或
+  宿主源码里硬编码自授权。回归探针证明：未 reset 时同串命令写入为零，正常 reset 后可写，
+  错误/空串仍拒。控制通道的 `submit-control` 绑定是另一条缝，本次不动。
 - GC-03：投递状态由判卷设置，本灯只核三行投递账按成员分开读回、原账不变、A 显式保存指回
   原事件。谁真的装入或排队（投递语义）留到投递账实现阶段，不能凭本灯视为已覆盖。
 - GC-04：两个世界各加一位不同的新成员，都要贯通五条路径；另静态扫描 `src/` 的非测试文件，

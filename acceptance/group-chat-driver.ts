@@ -46,6 +46,12 @@ export const groupChatSyntheticFixture = Object.freeze({
   hiddenRoomId: "test-room:gc-191-hidden",
   humanId: "test-human:owner",
   unauthorizedHumanId: "test-human:unauthorized",
+  /**
+   * Judge-owned setup grant: the only trusted source of the owner binding. An adapter
+   * registers it from resetScenario(id, fixture); the `binding` field of a perform()
+   * command stays untrusted request input and can never create this trust by itself.
+   */
+  trustedOwnerBinding: "test-binding:owner",
   roots: Object.freeze({ first: "test-root:one", second: "test-root:two" }),
   residentIds: Object.freeze({
     a: "test-resident:a",
@@ -84,6 +90,7 @@ export type GroupChatCommand =
       readonly claimedAuthorId?: string;
       readonly body: string;
       readonly visibility?: "public";
+      /** Untrusted request field; the host only compares it against its registered setup grant. */
       readonly binding?: string;
       readonly privateFields?: readonly string[];
     }
@@ -643,6 +650,7 @@ export interface GroupChatHostDriver {
   restartHost(): Promise<GroupChatHostRun>;
   /** Resolve only after the host process has exited; every readback must reject afterwards. */
   stopHost(): Promise<void>;
+  /** Delivers the judge-owned setup grant: fixture.trustedOwnerBinding is the only trusted binding source. */
   resetScenario(id: GroupChatCheckId, fixture: typeof groupChatSyntheticFixture): Promise<void>;
   perform(command: GroupChatCommand): Promise<void>;
   /** Omitted roomId means all records in the synthetic test namespace. */

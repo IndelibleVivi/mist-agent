@@ -209,6 +209,8 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   private hostPid = 12345;
   private hostCommit = "synthetic-test-only";
   private scenarioId: GroupChatCheckId = "GC-01";
+  /** The owner binding is trusted only after resetScenario registers the judge-owned setup grant. */
+  private trustedOwnerBinding: string | null = null;
   private sequence = 0;
   private roundRecords: RoundRecord[] = [];
   private policy: {
@@ -278,8 +280,11 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   }
   async stopHost(): Promise<void> {}
 
-  async resetScenario(id: GroupChatCheckId): Promise<void> {
+  async resetScenario(id: GroupChatCheckId, setup: typeof fixture): Promise<void> {
     this.scenarioId = id;
+    // Setup grant: the only moment the owner binding becomes trusted. A perform() command
+    // carrying the same string is still untrusted request input and proves nothing alone.
+    this.trustedOwnerBinding = setup.trustedOwnerBinding;
     this.events = [];
     this.eventTime.clear();
     this.roomCounters.clear();
@@ -706,13 +711,13 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
         const valid =
           command.roomId !== "" &&
           command.visibility === "public" &&
-          command.binding === "test-binding:owner" &&
+          command.binding === this.trustedOwnerBinding &&
           command.privateFields === undefined &&
           command.claimedAuthorId === undefined;
         const defects = [
           command.visibility !== "public" ? "visibility" : null,
           command.roomId === "" ? "room" : null,
-          command.binding !== "test-binding:owner" ? "binding" : null,
+          command.binding !== this.trustedOwnerBinding ? "binding" : null,
           command.privateFields !== undefined ? "private-fields" : null,
           command.claimedAuthorId !== undefined ? "claimed-author" : null,
         ].filter((defect) => defect !== null);
@@ -1987,12 +1992,14 @@ describe("#191/#192 group-chat acceptance: judge-driven synthetic host checks", 
   it("copies command arguments and host readbacks at the adapter boundary", async () => {
     const raw = new SyntheticGroupChatHost();
     const driver = cloneGroupChatDriverBoundary(raw);
+    // The setup grant crosses the same cloned boundary before any post can be trusted.
+    await driver.resetScenario("GC-01", fixture);
     const command: GroupChatCommand = {
       kind: "post",
       roomId: fixture.roomId,
       principalId: fixture.humanId,
       visibility: "public",
-      binding: "test-binding:owner",
+      binding: fixture.trustedOwnerBinding,
       body: "TEST-CLONE-BOUNDARY",
     };
     await driver.perform(command);
@@ -2002,6 +2009,36 @@ describe("#191/#192 group-chat acceptance: judge-driven synthetic host checks", 
     (returned as unknown as { body: string }).body = "mutated-return-value";
     expect(command.body).toBe("TEST-CLONE-BOUNDARY");
     expect((await raw.readRoomEvents())[0]?.body).toBe("TEST-CLONE-BOUNDARY");
+  });
+
+  // #206 review 2: the binding string is never self-authorizing. Only the judge-owned setup
+  // grant delivered through resetScenario(id, fixture) registers it on the host.
+  it("trusts the owner binding only as a resetScenario setup grant, never from a command", async () => {
+    const post = (binding: string): GroupChatCommand => ({
+      kind: "post",
+      roomId: fixture.roomId,
+      principalId: fixture.humanId,
+      visibility: "public",
+      binding,
+      body: "TEST-TRUSTED-BINDING-SEAM",
+    });
+    // Without a setup grant, the exact trusted string inside perform() writes nothing.
+    const host = new SyntheticGroupChatHost();
+    await host.perform(post(fixture.trustedOwnerBinding));
+    expect(await host.readRoomEvents()).toHaveLength(0);
+    // After resetScenario registers the grant, the same command writes normally.
+    await host.resetScenario("GC-01", fixture);
+    await host.perform(post(fixture.trustedOwnerBinding));
+    expect((await host.readRoomEvents()).map((event) => event.body)).toContain(
+      "TEST-TRUSTED-BINDING-SEAM",
+    );
+    // A wrong or empty binding stays rejected once the grant exists.
+    for (const binding of ["test-binding:forged", ""]) {
+      const negative = new SyntheticGroupChatHost();
+      await negative.resetScenario("GC-01", fixture);
+      await negative.perform(post(binding));
+      expect(await negative.readRoomEvents()).toHaveLength(0);
+    }
   });
 
   it("reports absent production adapter as thirteen expected red lamps", () => {
