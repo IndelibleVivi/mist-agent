@@ -309,7 +309,7 @@ function driverFileExists(): boolean {
   return existsSync(fileURLToPath(new URL(DRIVER_SPECIFIER, import.meta.url)));
 }
 
-interface LoadedDriver {
+export interface LoadedDriver {
   readonly driver: GroupChatHostDriver;
   readonly stubbed: ReadonlySet<string>;
 }
@@ -332,9 +332,29 @@ async function loadDriver(): Promise<LoadedDriver | null> {
   };
 }
 
-async function runHostChecks(loaded: LoadedDriver): Promise<GroupChatRunResult[]> {
+/** Tests inject the driver loader and provenance facts; production leaves both real. */
+export interface GroupChatAcceptanceOptions {
+  readonly strict?: boolean;
+  readonly loadDriver?: () => Promise<LoadedDriver | null>;
+  readonly facts?: HostProvenanceFacts;
+  readonly log?: (line: string) => void;
+}
+
+export interface GroupChatAcceptanceOutcome {
+  readonly results: readonly GroupChatRunResult[];
+  readonly driverMissing: boolean;
+  readonly provenanceFailed: boolean;
+  readonly strict: boolean;
+  readonly exitCode: number;
+}
+
+async function runHostChecks(
+  loaded: LoadedDriver,
+  factsOverride?: HostProvenanceFacts,
+  log: (line: string) => void = console.log,
+): Promise<GroupChatRunResult[]> {
   const { driver, stubbed } = loaded;
-  const facts: HostProvenanceFacts = {
+  const facts: HostProvenanceFacts = factsOverride ?? {
     headCommit: currentHeadCommit(),
     judgePid: process.pid,
     judgeExecutable: realpathSync(process.execPath),
@@ -356,8 +376,14 @@ async function runHostChecks(loaded: LoadedDriver): Promise<GroupChatRunResult[]
       const previous = activeHost;
       const current = await restartDriver.restartHost();
       const restartProblem = restartedHostProvenanceProblem(previous, current, facts);
+      // Restart provenance is whole-run evidence: a host whose restart cannot be
+      // attributed leaves no lamp judgeable, exactly like the start/stop checks.
+      // It must surface as HostProvenanceError so the runner paints every lamp red
+      // instead of one lamp's "scenario threw".
       if (restartProblem !== null)
-        throw new Error(`restarted real-host provenance check failed: ${restartProblem}`);
+        throw new HostProvenanceError(
+          `restarted real-host provenance check failed: ${restartProblem}`,
+        );
       activeHost = current;
       return { previous, current };
     },
@@ -375,6 +401,9 @@ async function runHostChecks(loaded: LoadedDriver): Promise<GroupChatRunResult[]
           stubbed: isStubbed,
         });
       } catch (error) {
+        // A provenance failure is not one lamp's scenario error: rethrow it to the
+        // runner boundary so every lamp goes red and both modes exit nonzero.
+        if (error instanceof HostProvenanceError) throw error;
         results.push({
           id: check.id,
           title: check.title,
@@ -392,18 +421,22 @@ async function runHostChecks(loaded: LoadedDriver): Promise<GroupChatRunResult[]
     throw new HostProvenanceError(
       `real-host provenance check failed after stopHost(): ${stopProblem}`,
     );
-  console.log(`真实宿主进程 PID ${activeHost.pid}；代码 ${activeHost.commit}`);
-  console.log(
+  log(`真实宿主进程 PID ${activeHost.pid}；代码 ${activeHost.commit}`);
+  log(
     "宿主来源已由判卷核对：判卷子进程、同一 node、src/ 入口、当前 HEAD、停机后进程退出且读回拒绝。判卷绕过 adapter 直写原账再读回的挑战，待 #191 adapter 定下数据根后补。",
   );
   return results;
 }
 
-async function main(): Promise<void> {
-  const driver = await loadDriver();
-  console.log("Mist #191/#192 群聊验收：GC-01～10、GC-12、GC-15、GC-16");
-  console.log(`合成夹具：${groupChatSyntheticFixture.roomId}；不读取真实聊天/记忆/凭据`);
-  console.log("");
+export async function executeGroupChatAcceptance(
+  options: GroupChatAcceptanceOptions = {},
+): Promise<GroupChatAcceptanceOutcome> {
+  const isStrict = options.strict ?? false;
+  const log = options.log ?? console.log;
+  const driver = await (options.loadDriver ?? loadDriver)();
+  log("Mist #191/#192 群聊验收：GC-01～10、GC-12、GC-15、GC-16");
+  log(`合成夹具：${groupChatSyntheticFixture.roomId}；不读取真实聊天/记忆/凭据`);
+  log("");
 
   let provenanceFailed = false;
   let results: GroupChatRunResult[];
@@ -411,7 +444,7 @@ async function main(): Promise<void> {
     results = missingDriverResults();
   } else {
     try {
-      results = await runHostChecks(driver);
+      results = await runHostChecks(driver, options.facts, log);
     } catch (error) {
       if (!(error instanceof HostProvenanceError)) throw error;
       provenanceFailed = true;
@@ -420,24 +453,33 @@ async function main(): Promise<void> {
   }
   const score = scoreGroupChatResults(results);
   for (const result of results) {
-    console.log(
+    log(
       `${result.passed ? (result.stubbed ? "🟡" : "🟢") : "🔴"} ${result.id} ${result.stubbed && result.passed ? `桩灯 — ${result.title}` : result.title}`,
     );
-    console.log(`   ${result.detail}`);
+    log(`   ${result.detail}`);
   }
-  console.log("");
-  console.log(
+  log("");
+  log(
     `真实宿主通过 ${driver === null ? 0 : score.trueGreen} / ${results.length}${score.stubGreen > 0 ? `；桩灯 ${score.stubGreen}` : ""}`,
   );
   if (driver === null)
-    console.log(
-      "这轮只确认 #192 六灯 stacked 于已合入 #202 的预期红灯；没有执行宿主正向/负向验收。",
-    );
+    log("这轮只确认 #192 六灯 stacked 于已合入 #202 的预期红灯；没有执行宿主正向/负向验收。");
   if (provenanceFailed) {
-    console.log("宿主来源核对未通过：这是坏 adapter，不是缺驱动的起点，报告模式同样非零退出。");
-    process.exitCode = 1;
+    log("宿主来源核对未通过：这是坏 adapter，不是缺驱动的起点，报告模式同样非零退出。");
   }
-  if (strict && !score.strictPass) process.exitCode = 1;
+  const exitCode = provenanceFailed || (isStrict && !score.strictPass) ? 1 : 0;
+  return {
+    results,
+    driverMissing: driver === null,
+    provenanceFailed,
+    strict: isStrict,
+    exitCode,
+  };
+}
+
+async function main(): Promise<void> {
+  const outcome = await executeGroupChatAcceptance({ strict });
+  if (outcome.exitCode !== 0) process.exitCode = outcome.exitCode;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

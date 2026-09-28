@@ -50,6 +50,7 @@ import {
 import {
   type HostProcessInfo,
   type HostProvenanceFacts,
+  executeGroupChatAcceptance,
   findSourceLiterals,
   hostProvenanceProblem,
   hostStopProblem,
@@ -101,6 +102,10 @@ interface TestOptions {
   readonly omitPlainDecisions?: boolean;
   readonly holdGatedMentions?: boolean;
   readonly acceptUnknownTargetWithoutCall?: boolean;
+  /** #206 review 1: sender feedback free text carries a resident id claiming a personal state. */
+  readonly feedbackClaimsMemberRead?: boolean;
+  /** #206 review 1: a failure receipt carries a canonical resident id claiming a personal state. */
+  readonly failureReceiptClaimsMemberRead?: boolean;
   /** #202 second-review probes: calls the decisions do not account for. */
   readonly plainCallOffDecision?: boolean;
   readonly orphanCalls?: boolean;
@@ -414,7 +419,11 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
         online || this.options.markOfflineFeedbackDelivered
           ? `feedback-receipt:${submission.operationId}`
           : null,
-      body: this.options.leakBlockedBody ? submission.body : null,
+      body: this.options.leakBlockedBody
+        ? submission.body
+        : this.options.feedbackClaimsMemberRead
+          ? `${submission.residentId} 已读完配置`
+          : null,
     });
   }
 
@@ -620,6 +629,13 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
       this.appendFeedback(submission, "ROOM_MEMBER_FAILED");
       if (this.options.falseFailurePresenceReceipt)
         this.receipts.push({ actor: "system", phase: "seen", claim: "成员已读且讨论有产出" });
+      if (this.options.failureReceiptClaimsMemberRead)
+        this.receipts.push({
+          actor: "system",
+          phase: "failed",
+          // 记忆类声称：旧的 falsePresence 正则不管记忆，只有共享判卷能拦。
+          claim: `${submission.residentId} 已写入记忆`,
+        });
       return;
     }
     if (behavior === "hold") {
@@ -1563,7 +1579,15 @@ const unsupportedClaims = [
   "小明已读完配置",
   "Ada已读完配置",
   "系统小明已读完配置",
-  "系统我已看到投递失败",
+  // #206 review 1: canonical resident id must not launder a personal claim into a
+  // system config reading; arbitrary colon strings stay unprotected (suffix clause judges).
+  "test-resident:a 已读完配置",
+  "test-resident:novel-d 已读",
+  "test-resident:b 👀",
+  "test-resident:c 正在输入",
+  "test-resident:a 已写入记忆",
+  "test-resident:b 已理解",
+  "test-human:owner 已读完配置",
 ];
 
 /**
@@ -1628,6 +1652,9 @@ const honestClaims = [
   "代表已读完配置",
   "日志已读完配置",
   "不到一秒就已读完配置",
+  // 不泛化成任意冒号字符串：非夹具 id 照旧在冒号处切开，残余子句按无主语配置读取放行。
+  "other-id:x 已读完配置",
+  "test-resident:x 已读完配置，不代表理解",
 ];
 
 describe("#191/#192 group-chat acceptance: judge-driven synthetic host checks", () => {
@@ -2052,6 +2079,7 @@ describe("#192 stacked red oracle: each A-D behavior has a single-mutation red",
     ["GC-08B offline", "GC-08", { markOfflineFeedbackDelivered: true }, "离线"],
     ["GC-08B note", "GC-08", { feedbackNoteOnly: true }, "delivery receipt"],
     ["GC-08C body", "GC-08", { leakBlockedBody: true }, "被拦原文"],
+    ["GC-08C claim", "GC-08", { feedbackClaimsMemberRead: true }, "冒充成员个人状态"],
     ["GC-08C cross", "GC-08", { crossDeliverFeedback: true }, "跨发送方"],
     ["GC-08D consume", "GC-08", { consumeOnDecisionPersistFailure: true }, "仍消费"],
     ["GC-08D duplicate", "GC-08", { duplicateDecisionOnRetry: true }, "恰好留一份"],
@@ -2073,6 +2101,7 @@ describe("#192 stacked red oracle: each A-D behavior has a single-mutation red",
     ["GC-16C high-water", "GC-16", { resetRoundOnRestart: true }, "高水位"],
     ["GC-16D feedback", "GC-16", { dropFailureFeedback: true }, "失败反馈"],
     ["GC-16D receipt", "GC-16", { falseFailurePresenceReceipt: true }, "冒充"],
+    ["GC-16D claim", "GC-16", { failureReceiptClaimsMemberRead: true }, "冒充成员个人状态"],
   ] as const)("%s makes %s red for %j", async (_caseId, id, options, reason) => {
     const result = await check(id, options);
     expect(result.passed).toBe(false);
@@ -2347,5 +2376,158 @@ describe("#191/#192 runner: real-host provenance and static source scan", () => 
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("#206 review 1 runner: restart provenance failure is a whole-run red, never one lamp", () => {
+  const head = "0123456789abcdef0123456789abcdef01234567";
+  const judgePid = 4242;
+  const node = "/opt/test-node/bin/node";
+  const repoRoot = fileURLToPath(new URL("..", import.meta.url));
+  const entry = join("src", "installer", "cli.ts");
+
+  type HostRun = { readonly pid: number; readonly commit: string };
+  type RestartScript = (previous: HostRun, alive: Set<number>) => HostRun;
+
+  /** A synthetic host whose process story is readable by the judge's own facts. */
+  class RestartProbeHost extends SyntheticGroupChatHost {
+    private readonly alivePids = new Set<number>();
+    private stoppedNow = false;
+    private currentRun: HostRun = { pid: 5000, commit: head };
+    constructor(private readonly restartScript: RestartScript) {
+      super();
+    }
+    override async startHost(): Promise<HostRun> {
+      this.alivePids.add(this.currentRun.pid);
+      return this.currentRun;
+    }
+    override async restartHost(): Promise<HostRun> {
+      this.currentRun = this.restartScript(this.currentRun, this.alivePids);
+      return this.currentRun;
+    }
+    override async stopHost(): Promise<void> {
+      this.stoppedNow = true;
+      this.alivePids.clear();
+    }
+    override async readRoomEvents(roomId?: string): Promise<readonly RoomEvent[]> {
+      if (this.stoppedNow) throw new Error("host stopped");
+      return super.readRoomEvents(roomId);
+    }
+    get livePids(): ReadonlySet<number> {
+      return this.alivePids;
+    }
+  }
+
+  const probeFacts = (host: RestartProbeHost): HostProvenanceFacts => ({
+    headCommit: head,
+    judgePid,
+    judgeExecutable: node,
+    repoRoot,
+    readProcess: (pid) =>
+      host.livePids.has(pid)
+        ? {
+            alive: true,
+            ancestors: [judgePid, 1],
+            executable: node,
+            args: [node, "--import", "tsx", entry],
+          }
+        : null,
+  });
+
+  const runWith = async (restartScript: RestartScript, strict: boolean) => {
+    const host = new RestartProbeHost(restartScript);
+    return executeGroupChatAcceptance({
+      strict,
+      loadDriver: async () => ({ driver: host, stubbed: new Set<string>() }),
+      facts: probeFacts(host),
+      log: () => {},
+    });
+  };
+
+  const healthyRestart: RestartScript = (previous, alive) => {
+    alive.delete(previous.pid);
+    const next = { pid: previous.pid + 1, commit: previous.commit };
+    alive.add(next.pid);
+    return next;
+  };
+
+  it("runs all thirteen lamps green with an attributable restart", async () => {
+    const outcome = await runWith(healthyRestart, true);
+    expect(outcome.provenanceFailed).toBe(false);
+    expect(scoreGroupChatResults(outcome.results)).toEqual({
+      trueGreen: 13,
+      stubGreen: 0,
+      strictPass: true,
+    });
+    expect(outcome.exitCode).toBe(0);
+  });
+
+  it.each([
+    ["a reused pid", (previous: HostRun, _alive: Set<number>): HostRun => previous],
+    [
+      "the previous pid still alive",
+      (previous: HostRun, alive: Set<number>): HostRun => {
+        const next = { pid: previous.pid + 1, commit: previous.commit };
+        alive.add(next.pid);
+        return next;
+      },
+    ],
+    [
+      "a changed commit",
+      (previous: HostRun, alive: Set<number>): HostRun => {
+        alive.delete(previous.pid);
+        const next = {
+          pid: previous.pid + 1,
+          commit: "fedcba9876543210fedcba9876543210fedcba98",
+        };
+        alive.add(next.pid);
+        return next;
+      },
+    ],
+    [
+      "a current process that is not running",
+      (previous: HostRun, alive: Set<number>): HostRun => {
+        alive.delete(previous.pid);
+        return { pid: previous.pid + 2, commit: previous.commit };
+      },
+    ],
+  ] as const)(
+    "restart provenance failure (%s) paints every lamp red in both modes",
+    async (_label, restartScript) => {
+      for (const strict of [false, true]) {
+        const outcome = await runWith(restartScript, strict);
+        expect(outcome.provenanceFailed, `strict=${strict}`).toBe(true);
+        expect(outcome.results.map((result) => result.id)).toEqual(GROUP_CHAT_CHECK_IDS);
+        for (const result of outcome.results) {
+          expect(result.passed, `strict=${strict}`).toBe(false);
+          expect(result.detail, `strict=${strict}`).toContain("provenance");
+          expect(result.detail, `strict=${strict}`).not.toContain("scenario threw");
+        }
+        expect(scoreGroupChatResults(outcome.results)).toEqual({
+          trueGreen: 0,
+          stubGreen: 0,
+          strictPass: false,
+        });
+        expect(outcome.exitCode, `strict=${strict}`).toBe(1);
+      }
+    },
+  );
+
+  it("keeps a missing driver as the exit-0 report baseline, distinct from provenance red", async () => {
+    const report = await executeGroupChatAcceptance({
+      strict: false,
+      loadDriver: async () => null,
+      log: () => {},
+    });
+    expect(report.driverMissing).toBe(true);
+    expect(report.provenanceFailed).toBe(false);
+    expect(report.exitCode).toBe(0);
+    const strictRun = await executeGroupChatAcceptance({
+      strict: true,
+      loadDriver: async () => null,
+      log: () => {},
+    });
+    expect(strictRun.driverMissing).toBe(true);
+    expect(strictRun.exitCode).toBe(1);
   });
 });

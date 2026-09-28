@@ -286,6 +286,44 @@ function sameMultiset(actual: readonly string[], expected: readonly string[]): b
 
 /** 子句边界：标点、冒号、换行，以及转折词——「不代表理解但已读」「系统：已读」要拆开看。 */
 const CLAUSE_BOUNDARY = /[,，.。;；:：!！?？\n]|但是|可是|不过|然而|而是|但|\bbut\b/iu;
+const CLAUSE_BOUNDARY_GLOBAL = new RegExp(CLAUSE_BOUNDARY.source, "giu");
+
+/**
+ * Canonical 夹具成员 id（`test-resident:<id>` 与 `test-human:owner`）。它们永远指房间里
+ * 的具体成员：id 里的冒号是身份的一部分，不是子句边界。只识别夹具确切 id——不泛化成
+ * 任意冒号字符串，其他冒号写法照旧在冒号处切开、按残余子句判。
+ */
+const FIXTURE_MEMBER_IDS: readonly string[] = Object.freeze([
+  ...Object.values(groupChatSyntheticFixture.residentIds),
+  groupChatSyntheticFixture.humanId,
+]);
+
+/** 切子句时护住夹具成员 id：「test-resident:a 已读完配置」不能碎成无主语残句再被误判。 */
+function splitClauses(claim: string): string[] {
+  const spans: Array<readonly [number, number]> = [];
+  for (const id of FIXTURE_MEMBER_IDS) {
+    let from = 0;
+    while (from <= claim.length) {
+      const at = claim.indexOf(id, from);
+      if (at < 0) break;
+      spans.push([at, at + id.length]);
+      from = at + id.length;
+    }
+  }
+  if (spans.length === 0) return claim.split(CLAUSE_BOUNDARY);
+  const insideProtected = (index: number) =>
+    spans.some(([start, end]) => index >= start && index < end);
+  const clauses: string[] = [];
+  let last = 0;
+  for (const match of claim.matchAll(CLAUSE_BOUNDARY_GLOBAL)) {
+    const at = match.index ?? 0;
+    if (insideProtected(at)) continue;
+    clauses.push(claim.slice(last, at));
+    last = at + match[0].length;
+  }
+  clauses.push(claim.slice(last));
+  return clauses;
+}
 
 type PersonalClaimKind = "presence" | "reading" | "understanding" | "memory";
 
@@ -366,6 +404,8 @@ const NOT_A_MEMBER_NAME = /^(?:刚刚|刚才|自动|直接|代码|其他|当前|
 
 /** 主语是成员、住户、人称，或一个具体名字。 */
 function isMemberSubject(prefix: string): boolean {
+  // Canonical 夹具成员 id 永远指具体成员，不等词形规则。
+  if (FIXTURE_MEMBER_IDS.some((id) => prefix.includes(id))) return true;
   if (MEMBER_ROLE.test(prefix) || MEMBER_PRONOUN.test(prefix)) return true;
   const subject = prefix
     .replaceAll("系统", "")
@@ -392,7 +432,7 @@ function isSystemReading(prefix: string, text: string, suffix: string): boolean 
  * structural readbacks (proxied reactions, memory ledger, phases) carry the lamp.
  */
 export function isUnsupportedPersonalClaim(claim: string): boolean {
-  return claim.split(CLAUSE_BOUNDARY).some((clause) =>
+  return splitClauses(claim).some((clause) =>
     PERSONAL_STATE_CLAIMS.some(({ kind, pattern }) =>
       [...clause.matchAll(pattern)].some((match) => {
         const start = match.index ?? 0;
@@ -731,6 +771,8 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         return fail("query/wake 没有交付四类结构化反馈与真实 delivery receipt");
       if (e.crossSenderFeedback.length > 0) return fail("反馈跨发送方或私域递送");
       if (e.leakedBlockedBody) return fail("反馈夹带了被拦原文");
+      if (e.unsupportedClaims.length > 0)
+        return fail("发送方反馈冒充成员个人状态（在场/已读/理解/记忆）");
       if (!e.stableReasonsAcrossRestart) return fail("同一决定的原因码在重启后漂移");
       if (e.persistFailureConsumedPermit) return fail("决定落盘失败仍消费了许可");
       if (e.persistedDecisionCountAfterRetry !== 1)
@@ -901,6 +943,8 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         return fail("故障恢复没有换真实进程，或前后代码 commit 不同");
       if (!e.failureFeedbackRetained) return fail("成员失败反馈在离线/重启后丢失");
       if (e.falsePresenceClaims.length > 0) return fail("故障/未决结果冒充模型在场或讨论有产出");
+      if (e.unsupportedClaims.length > 0)
+        return fail("故障收据冒充成员个人状态（在场/已读/理解/记忆）");
       return {
         passed: true,
         detail:
@@ -1757,6 +1801,11 @@ export async function runGroupChatCheck(
         leakedBlockedBody: deliveredFeedback.some((feedback) =>
           (feedback.body ?? "").includes(fixture.canaries.blocked),
         ),
+        // 发送方反馈的正文也过共享判卷：携带成员身份的个人状态声称（含
+        // canonical resident id 写法）在这里抓出来。
+        unsupportedClaims: [...pendingFeedback, ...deliveredFeedback]
+          .map((feedback) => feedback.body ?? "")
+          .filter((body) => body !== "" && isUnsupportedPersonalClaim(body)),
         stableReasonsAcrossRestart:
           restarted.previous.pid !== restarted.current.pid &&
           reasonsBefore.size === stimuli.length &&
@@ -2443,6 +2492,12 @@ export async function runGroupChatCheck(
         falsePresenceClaims: receipts
           .map((receipt) => `${receipt.phase} ${receipt.claim ?? ""}`)
           .filter((claim) => suspicious.test(claim)),
+        // 失败/故障收据的声称走共享判卷：携带 canonical resident id 的个人状态
+        // 声称与 GC-09 同一把尺。
+        unsupportedClaims: receipts
+          .filter((receipt) => receipt.actor === "system")
+          .map((receipt) => receipt.claim ?? "")
+          .filter((claim) => claim !== "" && isUnsupportedPersonalClaim(claim)),
       });
     }
   }

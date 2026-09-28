@@ -565,6 +565,8 @@ export interface GroupChatEvidenceById {
     stableReasonsAcrossRestart: boolean;
     persistFailureConsumedPermit: boolean;
     persistedDecisionCountAfterRetry: number;
+    /** Sender-feedback free text flagged by the shared personal-claim judge. */
+    unsupportedClaims: readonly string[];
   };
   "GC-09": {
     receipts: readonly SystemReceipt[];
@@ -625,6 +627,8 @@ export interface GroupChatEvidenceById {
     highWaterAfterRestart: number;
     failureFeedbackRetained: boolean;
     falsePresenceClaims: readonly string[];
+    /** System-receipt claims flagged by the shared personal-claim judge. */
+    unsupportedClaims: readonly string[];
   };
 }
 

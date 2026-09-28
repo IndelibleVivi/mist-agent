@@ -47,7 +47,9 @@ GC-05、GC-09、GC-15 均因 `real-host driver missing` 报预期红，真实宿
 
 所有 command 入参与 host readback 继续在 driver 边界统一 `structuredClone`。时间只由 controlled
 scheduler 推进，不用 sleep；重启必须返回新 PID、同 checkout commit，并再次通过 runner 的
-provenance 核验。故障注入只触发 ledger append/member transport 失败，被验宿主仍负责身份、
+provenance 核验。重启 provenance 失败与启动/停机核验同级：抛 `HostProvenanceError` 一路到
+runner 边界，十三灯全部按坏 adapter 判红、report 与 strict 都非零退出——不降级成当前一盏灯的
+scenario error。故障注入只触发 ledger append/member transport 失败，被验宿主仍负责身份、
 权限、编排、提交与耐久回读。
 
 ## PR1 判卷边界（2026-09-27 按 #202 初审修订，09-28 按第二、三轮复审及批准意见再修订）
@@ -80,6 +82,9 @@ provenance 核验。故障注入只触发 ledger append/member transport 失败�
   不发送」之类）；其余说法还认同一子句里更早出现的「不代表 / 不等于 / 不证明」，但「不是未读是
   已读」这种纠正句不算否认；紧贴在前的「待 / 将 / 会」说的是还没发生的事。冒号也分子句（「系统：
   已读」照样拦）。系统自己读配置、看到投递失败，不算替成员声称已读，「已读」「已阅」本身除外。
+  夹具成员 id（`test-resident:<id>`、`test-human:owner`）里的冒号是身份的一部分：切子句时护住不切，
+  且这些 id 永远算成员主语——「test-resident:a 已读完配置」照样拦；非夹具的冒号字符串不泛化，
+  照旧切开看残余子句。GC-08 的发送方反馈正文与 GC-16 的系统收据声称也过同一把文字尺。
   判卷不解析整句语义，与上文「不判模型措辞」一致。
 - GC-15：三个世界——隐藏房间内容不同的两个，加一个没有隐藏房间的；未授权方看到的正文、候选、
   计数、错误和回执须三个世界一致。另由住户 B 以房间成员资格读住户 A 的内部 scope，须被拒，
