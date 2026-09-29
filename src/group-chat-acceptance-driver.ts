@@ -19,6 +19,17 @@ import type {
 } from "./group-chat/post-room-message.ts";
 import type { RoomEvent } from "./group-chat/room-event-store.ts";
 
+export interface RoomPostExchangeObservation {
+  readonly principal: { readonly principalId: string };
+  readonly envelope: RoomMessageEnvelope;
+  readonly result: RoomPostResult;
+}
+
+export interface GroupChatHostDriverOptions {
+  /** Test-only observation of the exact post payload and result exchanged with the child host. */
+  readonly onPostExchange?: (exchange: RoomPostExchangeObservation) => void;
+}
+
 type ResponseMessage =
   | { readonly kind: "ready"; readonly pid: number }
   | { readonly id: string; readonly ok: true; readonly value?: unknown }
@@ -117,7 +128,9 @@ type FixtureWithTrustedBinding = Omit<typeof groupChatSyntheticFixture, "trusted
 };
 
 /** Real child-process adapter for the durable room-write slice; unsupported lamps fail explicitly. */
-export function createGroupChatHostDriver(): GroupChatHostDriver & {
+export function createGroupChatHostDriver(
+  options: GroupChatHostDriverOptions = {},
+): GroupChatHostDriver & {
   restartHost(): Promise<GroupChatHostRun>;
 } {
   const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -201,10 +214,12 @@ export function createGroupChatHostDriver(): GroupChatHostDriver & {
       const { kind: _kind, ...rawFields } = command;
       void _kind;
       const envelope = { ...rawFields, operationId: randomUUID() } as RoomMessageEnvelope;
-      await active().request<RoomPostResult>("post", {
-        principal: { principalId: command.principalId },
+      const principal = { principalId: command.principalId };
+      const result = await active().request<RoomPostResult>("post", {
+        principal,
         envelope,
       });
+      options.onPostExchange?.({ principal, envelope, result });
     },
     readRoomEvents: async (roomId?: string) => {
       const rows = await active().request<readonly RoomEvent[]>("read-room-events", { roomId });

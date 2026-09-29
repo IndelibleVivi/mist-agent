@@ -13,7 +13,10 @@ import {
   judgeDirectWriteReadback,
   readProcessInfo,
 } from "../../acceptance/group-chat-run.ts";
-import { createGroupChatHostDriver } from "../../src/group-chat-acceptance-driver.ts";
+import {
+  type RoomPostExchangeObservation,
+  createGroupChatHostDriver,
+} from "../../src/group-chat-acceptance-driver.ts";
 import { RoomEventStore } from "../../src/group-chat/room-event-store.ts";
 
 describe("group-chat acceptance host process", () => {
@@ -72,8 +75,9 @@ describe("group-chat acceptance host process", () => {
     expect(readback.find((event) => event.id === direct.event.id)?.body).toBe("judge-direct-write");
   });
 
-  it("returns a rejected room write and reason to its sender without recording it", async () => {
-    driver = createGroupChatHostDriver();
+  it("returns a wrong-binding rejection to its sender without recording it", async () => {
+    const exchanges: RoomPostExchangeObservation[] = [];
+    driver = createGroupChatHostDriver({ onPostExchange: (exchange) => exchanges.push(exchange) });
     const fixture = groupChatSyntheticFixture;
     const run = await driver.startHost();
     dataRoot = (run as typeof run & { readonly dataRoot: string }).dataRoot;
@@ -89,6 +93,13 @@ describe("group-chat acceptance host process", () => {
     };
 
     await driver.perform(command);
+    expect(exchanges).toHaveLength(1);
+    expect(exchanges[0]?.result).toStrictEqual({
+      status: "rejected",
+      operationId: exchanges[0]?.envelope.operationId,
+      recipient: "sender",
+      reasonCode: "room_binding_denied",
+    });
     expect(await driver.readRoomEvents(fixture.roomId)).toEqual([]);
     expect(await driver.readSystemReceipts()).toEqual([]);
   });
@@ -111,6 +122,7 @@ describe("group-chat acceptance host process", () => {
         binding: fixture.trustedOwnerBinding,
         body: "missing-visibility",
       }),
+      reasonCode: "public_declaration_required",
     },
     {
       label: "empty room",
@@ -130,6 +142,7 @@ describe("group-chat acceptance host process", () => {
         binding: fixture.trustedOwnerBinding,
         body: "empty-room",
       }),
+      reasonCode: "room_required",
     },
     {
       label: "missing room binding",
@@ -148,6 +161,7 @@ describe("group-chat acceptance host process", () => {
         visibility: "public",
         body: "missing-binding",
       }),
+      reasonCode: "room_binding_denied",
     },
     {
       label: "private fields",
@@ -168,18 +182,54 @@ describe("group-chat acceptance host process", () => {
         body: "private-field-canary",
         privateFields: ["not-for-room"],
       }),
+      reasonCode: "private_fields_not_allowed",
     },
   ] as const)(
-    "passes $label unchanged to the real child host for rejection",
-    async ({ valid, invalid }) => {
-      driver = createGroupChatHostDriver();
+    "passes $label unchanged through the real child host and reports its rejection",
+    async ({ valid, invalid, reasonCode }) => {
+      const exchanges: RoomPostExchangeObservation[] = [];
+      driver = createGroupChatHostDriver({
+        onPostExchange: (exchange) => exchanges.push(exchange),
+      });
       const fixture = groupChatSyntheticFixture;
       const run = await driver.startHost();
       dataRoot = run.dataRoot;
       await driver.resetScenario("GC-01", fixture);
 
-      await driver.perform(valid(fixture) as unknown as GroupChatCommand);
-      await driver.perform(invalid(fixture) as unknown as GroupChatCommand);
+      const validCommand = valid(fixture);
+      const invalidCommand = invalid(fixture);
+      const validSnapshot = structuredClone(validCommand);
+      const invalidSnapshot = structuredClone(invalidCommand);
+      await driver.perform(validCommand as unknown as GroupChatCommand);
+      await driver.perform(invalidCommand as unknown as GroupChatCommand);
+
+      expect(validCommand).toStrictEqual(validSnapshot);
+      expect(invalidCommand).toStrictEqual(invalidSnapshot);
+      expect(exchanges).toHaveLength(2);
+      const assertUnchangedPostFields = (
+        command: Record<string, unknown>,
+        exchange: RoomPostExchangeObservation | undefined,
+      ) => {
+        expect(exchange).toBeDefined();
+        if (exchange === undefined) throw new Error("missing child-host post exchange");
+        const expectedEnvelope = Object.fromEntries(
+          Object.entries(command).filter(([key]) => key !== "kind"),
+        );
+        const { operationId, ...observedFields } = exchange.envelope;
+        expect(operationId).toBeTruthy();
+        expect(observedFields).toStrictEqual(expectedEnvelope);
+        expect(exchange.principal).toStrictEqual({ principalId: command.principalId });
+        expect(exchange.result.operationId).toBe(operationId);
+      };
+      assertUnchangedPostFields(validCommand, exchanges[0]);
+      assertUnchangedPostFields(invalidCommand, exchanges[1]);
+      expect(exchanges[0]?.result.status).toBe("recorded");
+      expect(exchanges[1]?.result).toStrictEqual({
+        status: "rejected",
+        operationId: exchanges[1]?.envelope.operationId,
+        recipient: "sender",
+        reasonCode,
+      });
 
       const events = await driver.readRoomEvents(fixture.roomId);
       expect(events).toHaveLength(1);
