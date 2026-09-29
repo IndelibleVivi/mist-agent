@@ -176,6 +176,12 @@ interface TestOptions {
   readonly omitStoppedResultRejection?: boolean;
   /** #206 review 3: the first failing attempt is numbered far beyond the configured bound. */
   readonly forgeAttemptOutOfBound?: boolean;
+  /** #206 review 4: every forged control's rejected record is written twice. */
+  readonly duplicateFalseControlRecord?: boolean;
+  /** #206 review 4: the batch projection repeats one authorized id while dropping another. */
+  readonly duplicateProjectedId?: boolean;
+  /** #206 review 4: every returned gc12-tuple target is washed into the same residentId variant. */
+  readonly washForgedTupleTargets?: boolean;
 }
 
 interface SyntheticSubmission {
@@ -1162,8 +1168,8 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
           command.issuerId === fixture.humanId;
         if (!valid && !this.options.acceptFalseControl) {
           // Review probe: silently dropping a forged control leaves no rejected record to audit.
-          if (!this.options.omitFalseControlRecords)
-            this.controlRecords.push({
+          if (!this.options.omitFalseControlRecords) {
+            const rejected: ControlRecord = {
               sequence: this.nextSequence(),
               controlId: command.controlId,
               issuerId: command.issuerId,
@@ -1172,7 +1178,12 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
               phase: "rejected",
               cutoffId: null,
               externalEffectReversed: false,
-            });
+            };
+            this.controlRecords.push(rejected);
+            // Review probe: a duplicated rejected record must not count as exactly one.
+            if (this.options.duplicateFalseControlRecord)
+              this.controlRecords.push({ ...rejected, sequence: this.nextSequence() });
+          }
           return;
         }
         const cutoffId = `control-cutoff:${command.controlId}`;
@@ -1246,13 +1257,18 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
         const authorized = this.projectionSources.filter((item) => item.authorized);
         const hidden = this.projectionSources.filter((item) => !item.authorized);
         // Review probe: omit-everything — included stays empty, all authorized land in omitted.
-        const included = this.options.omitAllProjected
+        let included = this.options.omitAllProjected
           ? []
           : command.mode === "batch"
             ? authorized.filter((_item, index) => index === 0 || index === authorized.length - 1)
             : command.mode === "latest"
               ? authorized.slice(-2)
               : authorized.slice(2, 3);
+        // Review probe: repeat one authorized id and drop another — a length-only check stays green.
+        if (this.options.duplicateProjectedId && command.mode === "batch") {
+          const first = included[0];
+          if (first !== undefined) included = included.map(() => first);
+        }
         const omitted = this.options.omitProjectionGaps
           ? []
           : authorized.filter((item) => !included.includes(item));
@@ -1364,10 +1380,26 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
         const held = this.held.get(command.operationId);
         if (held === undefined) return;
         if (!this.options.skipReturnedResultRecord) {
+          // Review probe: wash the six forged returned targets into the same residentId variant,
+          // so the judge can only catch it by reading the host ledger, never its own stimulus list.
+          const seen = this.results.filter(
+            (row) => row.operationId === "gc12-tuple" && row.phase === "returned",
+          ).length;
+          const recordedTarget =
+            this.options.washForgedTupleTargets && command.operationId === "gc12-tuple" && seen < 6
+              ? {
+                  residentId: fixture.residentIds.b,
+                  scopeId: "test-scope:gc12",
+                  scopeGeneration: 1,
+                  windowId: "test-window:gc12",
+                  generation: 1,
+                  dispatchId: "test-dispatch:gc12",
+                }
+              : command.target;
           this.results.push({
             sequence: this.nextSequence(),
             operationId: command.operationId,
-            target: command.target,
+            target: recordedTarget,
             phase: "returned",
             reasonCode: null,
           });
@@ -2179,6 +2211,10 @@ describe("#192 stacked red oracle: each A-D behavior has a single-mutation red",
     ["GC-10 omit-all", "GC-10", { omitAllProjected: true }, "没有纳入任何"],
     ["GC-12C drop-reject", "GC-12", { omitStoppedResultRejection: true }, "明确 rejected"],
     ["GC-16C attempt-999", "GC-16", { forgeAttemptOutOfBound: true }, "无界"],
+    // #206 review 4: duplicate-accounting probes for the three remaining false greens.
+    ["GC-07B dup", "GC-07", { duplicateFalseControlRecord: true }, "恰好一条"],
+    ["GC-10 dup-id", "GC-10", { duplicateProjectedId: true }, "重复"],
+    ["GC-12D wash", "GC-12", { washForgedTupleTargets: true }, "各改一个"],
   ] as const)("%s makes %s red for %j", async (_caseId, id, options, reason) => {
     const result = await check(id, options);
     expect(result.passed).toBe(false);
@@ -2331,6 +2367,12 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
     ]);
     expect(evaluateGroupChatEvidence("GC-07", cutoffForgery).passed).toBe(false);
     expect(evaluateGroupChatEvidence("GC-07", mutate(0, [])).passed).toBe(false);
+    // #206 review 4: two identical rejected records must not count as exactly one.
+    const duplicated = mutate(0, [
+      forgedRecord("gc07-quoted-stop", {}),
+      forgedRecord("gc07-quoted-stop", { sequence: 2 }),
+    ]);
+    expect(evaluateGroupChatEvidence("GC-07", duplicated).passed).toBe(false);
   });
 
   const gc08Decision = (
@@ -2506,6 +2548,16 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       ),
     };
     expect(evaluateGroupChatEvidence("GC-10", doubleTruncate).passed).toBe(false);
+    // #206 review 4: repeating one authorized id while dropping another must not reconcile.
+    const duplicatedId = {
+      ...gc10Base(),
+      batch: gc10Projection(
+        "gc10-batch",
+        ["gc10-event-1", "gc10-event-1"],
+        ["gc10-event-2", "gc10-event-3"],
+      ),
+    };
+    expect(evaluateGroupChatEvidence("GC-10", duplicatedId).passed).toBe(false);
   });
 
   const gc12Base = (): GroupChatEvidenceById["GC-12"] => ({

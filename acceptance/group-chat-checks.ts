@@ -743,10 +743,10 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
       if (e.oldPermitCommitted) return fail("stop cutoff 前的旧许可结果仍被提交");
       for (const { controlId, records } of e.falseControls) {
         if (
-          records.length === 0 ||
+          records.length !== 1 ||
           records.some((row) => row.phase !== "rejected" || row.cutoffId !== null)
         )
-          return fail(`伪造控制 ${controlId} 没有全部明确 rejected 且不带 cutoff`);
+          return fail(`伪造控制 ${controlId} 没有恰好一条明确 rejected 且无 cutoff 的记录`);
       }
       if (!e.unreachableReportedIncomplete) return fail("目标不可达时伪报控制已生效");
       if (e.externalEffectClaimedReversed) return fail("已发生的外部副作用被伪报撤回");
@@ -860,12 +860,10 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         if (projection === null) return `${label} 投影缺失`;
         const { includedEventIds: included, omittedEventIds: omitted } = projection;
         if (included.length === 0) return `${label} 投影没有纳入任何本轮授权事件`;
-        if ([...included, ...omitted].some((eventId) => !authorized.includes(eventId)))
-          return `${label} 投影出现非本轮判卷授权的事件 id`;
-        if (included.some((eventId) => omitted.includes(eventId)))
-          return `${label} 投影的纳入与省略互相重叠`;
-        if (included.length + omitted.length !== authorized.length)
-          return `${label} 投影的纳入加省略没有与本轮授权全集对账`;
+        if (new Set(included).size !== included.length || new Set(omitted).size !== omitted.length)
+          return `${label} 投影的纳入或省略里有重复事件 id`;
+        if (!sameMultiset([...included, ...omitted], authorized))
+          return `${label} 投影的纳入加省略与本轮授权全集不是同一个多重集`;
         return null;
       };
       for (const [label, projection] of [
@@ -935,6 +933,8 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         return fail("stop 前许可在 continue 后复活，或新许可没有正常提交");
       if (!e.stoppedResultReasoned)
         return fail("stop cutoff 后的旧许可结果没有明确 rejected 记录与可归属原因");
+      if (e.forgedTupleAttempts !== 6 || e.forgedTupleCommits !== 0 || e.currentTupleCommits !== 1)
+        return fail("完整目标六字段的伪造负例或当前身份正对照不成立");
       if (
         !sameMultiset(e.forgedTupleFields, [
           "residentId",
@@ -946,8 +946,17 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         ])
       )
         return fail("六个伪造目标没有恰好各改一个不同的身份字段");
-      if (e.forgedTupleAttempts !== 6 || e.forgedTupleCommits !== 0 || e.currentTupleCommits !== 1)
-        return fail("完整目标六字段的伪造负例或当前身份正对照不成立");
+      if (
+        !sameMultiset(e.forgedTupleFields, [
+          "residentId",
+          "scopeId",
+          "scopeGeneration",
+          "windowId",
+          "generation",
+          "dispatchId",
+        ])
+      )
+        return fail("六个伪造目标没有恰好各改一个不同的身份字段");
       return {
         passed: true,
         detail: "成员撤权在发送前重验；旧代际与 cutoff 结果实返实拒；六字段绑定且新许可可提交",
@@ -2181,14 +2190,6 @@ export async function runGroupChatCheck(
         { ...baseTarget, generation: 2 },
         { ...baseTarget, dispatchId: "test-dispatch:forged" },
       ];
-      // The six forgeries must each move exactly one distinct identity field; a duplicated
-      // field mutation would silently shrink the negative coverage, so the judge accounts for it.
-      const forgedTupleFields = forgedTargets.map((target) => {
-        const changed = (Object.keys(baseTarget) as readonly (keyof typeof baseTarget)[]).filter(
-          (key) => target[key] !== baseTarget[key],
-        );
-        return changed.length === 1 && changed[0] !== undefined ? changed[0] : "multiple";
-      });
       for (const target of forgedTargets)
         await act({
           kind: "return-member-result",
@@ -2203,6 +2204,21 @@ export async function runGroupChatCheck(
         body: "TEST-GC12-CURRENT-TUPLE",
       });
       const tupleResults = await driver.readMemberResults();
+      // The six forgery fields are derived from the host-owned returned ledger, never from what
+      // the judge sent: a host washing every returned target into one variant must turn red.
+      const forgedTupleFields = tupleResults
+        .filter(
+          (row) =>
+            row.operationId === "gc12-tuple" &&
+            row.phase === "returned" &&
+            JSON.stringify(row.target) !== JSON.stringify(baseTarget),
+        )
+        .map((row) => {
+          const changed = (Object.keys(baseTarget) as readonly (keyof typeof baseTarget)[]).filter(
+            (key) => row.target[key] !== baseTarget[key],
+          );
+          return changed.length === 1 && changed[0] !== undefined ? changed[0] : "multiple";
+        });
       return evaluateGroupChatEvidence(id, {
         revokedDeliveryCommitted: revokedDecisions.some(
           (row) =>
