@@ -17,6 +17,7 @@ const allowedBinding = "membership-token-a";
 const authA: AuthenticatedPrincipal = { principalId: principalA };
 const nearGreenOverrides: Readonly<Record<string, Partial<RoomMessageEnvelope>>> = {
   "missing authentication": {},
+  "wrong-type authentication": {},
   "missing room": { roomId },
   "whitespace room": { roomId },
   "wrong-type room": { roomId },
@@ -85,6 +86,12 @@ describe("postRoomMessage", () => {
     {
       label: "missing authentication",
       auth: null,
+      envelope: (base: RoomMessageEnvelope) => base,
+      reasonCode: "authentication_required",
+    },
+    {
+      label: "wrong-type authentication",
+      auth: { principalId: 7 } as unknown as AuthenticatedPrincipal,
       envelope: (base: RoomMessageEnvelope) => base,
       reasonCode: "authentication_required",
     },
