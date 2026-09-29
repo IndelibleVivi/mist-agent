@@ -3782,8 +3782,8 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       expect(result.detail).toContain("生效之前");
     }
     // Control-identity binding (review 10 round 3): every row of the pair must match the
-    // judge-owned controlId/issuerId/targetId, and each control's accepted/effective must
-    // share one non-empty cutoffId (stop and continue never share one).
+    // judge-owned controlId/issuerId/targetId. cutoffId stays unjudged — the driver contract
+    // only freezes `string | null`, no cutoffId shape is part of the adapter protocol.
     const gc07IdentityShapes: readonly (readonly ControlRecord[])[] = [
       gc07IndependentControls().map((row) =>
         row.action === "stop" ? { ...row, controlId: "gc07-independent-washed" } : row,
@@ -3794,28 +3794,8 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       gc07IndependentControls().map((row) =>
         row.action === "stop" ? { ...row, issuerId: fixture.unauthorizedHumanId } : row,
       ),
-      gc07IndependentControls().map((row) =>
-        row.action === "stop" && row.phase === "effective"
-          ? { ...row, cutoffId: "control-cutoff:other" }
-          : row,
-      ),
-      gc07IndependentControls().map((row) =>
-        row.action === "stop" ? { ...row, cutoffId: null } : row,
-      ),
-      gc07IndependentControls().map((row) =>
-        row.action === "continue"
-          ? { ...row, cutoffId: "control-cutoff:gc07-independent-stop" }
-          : row,
-      ),
     ];
-    const gc07IdentityReasons = [
-      "授权身份",
-      "授权身份",
-      "授权身份",
-      "cutoffId",
-      "cutoffId",
-      "cutoffId",
-    ] as const;
+    const gc07IdentityReasons = ["授权身份", "授权身份", "授权身份"] as const;
     for (const [index, independentControls] of gc07IdentityShapes.entries()) {
       const result = evaluateGroupChatEvidence("GC-07", { ...gc07Base(), independentControls });
       expect(result.passed, JSON.stringify(independentControls)).toBe(false);

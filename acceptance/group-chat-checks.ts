@@ -1257,8 +1257,7 @@ function sameDispatchIdentity(left: DispatchIdentity | null, right: DispatchIden
  * returned before stop/continue, so no memoized terminal rejection can stand in for a fresh
  * cutoff decision. The world's own host-owned control ledger must prove the stop/continue
  * pair first: each exactly one accepted and one effective, every row matching the judge-owned
- * controlId/issuerId/targetId, accepted and effective sharing one non-empty cutoffId (the two
- * controls never share one), accepted before effective, stop before continue; then exactly one returned, zero committed, body out of the room, exactly
+ * controlId/issuerId/targetId, accepted before effective, stop before continue; then exactly one returned, zero committed, body out of the room, exactly
  * one reasoned rejected carrying the judge-owned identity, and every result row must land
  * after the continue-effective sequence with returned before rejected — pre-continue rows can
  * never stand in. The post-continue new permit must still commit. `committedDetail` carries
@@ -1293,9 +1292,6 @@ function firstLateReturnProblem(
       )
     )
       return `独立世界 ${action} 控制账目与判卷授权身份不符（controlId/issuerId/targetId）`;
-    // Protocol shape: accepted/effective of one control share its non-empty cutoffId.
-    if ((accepted[0]?.cutoffId ?? "") === "" || accepted[0]?.cutoffId !== effective[0]?.cutoffId)
-      return `独立世界 ${action} 控制的 accepted/effective 未共享同一非空 cutoffId`;
     if ((accepted[0]?.sequence ?? 0) >= (effective[0]?.sequence ?? 0))
       return `独立世界 ${action} 控制的 accepted 没有先于 effective 入账`;
     return null;
@@ -1310,11 +1306,6 @@ function firstLateReturnProblem(
     continueRows,
   );
   if (continueProblem !== null) return continueProblem;
-  // Protocol shape: cutoffId derives from the controlId, so the two controls never share one.
-  const stopCutoffId = stopRows.find((row) => row.phase === "accepted")?.cutoffId ?? null;
-  const continueCutoffId = continueRows.find((row) => row.phase === "accepted")?.cutoffId ?? null;
-  if (stopCutoffId !== null && stopCutoffId === continueCutoffId)
-    return "独立世界 stop 与 continue 不得共用同一 cutoffId";
   const stopEffectiveSequence = stopRows.find((row) => row.phase === "effective")?.sequence ?? -1;
   const continueEffectiveSequence =
     continueRows.find((row) => row.phase === "effective")?.sequence ?? -1;
