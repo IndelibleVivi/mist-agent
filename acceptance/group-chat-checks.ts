@@ -956,17 +956,23 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         truncation.keptEnd > truncation.originalLength
       )
         return fail("截断保留范围不合法，或越过判卷请求的单条长度上限");
-      // Field-exact matching: whitespace-delimited tokens, so "125" cannot wash "25".
-      const contextTokens = e.projectionContext.split(/\s+/u);
-      for (const value of [
-        truncation.sourceRef,
-        String(truncation.originalLength),
-        truncation.unit,
-        `${truncation.keptStart}:${truncation.keptEnd}`,
-      ]) {
-        if (!contextTokens.includes(value))
-          return fail("截断元数据没有以完整字段进入模型可见上下文");
-      }
+      // Field-exact matching with explicit per-kind boundaries: `125` cannot wash `25`,
+      // `charactersX` cannot wash the unit, while JSON / key=value / brackets stay legal.
+      if (
+        !contextHasExactField(e.projectionContext, truncation.sourceRef, "A-Za-z0-9_:-") ||
+        !contextHasExactField(
+          e.projectionContext,
+          String(truncation.originalLength),
+          "0-9A-Za-z",
+        ) ||
+        !contextHasExactField(e.projectionContext, truncation.unit, "A-Za-z0-9_-") ||
+        !contextHasExactField(
+          e.projectionContext,
+          `${truncation.keptStart}:${truncation.keptEnd}`,
+          "0-9A-Za-z",
+        )
+      )
+        return fail("截断元数据没有以完整字段进入模型可见上下文");
       if (!e.truncated?.includedEventIds.includes(truncation.eventId))
         return fail("被截断的事件不在 truncated 投影的纳入集合里");
       if (e.hiddenWorldFingerprints.length !== 3 || new Set(e.hiddenWorldFingerprints).size !== 1)
@@ -1107,6 +1113,18 @@ function hasMarker(events: readonly { readonly body: string }[], marker: string)
 function matchingEvent(events: readonly RoomEvent[], marker: string): RoomEvent | null {
   const matches = events.filter(({ body }) => body.includes(marker));
   return matches.length === 1 ? (matches[0] ?? null) : null;
+}
+
+/**
+ * Field-exact match inside model-visible context: the escaped value must appear with explicit
+ * boundaries, never as a substring of a longer token of its own kind. Whitespace, JSON
+ * punctuation, `key=value` and brackets are all valid boundaries; `125` must not wash `25`,
+ * `charactersX` must not wash the unit, and a sourceRef must not continue with token chars.
+ * This is a boundary check only — it does not parse or prescribe a context format.
+ */
+function contextHasExactField(context: string, value: string, boundary: string): boolean {
+  const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<![${boundary}])${escaped}(?![${boundary}])`, "u").test(context);
 }
 
 function surfaceText(surface: SurfaceSnapshot): string {

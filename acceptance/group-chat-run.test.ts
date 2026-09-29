@@ -3015,9 +3015,52 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
     // Substring washing: "1180" contains "180" but is not the field.
     const substringWash = {
       ...gc10Base(),
-      projectionContext: "room-source:gc10-event-3x 1180 characters 0:24",
+      projectionContext: "room-source:gc10-event-3 1180 characters 0:24",
     };
     expect(evaluateGroupChatEvidence("GC-10", substringWash).passed).toBe(false);
+  });
+
+  // #206 review 6: exact-match boundaries must accept honest JSON / key=value renderings.
+  it("GC-10 accepts JSON and key=value contexts, and rejects extended-token washes", () => {
+    const jsonContext =
+      '{"sourceRef":"room-source:gc10-event-3","originalLength":180,"unit":"characters","kept":"0:24"}';
+    expect(
+      evaluateGroupChatEvidence("GC-10", { ...gc10Base(), projectionContext: jsonContext }).passed,
+    ).toBe(true);
+    const keyValueContext =
+      "sourceRef=room-source:gc10-event-3, originalLength=180, unit=characters, range=(0:24)";
+    expect(
+      evaluateGroupChatEvidence("GC-10", { ...gc10Base(), projectionContext: keyValueContext })
+        .passed,
+    ).toBe(true);
+    // A JSON context whose value differs from the receipt must not wash (125-style).
+    const jsonWrongValue =
+      '{"sourceRef":"room-source:gc10-event-3","originalLength":125,"unit":"characters","kept":"0:24"}';
+    expect(
+      evaluateGroupChatEvidence("GC-10", { ...gc10Base(), projectionContext: jsonWrongValue })
+        .passed,
+    ).toBe(false);
+    // Extended tokens: unit, sourceRef and range continuations all stay red.
+    const unitExtended = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3 180 charactersX 0:24",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", unitExtended).passed).toBe(false);
+    const sourceRefExtended = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3-ext 180 characters 0:24",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", sourceRefExtended).passed).toBe(false);
+    const sourceRefColonExtended = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3:4 180 characters 0:24",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", sourceRefColonExtended).passed).toBe(false);
+    const rangeExtended = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3 180 characters 10:240",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", rangeExtended).passed).toBe(false);
   });
 });
 
