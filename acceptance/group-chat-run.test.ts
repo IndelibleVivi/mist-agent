@@ -24,6 +24,7 @@ import {
   GROUP_CHAT_CHECK_IDS,
   type GroupChatCheckId,
   type GroupChatCommand,
+  type GroupChatEvidenceById,
   type GroupChatHostDriver,
   type MemberAttemptRecord,
   type MemberBehavior,
@@ -163,6 +164,18 @@ interface TestOptions {
   readonly washFailuresOnRestart?: boolean;
   readonly dropFailureFeedback?: boolean;
   readonly falseFailurePresenceReceipt?: boolean;
+  /** #206 review 3: the host keeps no record at all for the self-declared-root stimulus. */
+  readonly omitSelfRootRecord?: boolean;
+  /** #206 review 3: forged controls are silently dropped without an explicit rejected record. */
+  readonly omitFalseControlRecords?: boolean;
+  /** #206 review 3: two pressured decision states are swapped between their operations. */
+  readonly permuteDeliveryStates?: boolean;
+  /** #206 review 3: every projection mode includes nothing, omitting the whole authorized set. */
+  readonly omitAllProjected?: boolean;
+  /** #206 review 3: the cutoff-stopped late result is dropped without a rejected record. */
+  readonly omitStoppedResultRejection?: boolean;
+  /** #206 review 3: the first failing attempt is numbered far beyond the configured bound. */
+  readonly forgeAttemptOutOfBound?: boolean;
 }
 
 interface SyntheticSubmission {
@@ -438,9 +451,15 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
     outcome: MemberAttemptRecord["outcome"],
     reasonCode: string | null,
   ): void {
+    // Review probe: a single attempt numbered far past the configured bound must still go red.
     const attempt =
-      this.attempts.filter((row) => row.operationId === operationId && row.memberId === memberId)
-        .length + 1;
+      this.options.forgeAttemptOutOfBound &&
+      outcome === "failed" &&
+      !this.attempts.some((row) => row.operationId === operationId && row.memberId === memberId)
+        ? 999
+        : this.attempts.filter(
+            (row) => row.operationId === operationId && row.memberId === memberId,
+          ).length + 1;
     this.attempts.push({
       sequence: this.nextSequence(),
       operationId,
@@ -452,7 +471,7 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   }
 
   private decisionForPressure(submission: SyntheticSubmission, mode: PressureMode): void {
-    const state =
+    let state: DeliveryDecisionRecord["state"] =
       mode === "batch"
         ? "batched"
         : mode === "not-included"
@@ -460,6 +479,11 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
           : mode === "stopped"
             ? "stop-blocked"
             : "queued";
+    // Review probe: states swapped between operations — the judge must pin state to operationId.
+    if (this.options.permuteDeliveryStates) {
+      if (state === "batched") state = "not-included";
+      else if (state === "not-included") state = "batched";
+    }
     const reasonCode =
       mode === "batch"
         ? "ROOM_BATCHED"
@@ -1024,6 +1048,8 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
         });
         return;
       case "member-turn": {
+        // Review probe: the self-declared-root stimulus vanishes without any record.
+        if (this.options.omitSelfRootRecord && command.claimedRootId !== undefined) return;
         const effectiveRoot =
           this.options.acceptSelfDeclaredRoot && command.claimedRootId !== undefined
             ? command.claimedRootId
@@ -1135,16 +1161,18 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
           command.binding === "test-control-binding:owner" &&
           command.issuerId === fixture.humanId;
         if (!valid && !this.options.acceptFalseControl) {
-          this.controlRecords.push({
-            sequence: this.nextSequence(),
-            controlId: command.controlId,
-            issuerId: command.issuerId,
-            targetId: command.targetId,
-            action: command.action,
-            phase: "rejected",
-            cutoffId: null,
-            externalEffectReversed: false,
-          });
+          // Review probe: silently dropping a forged control leaves no rejected record to audit.
+          if (!this.options.omitFalseControlRecords)
+            this.controlRecords.push({
+              sequence: this.nextSequence(),
+              controlId: command.controlId,
+              issuerId: command.issuerId,
+              targetId: command.targetId,
+              action: command.action,
+              phase: "rejected",
+              cutoffId: null,
+              externalEffectReversed: false,
+            });
           return;
         }
         const cutoffId = `control-cutoff:${command.controlId}`;
@@ -1217,8 +1245,10 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
       case "request-projection": {
         const authorized = this.projectionSources.filter((item) => item.authorized);
         const hidden = this.projectionSources.filter((item) => !item.authorized);
-        const included =
-          command.mode === "batch"
+        // Review probe: omit-everything — included stays empty, all authorized land in omitted.
+        const included = this.options.omitAllProjected
+          ? []
+          : command.mode === "batch"
             ? authorized.filter((_item, index) => index === 0 || index === authorized.length - 1)
             : command.mode === "latest"
               ? authorized.slice(-2)
@@ -1351,17 +1381,20 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
           this.options.acceptStaleTarget === true ||
           (this.options.acceptForgedTarget === true && command.operationId === "gc12-tuple") ||
           (this.options.acceptPreCutoffResult === true && stoppedAfterIssue);
-        this.results.push({
-          sequence: this.nextSequence(),
-          operationId: command.operationId,
-          target: command.target,
-          phase: accepted ? "committed" : "rejected",
-          reasonCode: accepted
-            ? null
-            : stoppedAfterIssue
-              ? "ROOM_CONTROL_CUTOFF"
-              : "ROOM_DISPATCH_IDENTITY_STALE",
-        });
+        // Review probe: dropping the rejection leaves the cutoff without attributable evidence.
+        if (!(this.options.omitStoppedResultRejection && !accepted && stoppedAfterIssue)) {
+          this.results.push({
+            sequence: this.nextSequence(),
+            operationId: command.operationId,
+            target: command.target,
+            phase: accepted ? "committed" : "rejected",
+            reasonCode: accepted
+              ? null
+              : stoppedAfterIssue
+                ? "ROOM_CONTROL_CUTOFF"
+                : "ROOM_DISPATCH_IDENTITY_STALE",
+          });
+        }
         if (accepted) {
           this.addEvent({
             roomId: fixture.roomId,
@@ -2139,6 +2172,13 @@ describe("#192 stacked red oracle: each A-D behavior has a single-mutation red",
     ["GC-16D feedback", "GC-16", { dropFailureFeedback: true }, "失败反馈"],
     ["GC-16D receipt", "GC-16", { falseFailurePresenceReceipt: true }, "冒充"],
     ["GC-16D claim", "GC-16", { failureReceiptClaimsMemberRead: true }, "冒充成员个人状态"],
+    // #206 review 3: single-mutation probes for the six corrected false greens.
+    ["GC-06B root-omit", "GC-06", { omitSelfRootRecord: true }, "自报新根"],
+    ["GC-07B drop", "GC-07", { omitFalseControlRecords: true }, "伪造控制"],
+    ["GC-08 swap", "GC-08", { permuteDeliveryStates: true }, "缺恰好一条"],
+    ["GC-10 omit-all", "GC-10", { omitAllProjected: true }, "没有纳入任何"],
+    ["GC-12C drop-reject", "GC-12", { omitStoppedResultRejection: true }, "明确 rejected"],
+    ["GC-16C attempt-999", "GC-16", { forgeAttemptOutOfBound: true }, "无界"],
   ] as const)("%s makes %s red for %j", async (_caseId, id, options, reason) => {
     const result = await check(id, options);
     expect(result.passed).toBe(false);
@@ -2183,6 +2223,378 @@ describe("#192 stacked red oracle: each A-D behavior has a single-mutation red",
     const records = await driver.readRoundRecords();
     (records[0] as { reasonCode: string | null }).reasonCode = "mutated";
     expect((await raw.readRoundRecords())[0]?.reasonCode).toBeNull();
+  });
+});
+
+describe("#206 review 3: evaluator pins identities and sequences, not just counts", () => {
+  const a = fixture.residentIds.a;
+
+  const gc06Base = (): GroupChatEvidenceById["GC-06"] => ({
+    boundedWorlds: [
+      { budget: 1, permitted: 1, blocked: 1, oneRoot: true, policyVersionStable: true },
+      { budget: 3, permitted: 3, blocked: 1, oneRoot: true, policyVersionStable: true },
+    ],
+    retryAddedDispatch: false,
+    passRecorded: true,
+    failureRecorded: true,
+    identityChangesResetBudget: false,
+    generationChangeStimulated: true,
+    selfRootAttempts: [{ decision: "blocked", reasonCode: "ROOM_ROOT_FORGED" }],
+    restartPidChanged: true,
+    restartCommitStable: true,
+    highWaterBeforeRestart: 1,
+    highWaterAfterRestart: 1,
+    humanAfterLimitAccepted: true,
+    invalidConfigDispatched: false,
+    invalidConfigReasoned: true,
+  });
+
+  it("GC-06 requires exactly one blocked self-root record with a stable reason", () => {
+    expect(evaluateGroupChatEvidence("GC-06", gc06Base()).passed).toBe(true);
+    const badAttempts: readonly (readonly Pick<RoundRecord, "decision" | "reasonCode">[])[] = [
+      [],
+      [
+        { decision: "blocked", reasonCode: "ROOM_ROOT_FORGED" },
+        { decision: "blocked", reasonCode: "ROOM_ROOT_FORGED" },
+      ],
+      [{ decision: "permitted", reasonCode: null }],
+      [{ decision: "blocked", reasonCode: "" }],
+      [{ decision: "blocked", reasonCode: null }],
+    ];
+    for (const selfRootAttempts of badAttempts) {
+      const result = evaluateGroupChatEvidence("GC-06", { ...gc06Base(), selfRootAttempts });
+      expect(result.passed, JSON.stringify(selfRootAttempts)).toBe(false);
+      expect(result.detail).toContain("自报新根");
+    }
+  });
+
+  const gc07Forged = (
+    controlId: string,
+  ): GroupChatEvidenceById["GC-07"]["falseControls"][number] => ({
+    controlId,
+    records: [
+      {
+        sequence: 1,
+        controlId,
+        issuerId: fixture.humanId,
+        targetId: fixture.residentIds.a,
+        action: "stop",
+        phase: "rejected",
+        cutoffId: null,
+        externalEffectReversed: false,
+      },
+    ],
+  });
+  const gc07Base = (): GroupChatEvidenceById["GC-07"] => ({
+    ordinaryQueueDepthBeforeControl: 3,
+    heldBeforeControl: true,
+    stopAcceptedBeforeQueueRelease: true,
+    stopEffective: true,
+    oldPermitCommitted: false,
+    falseControls: [
+      gc07Forged("gc07-quoted-stop"),
+      gc07Forged("gc07-resident-forgery"),
+      gc07Forged("gc07-unauthorized-human"),
+    ],
+    acceptedAndEffectiveSeparated: true,
+    unreachableReportedIncomplete: true,
+    externalEffectClaimedReversed: false,
+    continueEffectiveWhileQueueBlocked: true,
+    postContinueNewPermitCommitted: true,
+  });
+
+  it("GC-07 requires every forged control explicitly rejected without a cutoff", () => {
+    expect(evaluateGroupChatEvidence("GC-07", gc07Base()).passed).toBe(true);
+    const mutate = (index: number, records: ControlRecord[]) => ({
+      ...gc07Base(),
+      falseControls: gc07Base().falseControls.map((entry, at) =>
+        at === index ? { ...entry, records } : entry,
+      ),
+    });
+    const forgedRecord = (controlId: string, overrides: Partial<ControlRecord>): ControlRecord => ({
+      sequence: 1,
+      controlId,
+      issuerId: fixture.humanId,
+      targetId: fixture.residentIds.a,
+      action: "stop",
+      phase: "rejected",
+      cutoffId: null,
+      externalEffectReversed: false,
+      ...overrides,
+    });
+    const acceptedForgery = mutate(1, [
+      forgedRecord("gc07-resident-forgery", { phase: "accepted" }),
+    ]);
+    expect(evaluateGroupChatEvidence("GC-07", acceptedForgery).passed).toBe(false);
+    const cutoffForgery = mutate(2, [
+      forgedRecord("gc07-unauthorized-human", { cutoffId: "control-cutoff:x" }),
+    ]);
+    expect(evaluateGroupChatEvidence("GC-07", cutoffForgery).passed).toBe(false);
+    expect(evaluateGroupChatEvidence("GC-07", mutate(0, [])).passed).toBe(false);
+  });
+
+  const gc08Decision = (
+    operationId: string,
+    state: DeliveryDecisionRecord["state"],
+    reasonCode: string,
+  ): DeliveryDecisionRecord => ({
+    sequence: 1,
+    operationId,
+    senderId: fixture.residentIds.a,
+    state,
+    reasonCode,
+    count: 1,
+    permitConsumed: true,
+    rosterVersion: 1,
+    target: null,
+  });
+  const gc08Feedback = (operationId: string, reasonCode: string): SenderFeedbackRecord => ({
+    operationId,
+    senderId: fixture.residentIds.a,
+    roomId: fixture.roomId,
+    scopeId: "test-scope:room",
+    reasonCode,
+    count: 1,
+    phase: "delivered",
+    deliveryReceipt: `feedback-receipt:${operationId}`,
+    body: null,
+  });
+  const gc08Base = (): GroupChatEvidenceById["GC-08"] => ({
+    expectedByOperation: [
+      { operationId: "op-batch", state: "batched" },
+      { operationId: "op-not-included", state: "not-included" },
+      { operationId: "op-stopped", state: "stop-blocked" },
+      { operationId: "op-dispatch", state: "dispatch-failed" },
+    ],
+    decisions: [
+      gc08Decision("op-batch", "batched", "ROOM_BATCHED"),
+      gc08Decision("op-not-included", "not-included", "ROOM_NOT_INCLUDED"),
+      gc08Decision("op-stopped", "stop-blocked", "ROOM_STOPPED"),
+      gc08Decision("op-dispatch", "dispatch-failed", "ROOM_DISPATCH_FAILED"),
+    ],
+    offlineFeedbackMarkedDelivered: false,
+    deliveredFeedback: [
+      gc08Feedback("op-batch", "ROOM_BATCHED"),
+      gc08Feedback("op-not-included", "ROOM_NOT_INCLUDED"),
+      gc08Feedback("op-stopped", "ROOM_STOPPED"),
+      gc08Feedback("op-dispatch", "ROOM_DISPATCH_FAILED"),
+    ],
+    crossSenderFeedback: [],
+    leakedBlockedBody: false,
+    unsupportedClaims: [],
+    stableReasonsAcrossRestart: true,
+    persistFailureConsumedPermit: false,
+    persistedDecisionCountAfterRetry: 1,
+  });
+
+  it("GC-08 pins each expected state and its feedback reason to the operationId", () => {
+    expect(evaluateGroupChatEvidence("GC-08", gc08Base()).passed).toBe(true);
+    const swappedStates = {
+      ...gc08Base(),
+      decisions: [
+        gc08Decision("op-batch", "not-included", "ROOM_BATCHED"),
+        gc08Decision("op-not-included", "batched", "ROOM_NOT_INCLUDED"),
+        gc08Decision("op-stopped", "stop-blocked", "ROOM_STOPPED"),
+        gc08Decision("op-dispatch", "dispatch-failed", "ROOM_DISPATCH_FAILED"),
+      ],
+    };
+    expect(evaluateGroupChatEvidence("GC-08", swappedStates).passed).toBe(false);
+    const misalignedFeedback = {
+      ...gc08Base(),
+      deliveredFeedback: [
+        gc08Feedback("op-batch", "ROOM_DISPATCH_FAILED"),
+        gc08Feedback("op-not-included", "ROOM_NOT_INCLUDED"),
+        gc08Feedback("op-stopped", "ROOM_STOPPED"),
+        gc08Feedback("op-dispatch", "ROOM_DISPATCH_FAILED"),
+      ],
+    };
+    expect(evaluateGroupChatEvidence("GC-08", misalignedFeedback).passed).toBe(false);
+  });
+
+  const authorizedIds = ["gc10-event-1", "gc10-event-2", "gc10-event-3", "gc10-event-4"];
+  const gc10Projection = (
+    projectionId: string,
+    included: readonly string[],
+    omitted: readonly string[],
+    truncations: ProjectionReceipt["truncations"] = [],
+  ): ProjectionReceipt => ({
+    projectionId,
+    viewerId: fixture.residentIds.a,
+    sourceRange: [included[0] ?? "none", included[included.length - 1] ?? "none"],
+    watermark: "watermark:x",
+    policyVersion: "test-projection-policy:v1",
+    includedEventIds: [...included],
+    omittedEventIds: [...omitted],
+    complete: false,
+    errorCode: null,
+    truncations,
+  });
+  const gc10Truncation = {
+    eventId: "gc10-event-3",
+    originalLength: 30,
+    unit: "characters" as const,
+    keptStart: 0,
+    keptEnd: 24,
+    sourceRef: "room-source:gc10-event-3",
+    modelVisible: true,
+  };
+  const gc10Base = (): GroupChatEvidenceById["GC-10"] => ({
+    authorizedEventIds: authorizedIds,
+    batch: gc10Projection(
+      "gc10-batch",
+      ["gc10-event-1", "gc10-event-4"],
+      ["gc10-event-2", "gc10-event-3"],
+    ),
+    latest: gc10Projection(
+      "gc10-latest",
+      ["gc10-event-3", "gc10-event-4"],
+      ["gc10-event-1", "gc10-event-2"],
+    ),
+    truncated: gc10Projection(
+      "gc10-truncate",
+      ["gc10-event-3"],
+      ["gc10-event-1", "gc10-event-2", "gc10-event-4"],
+      [gc10Truncation],
+    ),
+    projectionContext: "room-source:gc10-event-3 30 characters 0:24",
+    hiddenWorldFingerprints: ["x", "x", "x"],
+    grantedRead: {
+      sourceRef: "room-source:gc10-event-3",
+      viewerId: fixture.residentIds.a,
+      outcome: "granted",
+      eventId: "gc10-event-3",
+      body: "TEST-GC10-LONG-body",
+      errorCode: null,
+    },
+    deniedRead: {
+      sourceRef: "room-source:gc10-event-3",
+      viewerId: fixture.residentIds.a,
+      outcome: "denied",
+      eventId: null,
+      body: null,
+      errorCode: "not-found",
+    },
+  });
+
+  it("GC-10 reconciles included/omitted identities with the judge-seeded authorized set", () => {
+    expect(evaluateGroupChatEvidence("GC-10", gc10Base()).passed).toBe(true);
+    const overlap = {
+      ...gc10Base(),
+      batch: gc10Projection(
+        "gc10-batch",
+        ["gc10-event-1", "gc10-event-4"],
+        ["gc10-event-4", "gc10-event-2", "gc10-event-3"],
+      ),
+    };
+    expect(evaluateGroupChatEvidence("GC-10", overlap).passed).toBe(false);
+    const staleLatest = {
+      ...gc10Base(),
+      latest: gc10Projection(
+        "gc10-latest",
+        ["gc10-event-2", "gc10-event-3"],
+        ["gc10-event-1", "gc10-event-4"],
+      ),
+    };
+    expect(evaluateGroupChatEvidence("GC-10", staleLatest).passed).toBe(false);
+    const doubleTruncate = {
+      ...gc10Base(),
+      truncated: gc10Projection(
+        "gc10-truncate",
+        ["gc10-event-3", "gc10-event-2"],
+        ["gc10-event-1", "gc10-event-4"],
+        [gc10Truncation],
+      ),
+    };
+    expect(evaluateGroupChatEvidence("GC-10", doubleTruncate).passed).toBe(false);
+  });
+
+  const gc12Base = (): GroupChatEvidenceById["GC-12"] => ({
+    revokedDeliveryCommitted: false,
+    revokedDeliveryReasoned: true,
+    rosterVersionAdvanced: true,
+    staleResultActuallyReturned: true,
+    staleResultCommitted: false,
+    staleResultReasoned: true,
+    stoppedResultActuallyReturned: true,
+    stoppedResultCommitted: false,
+    stoppedResultReasoned: true,
+    postContinueResultCommitted: true,
+    forgedTupleFields: [
+      "residentId",
+      "scopeId",
+      "scopeGeneration",
+      "windowId",
+      "generation",
+      "dispatchId",
+    ],
+    forgedTupleAttempts: 6,
+    forgedTupleCommits: 0,
+    currentTupleCommits: 1,
+  });
+
+  it("GC-12 requires a rejected cutoff record and one distinct field moved per forgery", () => {
+    expect(evaluateGroupChatEvidence("GC-12", gc12Base()).passed).toBe(true);
+    const noRejection = { ...gc12Base(), stoppedResultReasoned: false };
+    expect(evaluateGroupChatEvidence("GC-12", noRejection).passed).toBe(false);
+    const duplicatedFields = {
+      ...gc12Base(),
+      forgedTupleFields: [
+        "residentId",
+        "residentId",
+        "residentId",
+        "residentId",
+        "residentId",
+        "residentId",
+      ],
+    };
+    expect(evaluateGroupChatEvidence("GC-12", duplicatedFields).passed).toBe(false);
+  });
+
+  const gc16Attempt = (attempt: number): MemberAttemptRecord => ({
+    sequence: attempt,
+    operationId: "gc16-failing-member",
+    memberId: fixture.residentIds.a,
+    attempt,
+    outcome: "failed",
+    reasonCode: "ROOM_MEMBER_FAILED",
+  });
+  const gc16Base = (): GroupChatEvidenceById["GC-16"] => ({
+    failedMemberAttempts: [gc16Attempt(1), gc16Attempt(2)],
+    normalMemberCompleted: true,
+    humanContinued: true,
+    controlContinued: true,
+    heldWasActuallyInFlight: true,
+    heldTimedOut: true,
+    configuredMaxMemberAttempts: 2,
+    failingOperationAttempts: [gc16Attempt(1), gc16Attempt(2)],
+    restartPidChanged: true,
+    restartCommitStable: true,
+    failuresBeforeRestart: 2,
+    failuresAfterRestart: 2,
+    highWaterBeforeRestart: 2,
+    highWaterAfterRestart: 2,
+    failureFeedbackRetained: true,
+    falsePresenceClaims: [],
+    unsupportedClaims: [],
+  });
+
+  it("GC-16 bounds retries by attempt numbers, not just row counts", () => {
+    expect(evaluateGroupChatEvidence("GC-16", gc16Base()).passed).toBe(true);
+    const badSequences: readonly (readonly MemberAttemptRecord[])[] = [
+      [gc16Attempt(999)],
+      [gc16Attempt(0)],
+      [gc16Attempt(1), gc16Attempt(1)],
+      [gc16Attempt(2)],
+      [gc16Attempt(1), gc16Attempt(2), gc16Attempt(3)],
+    ];
+    for (const failingOperationAttempts of badSequences) {
+      const result = evaluateGroupChatEvidence("GC-16", {
+        ...gc16Base(),
+        failingOperationAttempts,
+      });
+      expect(result.passed, JSON.stringify(failingOperationAttempts)).toBe(false);
+      expect(result.detail).toContain("无界");
+    }
   });
 });
 

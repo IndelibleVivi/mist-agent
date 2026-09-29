@@ -715,7 +715,12 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
       if (e.retryAddedDispatch) return fail("同操作重试重复计数或重复派发");
       if (e.identityChangesResetBudget) return fail("换发送者、消息身份或代际重置了同根预算");
       if (!e.generationChangeStimulated) return fail("换代负例没有携带并读回新的目标 generation");
-      if (e.selfRootAccepted) return fail("住户自报新根获得了额外预算");
+      if (
+        e.selfRootAttempts.length !== 1 ||
+        e.selfRootAttempts[0]?.decision !== "blocked" ||
+        (e.selfRootAttempts[0]?.reasonCode ?? "").trim() === ""
+      )
+        return fail("住户自报新根没有恰好一条带稳定非空原因码的 blocked 记录");
       if (!e.restartPidChanged || !e.restartCommitStable)
         return fail("重启没有换真实进程，或前后代码 commit 不同");
       if (e.highWaterAfterRestart !== e.highWaterBeforeRestart)
@@ -736,7 +741,13 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
       if (!e.stopAcceptedBeforeQueueRelease || !e.stopEffective)
         return fail("合法 stop 没有在普通队列释放前经独立通道接收并生效");
       if (e.oldPermitCommitted) return fail("stop cutoff 前的旧许可结果仍被提交");
-      if (e.falseControlsChangedLatch) return fail("引用文本、住户伪造或越权控制改变了 latch");
+      for (const { controlId, records } of e.falseControls) {
+        if (
+          records.length === 0 ||
+          records.some((row) => row.phase !== "rejected" || row.cutoffId !== null)
+        )
+          return fail(`伪造控制 ${controlId} 没有全部明确 rejected 且不带 cutoff`);
+      }
       if (!e.unreachableReportedIncomplete) return fail("目标不可达时伪报控制已生效");
       if (e.externalEffectClaimedReversed) return fail("已发生的外部副作用被伪报撤回");
       if (!e.continueEffectiveWhileQueueBlocked || !e.postContinueNewPermitCommitted)
@@ -748,22 +759,24 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
     }
     case "GC-08": {
       const e = evidence as GroupChatEvidenceById["GC-08"];
-      const expectedStates = ["batched", "not-included", "stop-blocked", "dispatch-failed"];
-      for (const state of expectedStates) {
-        const rows = e.decisions.filter((row) => row.state === state);
+      for (const { operationId, state } of e.expectedByOperation) {
+        const rows = e.decisions.filter((row) => row.operationId === operationId);
         if (
           rows.length !== 1 ||
-          !rows[0]?.operationId ||
+          rows[0]?.state !== state ||
           !rows[0]?.senderId ||
           !rows[0]?.reasonCode ||
           !Number.isSafeInteger(rows[0]?.count) ||
           (rows[0]?.count ?? 0) < 1
         )
-          return fail(`${state} 决定缺操作归属、稳定原因码或计数`);
+          return fail(`${operationId} 缺恰好一条 ${state} 决定，或决定缺归属、稳定原因码或计数`);
+        const feedbackRows = e.deliveredFeedback.filter((row) => row.operationId === operationId);
+        if (feedbackRows.length !== 1 || feedbackRows[0]?.reasonCode !== rows[0]?.reasonCode)
+          return fail(`${operationId} 没有恰好一条反馈，或反馈原因码与决定不对齐`);
       }
       if (e.offlineFeedbackMarkedDelivered) return fail("发送方离线时反馈已冒充 delivered");
       if (
-        e.deliveredFeedback.length !== expectedStates.length ||
+        e.deliveredFeedback.length !== e.expectedByOperation.length ||
         e.deliveredFeedback.some(
           (feedback) => feedback.phase !== "delivered" || feedback.deliveryReceipt === null,
         )
@@ -839,6 +852,35 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         return fail("batch 投影没有外显授权范围、水位、策略与省略缺口");
       if (!completeProjection(e.latest) || (e.latest?.omittedEventIds.length ?? 0) < 1)
         return fail("最近子集被冒充完整房间史");
+      const authorized = e.authorizedEventIds;
+      const reconcileProjection = (
+        label: string,
+        projection: GroupChatEvidenceById["GC-10"]["batch"],
+      ): string | null => {
+        if (projection === null) return `${label} 投影缺失`;
+        const { includedEventIds: included, omittedEventIds: omitted } = projection;
+        if (included.length === 0) return `${label} 投影没有纳入任何本轮授权事件`;
+        if ([...included, ...omitted].some((eventId) => !authorized.includes(eventId)))
+          return `${label} 投影出现非本轮判卷授权的事件 id`;
+        if (included.some((eventId) => omitted.includes(eventId)))
+          return `${label} 投影的纳入与省略互相重叠`;
+        if (included.length + omitted.length !== authorized.length)
+          return `${label} 投影的纳入加省略没有与本轮授权全集对账`;
+        return null;
+      };
+      for (const [label, projection] of [
+        ["batch", e.batch],
+        ["latest", e.latest],
+        ["truncated", e.truncated],
+      ] as const) {
+        const problem = reconcileProjection(label, projection);
+        if (problem !== null) return fail(problem);
+      }
+      const newest = authorized[authorized.length - 1];
+      if (newest !== undefined && !e.latest?.includedEventIds.includes(newest))
+        return fail("latest 最近子集没有纳入最新的授权事件");
+      if (e.truncated !== null && e.truncated.includedEventIds.length !== 1)
+        return fail("truncated 单条截断没有恰好纳入一条授权事件");
       const truncation = e.truncated?.truncations[0];
       if (
         !completeProjection(e.truncated) ||
@@ -858,6 +900,8 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         if (!e.projectionContext.includes(value))
           return fail("截断元数据没有进入模型实际可见上下文");
       }
+      if (!e.truncated?.includedEventIds.includes(truncation.eventId))
+        return fail("被截断的事件不在 truncated 投影的纳入集合里");
       if (e.hiddenWorldFingerprints.length !== 3 || new Set(e.hiddenWorldFingerprints).size !== 1)
         return fail("隐藏内容或其存在通过投影计数、错误或回执泄漏");
       if (
@@ -889,6 +933,19 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         return fail("stop cutoff 后的旧许可结果没有实际送回宿主");
       if (e.stoppedResultCommitted || !e.postContinueResultCommitted)
         return fail("stop 前许可在 continue 后复活，或新许可没有正常提交");
+      if (!e.stoppedResultReasoned)
+        return fail("stop cutoff 后的旧许可结果没有明确 rejected 记录与可归属原因");
+      if (
+        !sameMultiset(e.forgedTupleFields, [
+          "residentId",
+          "scopeId",
+          "scopeGeneration",
+          "windowId",
+          "generation",
+          "dispatchId",
+        ])
+      )
+        return fail("六个伪造目标没有恰好各改一个不同的身份字段");
       if (e.forgedTupleAttempts !== 6 || e.forgedTupleCommits !== 0 || e.currentTupleCommits !== 1)
         return fail("完整目标六字段的伪造负例或当前身份正对照不成立");
       return {
@@ -938,7 +995,18 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         return fail("单成员故障饿死了正常成员、人类消息或控制通道");
       if (!e.heldWasActuallyInFlight) return fail("同步快抛错冒充了不交许可的 wedge/timeout 场景");
       if (!e.heldTimedOut) return fail("失联成员没有在受控 scheduler 的 deadline 后有界收口");
-      if (!e.attemptsWithinBound) return fail("故障成员发生无界自动重试");
+      const attemptNumbers = e.failingOperationAttempts.map((row) => row.attempt);
+      const sortedNumbers = [...attemptNumbers].sort((a, b) => a - b);
+      if (
+        sortedNumbers.length === 0 ||
+        sortedNumbers[0] !== 1 ||
+        new Set(attemptNumbers).size !== attemptNumbers.length ||
+        !sortedNumbers.every(
+          (value, index) => index === 0 || value === (sortedNumbers[index - 1] ?? 0) + 1,
+        ) ||
+        (sortedNumbers[sortedNumbers.length - 1] ?? 0) > e.configuredMaxMemberAttempts
+      )
+        return fail("故障成员重试无界，或尝试序号不从 1 起、缺失、重复、越过配置上限");
       if (!e.restartPidChanged || !e.restartCommitStable)
         return fail("故障恢复没有换真实进程，或前后代码 commit 不同");
       if (!e.failureFeedbackRetained) return fail("成员失败反馈在离线/重启后丢失");
@@ -1544,9 +1612,9 @@ export async function runGroupChatCheck(
             row.target?.scopeGeneration === 2 &&
             row.target.generation === 2,
         ),
-        selfRootAccepted: finalEdgeRecords.some(
-          (row) => row.operationId === "gc06-self-root" && row.decision !== "blocked",
-        ),
+        selfRootAttempts: finalEdgeRecords
+          .filter((row) => row.operationId === "gc06-self-root")
+          .map((row) => ({ decision: row.decision, reasonCode: row.reasonCode })),
         restartPidChanged: restarted.previous.pid !== restarted.current.pid,
         restartCommitStable: restarted.previous.commit === restarted.current.commit,
         highWaterBeforeRestart,
@@ -1634,7 +1702,6 @@ export async function runGroupChatCheck(
         },
       ])
         await act(command);
-      const afterFalseControls = await driver.readScheduler();
       await act({
         kind: "submit-control",
         controlId: "gc07-authorized-stop",
@@ -1698,8 +1765,12 @@ export async function runGroupChatCheck(
         oldPermitCommitted: results.some(
           (row) => row.operationId === "gc07-old-permit" && row.phase === "committed",
         ),
-        falseControlsChangedLatch:
-          afterFalseControls.stoppedResidentIds.length !== beforeControl.stoppedResidentIds.length,
+        falseControls: ["gc07-quoted-stop", "gc07-resident-forgery", "gc07-unauthorized-human"].map(
+          (controlId) => ({
+            controlId,
+            records: controls.filter((row) => row.controlId === controlId),
+          }),
+        ),
         acceptedAndEffectiveSeparated:
           authorizedStop.some((row) => row.phase === "accepted") &&
           authorizedStop.some((row) => row.phase === "effective") &&
@@ -1735,7 +1806,7 @@ export async function runGroupChatCheck(
       });
       await act({ kind: "set-sender-online", residentId: sender, online: false });
       const stimuli = [
-        ["batch", "batch", "gc08-batch"],
+        ["batch", "batched", "gc08-batch"],
         ["not-included", "not-included", "gc08-not-included"],
         ["stopped", "stop-blocked", "gc08-stopped"],
         ["normal", "dispatch-failed", "gc08-dispatch-failed"],
@@ -1788,6 +1859,7 @@ export async function runGroupChatCheck(
       const reasonsBefore = reasonMap(decisionsBeforeRestart);
       const reasonsAfter = reasonMap(decisionsAfterRestart);
       return evaluateGroupChatEvidence(id, {
+        expectedByOperation: stimuli.map(([, state, operationId]) => ({ operationId, state })),
         decisions: decisionsBeforeRestart.filter((row) =>
           stimuli.some(([, , operationId]) => operationId === row.operationId),
         ),
@@ -1869,6 +1941,12 @@ export async function runGroupChatCheck(
       });
     }
     case "GC-10": {
+      const authorizedEventIds = [
+        "gc10-event-1",
+        "gc10-event-2",
+        "gc10-event-3",
+        "gc10-event-4",
+      ] as const;
       const runWorld = async (hiddenBodies: readonly string[]) => {
         await driver.resetScenario(id, fixture);
         await act({ kind: "set-room-access", residentId: fixture.residentIds.a, allowed: true });
@@ -1939,6 +2017,7 @@ export async function runGroupChatCheck(
       const fingerprint = (world: typeof worldA) =>
         JSON.stringify({ receipts: world.receipts, contextText: world.contextText });
       return evaluateGroupChatEvidence(id, {
+        authorizedEventIds,
         batch,
         latest,
         truncated,
@@ -2102,6 +2181,14 @@ export async function runGroupChatCheck(
         { ...baseTarget, generation: 2 },
         { ...baseTarget, dispatchId: "test-dispatch:forged" },
       ];
+      // The six forgeries must each move exactly one distinct identity field; a duplicated
+      // field mutation would silently shrink the negative coverage, so the judge accounts for it.
+      const forgedTupleFields = forgedTargets.map((target) => {
+        const changed = (Object.keys(baseTarget) as readonly (keyof typeof baseTarget)[]).filter(
+          (key) => target[key] !== baseTarget[key],
+        );
+        return changed.length === 1 && changed[0] !== undefined ? changed[0] : "multiple";
+      });
       for (const target of forgedTargets)
         await act({
           kind: "return-member-result",
@@ -2147,9 +2234,16 @@ export async function runGroupChatCheck(
         stoppedResultCommitted: cutoffResults.some(
           (row) => row.operationId === "gc12-cutoff-old" && row.phase === "committed",
         ),
+        stoppedResultReasoned: cutoffResults.some(
+          (row) =>
+            row.operationId === "gc12-cutoff-old" &&
+            row.phase === "rejected" &&
+            (row.reasonCode?.length ?? 0) > 0,
+        ),
         postContinueResultCommitted: cutoffResults.some(
           (row) => row.operationId === "gc12-cutoff-new" && row.phase === "committed",
         ),
+        forgedTupleFields,
         forgedTupleAttempts: tupleResults.filter(
           (row) =>
             row.operationId === "gc12-tuple" &&
@@ -2354,13 +2448,14 @@ export async function runGroupChatCheck(
       if (context === undefined) throw new Error("GC-16 needs restartHost judge support");
       const a = fixture.residentIds.a;
       const b = fixture.residentIds.b;
+      const configuredMaxMemberAttempts = 2;
       await act({
         kind: "configure-orchestration",
         rootId: fixture.roots.first,
         policyVersion: "test-policy:fault-isolation",
         turnBudget: 8,
         deadlineTicks: 2,
-        maxMemberAttempts: 2,
+        maxMemberAttempts: configuredMaxMemberAttempts,
       });
       await act({ kind: "set-room-membership", residentId: a, active: true });
       await act({ kind: "set-room-membership", residentId: b, active: true });
@@ -2472,7 +2567,8 @@ export async function runGroupChatCheck(
         heldTimedOut: attemptsBeforeRestart.some(
           (row) => row.operationId === "gc16-held-member" && row.outcome === "unknown",
         ),
-        attemptsWithinBound: failingAttempts.length <= 2,
+        configuredMaxMemberAttempts,
+        failingOperationAttempts: failingAttempts,
         restartPidChanged: restarted.previous.pid !== restarted.current.pid,
         restartCommitStable: restarted.previous.commit === restarted.current.commit,
         failuresBeforeRestart: attemptsBeforeRestart.filter(

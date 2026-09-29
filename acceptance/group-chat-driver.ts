@@ -541,7 +541,8 @@ export interface GroupChatEvidenceById {
     failureRecorded: boolean;
     identityChangesResetBudget: boolean;
     generationChangeStimulated: boolean;
-    selfRootAccepted: boolean;
+    /** Every round record the host kept for the self-root stimulus; judge requires exactly one blocked with a stable reason. */
+    selfRootAttempts: readonly Pick<RoundRecord, "decision" | "reasonCode">[];
     restartPidChanged: boolean;
     restartCommitStable: boolean;
     highWaterBeforeRestart: number;
@@ -556,7 +557,8 @@ export interface GroupChatEvidenceById {
     stopAcceptedBeforeQueueRelease: boolean;
     stopEffective: boolean;
     oldPermitCommitted: boolean;
-    falseControlsChangedLatch: boolean;
+    /** Host-owned records for each forged control; every one must be explicitly rejected, without a cutoff. */
+    falseControls: readonly { controlId: string; records: readonly ControlRecord[] }[];
     acceptedAndEffectiveSeparated: boolean;
     unreachableReportedIncomplete: boolean;
     externalEffectClaimedReversed: boolean;
@@ -564,6 +566,11 @@ export interface GroupChatEvidenceById {
     postContinueNewPermitCommitted: boolean;
   };
   "GC-08": {
+    /** Judge ground truth: the exact state each stimulus operation must get exactly one decision for. */
+    expectedByOperation: readonly {
+      operationId: string;
+      state: DeliveryDecisionRecord["state"];
+    }[];
     decisions: readonly DeliveryDecisionRecord[];
     offlineFeedbackMarkedDelivered: boolean;
     deliveredFeedback: readonly SenderFeedbackRecord[];
@@ -585,6 +592,8 @@ export interface GroupChatEvidenceById {
     memoryRecordsAddedByContextCommit: number;
   };
   "GC-10": {
+    /** Authorized event ids the judge seeded this round, in seed order; the identity baseline. */
+    authorizedEventIds: readonly string[];
     batch: ProjectionReceipt | null;
     latest: ProjectionReceipt | null;
     truncated: ProjectionReceipt | null;
@@ -602,7 +611,11 @@ export interface GroupChatEvidenceById {
     staleResultReasoned: boolean;
     stoppedResultActuallyReturned: boolean;
     stoppedResultCommitted: boolean;
+    /** The cutoff-stopped late result must carry an explicit rejected record with a stable reason. */
+    stoppedResultReasoned: boolean;
     postContinueResultCommitted: boolean;
+    /** The single identity field each of the six forged targets moves; must cover all six exactly once. */
+    forgedTupleFields: readonly string[];
     forgedTupleAttempts: number;
     forgedTupleCommits: number;
     currentTupleCommits: number;
@@ -625,7 +638,10 @@ export interface GroupChatEvidenceById {
     controlContinued: boolean;
     heldWasActuallyInFlight: boolean;
     heldTimedOut: boolean;
-    attemptsWithinBound: boolean;
+    /** The maxMemberAttempts the judge configured for this scenario. */
+    configuredMaxMemberAttempts: number;
+    /** Every attempt row for the failing operation, any outcome: 1-based, unique, contiguous, bounded. */
+    failingOperationAttempts: readonly MemberAttemptRecord[];
     restartPidChanged: boolean;
     restartCommitStable: boolean;
     failuresBeforeRestart: number;
