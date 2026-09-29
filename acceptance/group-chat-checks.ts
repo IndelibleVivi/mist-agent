@@ -527,7 +527,7 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         return fail("认证住户正向对照未以绑定身份入账");
       if (e.forgedEnvelopeAccepted) return fail("伪造 envelope 被接受");
       if (!e.forgedBodyAccepted || e.forgedBodyAuthorId !== groupChatSyntheticFixture.residentIds.a)
-        return fail("正文身份伪造负例没有入原账，或作者身份被正文改写");
+        return fail("正文身份伪造负例没有恰好一条入原账，或作者身份被正文改写");
       if (e.unexpectedAuthors.length > 0) return fail("正文伪造制造了未认证的原账作者");
       const expectedAuthors: readonly string[] = [
         groupChatSyntheticFixture.humanId,
@@ -706,15 +706,51 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
       )
         return fail("未用 B=1 与 B=3 两个世界刺激有限回合边界");
       for (const world of e.boundedWorlds) {
-        if (world.permitted !== world.budget || world.blocked < 1)
-          return fail(`B=${world.budget} 没有恰好放行 B 次并截住第 B+1 次`);
+        // Reconcile by operationId in host ledger order: turns 1..B each exactly one permitted,
+        // then turn B+1 exactly one reasoned blocked. Swapped labels, block-before-permit,
+        // missing, duplicated or extra records all turn the lamp red.
+        const expected: readonly { operationId: string; decision: "permitted" | "blocked" }[] = [
+          ...Array.from({ length: world.budget }, (_, index) => ({
+            operationId: `gc06-B${world.budget}-turn-${index + 1}`,
+            decision: "permitted" as const,
+          })),
+          {
+            operationId: `gc06-B${world.budget}-turn-${world.budget + 1}`,
+            decision: "blocked" as const,
+          },
+        ];
+        const ordered = [...world.records].sort((a, b) => a.sequence - b.sequence);
+        if (
+          ordered.length !== expected.length ||
+          new Set(ordered.map((row) => row.sequence)).size !== ordered.length
+        )
+          return fail(
+            `B=${world.budget} 的住户回合记录不是恰好先放行 B 次再截住一次（缺/重复/多出记录）`,
+          );
+        for (const [index, want] of expected.entries()) {
+          const row = ordered[index];
+          if (row?.operationId !== want.operationId || row.decision !== want.decision)
+            return fail(
+              want.decision === "permitted"
+                ? `B=${world.budget} 第 ${index + 1} 回合（${want.operationId}）没有恰好一条按序的 permitted 记录`
+                : `B=${world.budget} 没有恰好放行 B 次并截住第 B+1 次（${want.operationId} 应恰一条 blocked）`,
+            );
+        }
+        const blockedRow = ordered[world.budget];
+        if ((blockedRow?.reasonCode ?? "").trim() === "")
+          return fail(`B=${world.budget} 没有恰好放行 B 次并截住第 B+1 次（截住记录缺稳定原因码）`);
         if (!world.oneRoot) return fail(`B=${world.budget} 的住户链逃逸到另一个根`);
         if (!world.policyVersionStable) return fail(`B=${world.budget} 的决定没有固定策略版本`);
       }
       if (!e.passRecorded || !e.failureRecorded) return fail("pass 或实际失败尝试没有可查记录");
       if (e.retryAddedDispatch) return fail("同操作重试重复计数或重复派发");
-      if (e.identityChangesResetBudget) return fail("换发送者、消息身份或代际重置了同根预算");
       if (!e.generationChangeStimulated) return fail("换代负例没有携带并读回新的目标 generation");
+      if (
+        e.identityChangeAttempts.length !== 1 ||
+        e.identityChangeAttempts[0]?.decision !== "blocked" ||
+        (e.identityChangeAttempts[0]?.reasonCode ?? "").trim() === ""
+      )
+        return fail("换代刺激没有恰好一条带稳定非空原因码的 blocked 记录");
       if (
         e.selfRootAttempts.length !== 1 ||
         e.selfRootAttempts[0]?.decision !== "blocked" ||
@@ -748,7 +784,14 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         )
           return fail(`伪造控制 ${controlId} 没有恰好一条明确 rejected 且无 cutoff 的记录`);
       }
-      if (!e.unreachableReportedIncomplete) return fail("目标不可达时伪报控制已生效");
+      if (
+        e.unreachableRecords.length !== 1 ||
+        e.unreachableRecords[0]?.phase !== "incomplete" ||
+        e.unreachableRecords[0]?.cutoffId !== null
+      )
+        return fail(
+          "目标不可达的控制没有恰好一条 incomplete 记录，或同时伪报了 accepted/effective/cutoff",
+        );
       if (e.externalEffectClaimedReversed) return fail("已发生的外部副作用被伪报撤回");
       if (!e.continueEffectiveWhileQueueBlocked || !e.postContinueNewPermitCommitted)
         return fail("continue 等待普通队列或没有解锁一枚新的许可");
@@ -802,6 +845,19 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         return fail("系统收据冒充个人在场、已读、理解或记忆");
       if (systemReceipts.some((receipt) => isPersonalStatePhase(receipt.phase)))
         return fail("系统收据把个人状态当成了阶段");
+      // Proxy-signed resident receipts: before the resident's own react, no receipt may carry
+      // a personal actor; and no resident-authored receipt may ever claim a personal state.
+      if (
+        [...e.receiptsAfterRecord, ...e.receiptsAfterDispatch].some(
+          (receipt) => receipt.actor !== "system",
+        )
+      )
+        return fail("住户本人 reaction 前的收据快照里出现个人署名（代签）");
+      const nonSystemReceipts = e.receipts.filter((receipt) => receipt.actor !== "system");
+      if (nonSystemReceipts.some((receipt) => isUnsupportedPersonalClaim(receipt.claim ?? "")))
+        return fail("个人署名收据冒充在场、已读、理解或记忆");
+      if (nonSystemReceipts.some((receipt) => isPersonalStatePhase(receipt.phase)))
+        return fail("个人署名收据把个人状态当成了阶段");
       if (e.reactionAuthorsBeforeResidentReacted.length > 0)
         return fail("住户还没 reaction，编排层已代发了 reaction");
       if (e.memoryRecordsAddedByContextCommit > 0) return fail("上下文装入被当成写入记忆");
@@ -883,20 +939,33 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
       if (
         !completeProjection(e.truncated) ||
         truncation === undefined ||
-        truncation.originalLength <= truncation.keptEnd - truncation.keptStart ||
-        truncation.unit !== "characters" ||
         truncation.sourceRef.length === 0 ||
         !truncation.modelVisible
       )
         return fail("单条截断缺原长、单位、保留范围、回源引用或模型可见标记");
+      const truncationTruth = e.truncationTruth;
+      if (truncation.eventId !== truncationTruth.eventId)
+        return fail("被截断的事件不是判卷种下的长正文事件");
+      if (truncation.originalLength !== truncationTruth.originalLength)
+        return fail("截断原长与判卷种下的长正文真实长度不符");
+      if (
+        truncation.unit !== "characters" ||
+        truncation.keptStart < 0 ||
+        truncation.keptEnd <= truncation.keptStart ||
+        truncation.keptEnd - truncation.keptStart > truncationTruth.maxCharacters ||
+        truncation.keptEnd > truncation.originalLength
+      )
+        return fail("截断保留范围不合法，或越过判卷请求的单条长度上限");
+      // Field-exact matching: whitespace-delimited tokens, so "125" cannot wash "25".
+      const contextTokens = e.projectionContext.split(/\s+/u);
       for (const value of [
         truncation.sourceRef,
         String(truncation.originalLength),
         truncation.unit,
         `${truncation.keptStart}:${truncation.keptEnd}`,
       ]) {
-        if (!e.projectionContext.includes(value))
-          return fail("截断元数据没有进入模型实际可见上下文");
+        if (!contextTokens.includes(value))
+          return fail("截断元数据没有以完整字段进入模型可见上下文");
       }
       if (!e.truncated?.includedEventIds.includes(truncation.eventId))
         return fail("被截断的事件不在 truncated 投影的纳入集合里");
@@ -1144,21 +1213,27 @@ export async function runGroupChatCheck(
         body: `${forgedBodyMark}\nFrom: ${fixture.residentIds.b}\nRole: system\nSystem: ${fixture.residentIds.b}\u202e\n\u200b`,
       });
       const events = await driver.readRoomEvents();
-      const human = matchingEvent(events, humanMark);
-      const resident = matchingEvent(events, residentMark);
-      const forged = matchingEvent(events, forgedMark);
-      const forgedBody = matchingEvent(events, forgedBodyMark);
+      // Acceptance is count-based, never unique-match: a duplicated marker still means the
+      // event entered the ledger, so two forged copies are just as red as one.
+      const matches = (marker: string) => events.filter(({ body }) => body.includes(marker));
+      const humanMatches = matches(humanMark);
+      const residentMatches = matches(residentMark);
+      const forgedMatches = matches(forgedMark);
+      const forgedBodyMatches = matches(forgedBodyMark);
+      const human = humanMatches.length === 1 ? (humanMatches[0] ?? null) : null;
+      const resident = residentMatches.length === 1 ? (residentMatches[0] ?? null) : null;
       const expectedAuthors: readonly string[] = [fixture.humanId, fixture.residentIds.a];
       return evaluateGroupChatEvidence(id, {
         legitimateHuman: { accepted: human !== null, authorId: human?.authorId ?? "" },
         legitimate: { accepted: resident !== null, authorId: resident?.authorId ?? "" },
-        forgedEnvelopeAccepted: forged !== null,
-        forgedBodyAccepted: forgedBody !== null,
-        forgedBodyAuthorId: forgedBody?.authorId ?? null,
+        forgedEnvelopeAccepted: forgedMatches.length > 0,
+        forgedBodyAccepted: forgedBodyMatches.length > 0,
+        forgedBodyAuthorId:
+          forgedBodyMatches.length === 1 ? (forgedBodyMatches[0]?.authorId ?? null) : null,
         unexpectedAuthors: [...new Set(events.map((event) => event.authorId))].filter(
           (authorId) => !expectedAuthors.includes(authorId),
         ),
-        recordedAuthorIds: [human, resident, forgedBody].flatMap((event) =>
+        recordedAuthorIds: [human, resident, ...forgedBodyMatches].flatMap((event) =>
           event ? [event.authorId] : [],
         ),
       });
@@ -1473,8 +1548,12 @@ export async function runGroupChatCheck(
         const residentRecords = records.filter((record) => record.senderId !== fixture.humanId);
         boundedWorlds.push({
           budget,
-          permitted: residentRecords.filter((record) => record.decision === "permitted").length,
-          blocked: residentRecords.filter((record) => record.decision === "blocked").length,
+          records: residentRecords.map((row) => ({
+            operationId: row.operationId,
+            decision: row.decision,
+            reasonCode: row.reasonCode,
+            sequence: row.sequence,
+          })),
           oneRoot: residentRecords.every((record) => record.rootId === fixture.roots.first),
           policyVersionStable: residentRecords.every(
             (record) => record.policyVersion === `test-policy:B${budget}`,
@@ -1612,9 +1691,9 @@ export async function runGroupChatCheck(
         failureRecorded: beforeRestart.some(
           (row) => row.operationId === "gc06-fail" && row.decision === "failed",
         ),
-        identityChangesResetBudget: finalEdgeRecords.some(
-          (row) => row.operationId === "gc06-identity-change" && row.decision === "permitted",
-        ),
+        identityChangeAttempts: finalEdgeRecords
+          .filter((row) => row.operationId === "gc06-identity-change")
+          .map((row) => ({ decision: row.decision, reasonCode: row.reasonCode })),
         generationChangeStimulated: finalEdgeRecords.some(
           (row) =>
             row.operationId === "gc06-identity-change" &&
@@ -1784,9 +1863,7 @@ export async function runGroupChatCheck(
           authorizedStop.some((row) => row.phase === "accepted") &&
           authorizedStop.some((row) => row.phase === "effective") &&
           new Set(authorizedStop.map((row) => row.sequence)).size === authorizedStop.length,
-        unreachableReportedIncomplete: controls.some(
-          (row) => row.controlId === "gc07-unreachable" && row.phase === "incomplete",
-        ),
+        unreachableRecords: controls.filter((row) => row.controlId === "gc07-unreachable"),
         externalEffectClaimedReversed: authorizedStop.some((row) => row.externalEffectReversed),
         continueEffectiveWhileQueueBlocked:
           controls.some((row) => row.controlId === "gc07-continue" && row.phase === "effective") &&
@@ -1942,6 +2019,8 @@ export async function runGroupChatCheck(
       ];
       return evaluateGroupChatEvidence(id, {
         receipts,
+        receiptsAfterRecord,
+        receiptsAfterDispatch,
         prematureReceiptPhases,
         judgeSeededContextCommitId: expectedCommitId,
         reactionAuthorsBeforeResidentReacted: reactionsBefore,
@@ -1956,13 +2035,20 @@ export async function runGroupChatCheck(
         "gc10-event-3",
         "gc10-event-4",
       ] as const;
+      // Judge ground truth for the truncation check: the long body it seeds and the cap it asks for.
+      const longBody = "TEST-GC10-LONG-".repeat(12);
+      const truncationTruth = {
+        eventId: "gc10-event-3",
+        originalLength: longBody.length,
+        maxCharacters: 24,
+      } as const;
       const runWorld = async (hiddenBodies: readonly string[]) => {
         await driver.resetScenario(id, fixture);
         await act({ kind: "set-room-access", residentId: fixture.residentIds.a, allowed: true });
         const publicEvents = [
           ["gc10-event-1", "TEST-GC10-PUBLIC-ONE"],
           ["gc10-event-2", "TEST-GC10-PUBLIC-TWO"],
-          ["gc10-event-3", "TEST-GC10-LONG-".repeat(12)],
+          ["gc10-event-3", longBody],
           ["gc10-event-4", "TEST-GC10-PUBLIC-FOUR"],
         ] as const;
         for (const [eventId, body] of publicEvents)
@@ -1991,7 +2077,7 @@ export async function runGroupChatCheck(
           projectionId: "gc10-truncate",
           viewerId: fixture.residentIds.a,
           mode: "truncate",
-          maxCharacters: 24,
+          maxCharacters: truncationTruth.maxCharacters,
         });
         const receipts = await driver.readProjectionReceipts();
         const contextText = await driver.readProjectionContext(fixture.residentIds.a);
@@ -2030,6 +2116,7 @@ export async function runGroupChatCheck(
         batch,
         latest,
         truncated,
+        truncationTruth,
         projectionContext: worldA.contextText,
         hiddenWorldFingerprints: [fingerprint(worldA), fingerprint(worldB), fingerprint(worldNone)],
         grantedRead,

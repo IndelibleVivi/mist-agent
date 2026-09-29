@@ -531,15 +531,16 @@ export interface GroupChatEvidenceById {
   "GC-06": {
     boundedWorlds: readonly {
       budget: number;
-      permitted: number;
-      blocked: number;
+      /** Every resident round record of this bounded world, in host ledger order. */
+      records: readonly Pick<RoundRecord, "operationId" | "decision" | "reasonCode" | "sequence">[];
       oneRoot: boolean;
       policyVersionStable: boolean;
     }[];
     retryAddedDispatch: boolean;
     passRecorded: boolean;
     failureRecorded: boolean;
-    identityChangesResetBudget: boolean;
+    /** Every round record the host kept for the generation-change stimulus; judge requires exactly one blocked with a stable reason. */
+    identityChangeAttempts: readonly Pick<RoundRecord, "decision" | "reasonCode">[];
     generationChangeStimulated: boolean;
     /** Every round record the host kept for the self-root stimulus; judge requires exactly one blocked with a stable reason. */
     selfRootAttempts: readonly Pick<RoundRecord, "decision" | "reasonCode">[];
@@ -560,7 +561,8 @@ export interface GroupChatEvidenceById {
     /** Host-owned records for each forged control; every one must be explicitly rejected, without a cutoff. */
     falseControls: readonly { controlId: string; records: readonly ControlRecord[] }[];
     acceptedAndEffectiveSeparated: boolean;
-    unreachableReportedIncomplete: boolean;
+    /** Host-owned records for the unreachable-target control; exactly one incomplete, no accepted/effective/cutoff. */
+    unreachableRecords: readonly ControlRecord[];
     externalEffectClaimedReversed: boolean;
     continueEffectiveWhileQueueBlocked: boolean;
     postContinueNewPermitCommitted: boolean;
@@ -584,6 +586,9 @@ export interface GroupChatEvidenceById {
   };
   "GC-09": {
     receipts: readonly SystemReceipt[];
+    /** Receipt snapshots taken before the resident's own react; no resident actor may appear yet. */
+    receiptsAfterRecord: readonly SystemReceipt[];
+    receiptsAfterDispatch: readonly SystemReceipt[];
     prematureReceiptPhases: readonly string[];
     judgeSeededContextCommitId: string | null;
     /** Reactions on the judge event read back before the resident's own react command. */
@@ -597,6 +602,12 @@ export interface GroupChatEvidenceById {
     batch: ProjectionReceipt | null;
     latest: ProjectionReceipt | null;
     truncated: ProjectionReceipt | null;
+    /** Judge ground truth: which event it seeded long, its real body length, and the requested cap. */
+    truncationTruth: {
+      readonly eventId: string;
+      readonly originalLength: number;
+      readonly maxCharacters: number;
+    };
     projectionContext: string;
     hiddenWorldFingerprints: readonly string[];
     grantedRead: SourceReadAudit | null;

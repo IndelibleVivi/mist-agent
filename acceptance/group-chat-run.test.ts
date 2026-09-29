@@ -182,6 +182,18 @@ interface TestOptions {
   readonly duplicateProjectedId?: boolean;
   /** #206 review 4: every returned gc12-tuple target is washed into the same residentId variant. */
   readonly washForgedTupleTargets?: boolean;
+  /** #206 review 5: a receipt signed by a resident (seen/已读/记住) appears at record time. */
+  readonly proxySignedReceiptAtRecord?: boolean;
+  /** #206 review 5: an unreachable control reports an extra effective row next to incomplete. */
+  readonly unreachableAlsoEffective?: boolean;
+  /** #206 review 5: the generation-change stimulus is washed into a zero-cost human trigger. */
+  readonly identityChangeAsHumanTrigger?: boolean;
+  /** #206 review 5: the B=1 world's turn-1/turn-2 records carry each other's operationId. */
+  readonly swapBoundedTurnRecords?: boolean;
+  /** #206 review 5: truncation originalLength is forged to kept+1 and the context synced. */
+  readonly forgeTruncationMetadata?: boolean;
+  /** #206 review 5: the forged envelope is recorded twice, defeating unique-match readbacks. */
+  readonly duplicateForgedEnvelope?: boolean;
 }
 
 interface SyntheticSubmission {
@@ -400,11 +412,22 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
       readonly target?: DispatchIdentity | null;
     },
   ): void {
+    // Review probe: the B=1 bounded world mislabels turn-1/turn-2 records with each other's
+    // operationId — a count-only judge stays green, an operationId-pinned judge goes red.
+    const operationId =
+      this.options.swapBoundedTurnRecords && this.scenarioId === "GC-06"
+        ? input.operationId === "gc06-B1-turn-1"
+          ? "gc06-B1-turn-2"
+          : input.operationId === "gc06-B1-turn-2"
+            ? "gc06-B1-turn-1"
+            : input.operationId
+        : input.operationId;
     this.roundRecords.push({
       sequence: this.nextSequence(),
       consumedTurns: this.consumed(input.rootId),
       policyVersion: this.policy?.policyVersion ?? null,
       ...input,
+      operationId,
       target: this.options.omitRoundTarget ? null : (input.target ?? null),
     });
   }
@@ -510,6 +533,25 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   }
 
   private processMemberTurn(submission: SyntheticSubmission, claimedRootId?: string): void {
+    if (
+      this.options.identityChangeAsHumanTrigger &&
+      submission.operationId === "gc06-identity-change"
+    ) {
+      // Review probe: the generation-change stimulus washed into a zero-cost human trigger —
+      // the judge must require exactly one reasoned blocked record from the host's own ledger.
+      this.roundRecords.push({
+        sequence: this.nextSequence(),
+        operationId: submission.operationId,
+        rootId: submission.rootId,
+        senderId: fixture.humanId,
+        policyVersion: this.policy?.policyVersion ?? null,
+        decision: "human-trigger",
+        consumedTurns: 0,
+        reasonCode: null,
+        target: submission.target,
+      });
+      return;
+    }
     const policyValid =
       this.policy !== null &&
       Number.isSafeInteger(this.policy.turnBudget) &&
@@ -738,6 +780,18 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
       case "post": {
         if (this.options.dropForgedBodyPost && command.body.includes("TEST-GC01-BODY-FORGERY"))
           return;
+        if (this.options.duplicateForgedEnvelope && command.claimedAuthorId !== undefined) {
+          // Review probe: the forged envelope is recorded twice; a unique-match readback
+          // ("multiple => null") would wash the acceptance into a false green.
+          for (let copy = 0; copy < 2; copy += 1)
+            this.addEvent({
+              roomId: command.roomId,
+              authorId: command.principalId,
+              body: command.body,
+              visibility: "public",
+            });
+          return;
+        }
         const valid =
           command.roomId !== "" &&
           command.visibility === "public" &&
@@ -923,6 +977,15 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
         });
         const claim = this.options.claimOverride ?? "系统已收，成员尚未派发";
         this.receipts.push({ actor: "system", phase: "recorded", claim });
+        if (this.options.proxySignedReceiptAtRecord) {
+          // Review probe: a resident-signed personal-state receipt before any reaction must stay red
+          // even after that resident later reacts for real.
+          this.receipts.push({
+            actor: fixture.residentIds.a,
+            phase: "seen",
+            claim: "成员已读并记住了",
+          });
+        }
         if (this.options.publishFutureReceiptsEarly) {
           this.receipts.push({ actor: "system", phase: "dispatched", claim });
           this.receipts.push({
@@ -1199,13 +1262,31 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
             this.options.claimExternalEffectReversed === true &&
             this.externalEffects.has(command.targetId),
         };
-        if (!this.options.mergeControlReceipts) this.controlRecords.push(accepted);
         const reachable = this.roomMembers.has(command.targetId);
+        if (!reachable && !this.options.reportUnreachableEffective) {
+          // An unreachable target yields exactly one incomplete record: no accepted/effective
+          // row and no cutoff, so the control ledger cannot wash the failure into a success.
+          this.controlRecords.push({
+            ...accepted,
+            sequence: this.nextSequence(),
+            phase: "incomplete",
+            cutoffId: null,
+          });
+          // Review probe: an extra effective row next to the incomplete one must go red.
+          if (this.options.unreachableAlsoEffective)
+            this.controlRecords.push({
+              ...accepted,
+              sequence: this.nextSequence(),
+              phase: "effective",
+              cutoffId: null,
+            });
+          return;
+        }
+        if (!this.options.mergeControlReceipts) this.controlRecords.push(accepted);
         const blockedByOrdinaryQueue =
           this.options.controlSharesOrdinaryQueue && this.ordinaryQueueDepth > 0;
         const continueBlocked = this.options.continueDeadlocks && command.action === "continue";
         let phase: ControlRecord["phase"] = "effective";
-        if (!reachable && !this.options.reportUnreachableEffective) phase = "incomplete";
         if (blockedByOrdinaryQueue || continueBlocked) phase = "accepted";
         const effective: ControlRecord = {
           ...accepted,
@@ -1274,16 +1355,21 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
           : authorized.filter((item) => !included.includes(item));
         const truncate = command.mode === "truncate" ? included[0] : undefined;
         const maxCharacters = command.maxCharacters ?? 24;
+        // Review probe: originalLength forged to kept+1 (25) with the context line synced —
+        // only a judge-truth length check and field-exact context matching can catch it.
+        const keptEnd = truncate === undefined ? 0 : Math.min(maxCharacters, truncate.body.length);
         const truncations =
           truncate === undefined
             ? []
             : [
                 {
                   eventId: truncate.eventId,
-                  originalLength: truncate.body.length,
+                  originalLength: this.options.forgeTruncationMetadata
+                    ? keptEnd + 1
+                    : truncate.body.length,
                   unit: "characters" as const,
                   keptStart: 0,
-                  keptEnd: Math.min(maxCharacters, truncate.body.length),
+                  keptEnd,
                   sourceRef: `room-source:${truncate.eventId}`,
                   modelVisible: !this.options.truncationMetadataNotModelVisible,
                 },
@@ -1788,7 +1874,7 @@ describe("#191/#192 group-chat acceptance: judge-driven synthetic host checks", 
     ["GC-09", { proxyReaction: true }, "代发"],
     ["GC-09", { commitWritesMemory: true }, "写入记忆"],
     ["GC-09", { extraSystemPhase: "seen" }, "个人状态当成了阶段"],
-    ["GC-09", { forgedResidentReceipt: true }, "没有本人 reaction"],
+    ["GC-09", { forgedResidentReceipt: true }, "代签"],
     ["GC-15", { leakHiddenToUnauthorized: true }, "泄漏"],
     ["GC-15", { acceptCrossRoomReplay: true }, "错误房间"],
     ["GC-15", { noHiddenRoom: true }, "对照世界"],
@@ -2163,7 +2249,7 @@ describe("#192 stacked red oracle: each A-D behavior has a single-mutation red",
     ["GC-06B retry", "GC-06", { duplicateRetry: true }, "重试重复"],
     ["GC-06B pass", "GC-06", { omitPassRecord: true }, "pass"],
     ["GC-06B failure", "GC-06", { omitFailureRecord: true }, "失败尝试"],
-    ["GC-06B identity", "GC-06", { resetBudgetOnIdentityChange: true }, "重置了同根预算"],
+    ["GC-06B identity", "GC-06", { resetBudgetOnIdentityChange: true }, "换代刺激"],
     ["GC-06B generation", "GC-06", { omitRoundTarget: true }, "换代负例"],
     ["GC-06B root", "GC-06", { acceptSelfDeclaredRoot: true }, "自报新根"],
     ["GC-06C", "GC-06", { resetRoundOnRestart: true }, "高水位"],
@@ -2215,6 +2301,18 @@ describe("#192 stacked red oracle: each A-D behavior has a single-mutation red",
     ["GC-07B dup", "GC-07", { duplicateFalseControlRecord: true }, "恰好一条"],
     ["GC-10 dup-id", "GC-10", { duplicateProjectedId: true }, "重复"],
     ["GC-12D wash", "GC-12", { washForgedTupleTargets: true }, "各改一个"],
+    // #206 review 5: single-mutation probes for the six newly confirmed false greens.
+    ["GC-01 dup-forged", "GC-01", { duplicateForgedEnvelope: true }, "伪造 envelope"],
+    [
+      "GC-06A swap-order",
+      "GC-06",
+      { swapBoundedTurnRecords: true },
+      "没有恰好一条按序的 permitted",
+    ],
+    ["GC-06B identity-human", "GC-06", { identityChangeAsHumanTrigger: true }, "换代刺激"],
+    ["GC-07C unreachable-effective", "GC-07", { unreachableAlsoEffective: true }, "不可达"],
+    ["GC-09B proxy-sign", "GC-09", { proxySignedReceiptAtRecord: true }, "代签"],
+    ["GC-10B forge-length", "GC-10", { forgeTruncationMetadata: true }, "原长"],
   ] as const)("%s makes %s red for %j", async (_caseId, id, options, reason) => {
     const result = await check(id, options);
     expect(result.passed).toBe(false);
@@ -2265,15 +2363,37 @@ describe("#192 stacked red oracle: each A-D behavior has a single-mutation red",
 describe("#206 review 3: evaluator pins identities and sequences, not just counts", () => {
   const a = fixture.residentIds.a;
 
+  const gc06TurnRecord = (
+    operationId: string,
+    decision: "permitted" | "blocked",
+    sequence: number,
+    reasonCode: string | null = null,
+  ): GroupChatEvidenceById["GC-06"]["boundedWorlds"][number]["records"][number] => ({
+    operationId,
+    decision,
+    reasonCode,
+    sequence,
+  });
+  const gc06WorldRecords = (budget: number) => [
+    ...Array.from({ length: budget }, (_, index) =>
+      gc06TurnRecord(`gc06-B${budget}-turn-${index + 1}`, "permitted", index + 1),
+    ),
+    gc06TurnRecord(
+      `gc06-B${budget}-turn-${budget + 1}`,
+      "blocked",
+      budget + 1,
+      "ROOM_TURN_BUDGET_EXHAUSTED",
+    ),
+  ];
   const gc06Base = (): GroupChatEvidenceById["GC-06"] => ({
     boundedWorlds: [
-      { budget: 1, permitted: 1, blocked: 1, oneRoot: true, policyVersionStable: true },
-      { budget: 3, permitted: 3, blocked: 1, oneRoot: true, policyVersionStable: true },
+      { budget: 1, records: gc06WorldRecords(1), oneRoot: true, policyVersionStable: true },
+      { budget: 3, records: gc06WorldRecords(3), oneRoot: true, policyVersionStable: true },
     ],
     retryAddedDispatch: false,
     passRecorded: true,
     failureRecorded: true,
-    identityChangesResetBudget: false,
+    identityChangeAttempts: [{ decision: "blocked", reasonCode: "ROOM_TURN_BUDGET_EXHAUSTED" }],
     generationChangeStimulated: true,
     selfRootAttempts: [{ decision: "blocked", reasonCode: "ROOM_ROOT_FORGED" }],
     restartPidChanged: true,
@@ -2333,7 +2453,18 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       gc07Forged("gc07-unauthorized-human"),
     ],
     acceptedAndEffectiveSeparated: true,
-    unreachableReportedIncomplete: true,
+    unreachableRecords: [
+      {
+        sequence: 1,
+        controlId: "gc07-unreachable",
+        issuerId: fixture.humanId,
+        targetId: fixture.residentIds.c,
+        action: "stop",
+        phase: "incomplete",
+        cutoffId: null,
+        externalEffectReversed: false,
+      },
+    ],
     externalEffectClaimedReversed: false,
     continueEffectiveWhileQueueBlocked: true,
     postContinueNewPermitCommitted: true,
@@ -2471,9 +2602,10 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
     errorCode: null,
     truncations,
   });
+  const gc10Truth = { eventId: "gc10-event-3", originalLength: 180, maxCharacters: 24 } as const;
   const gc10Truncation = {
     eventId: "gc10-event-3",
-    originalLength: 30,
+    originalLength: 180,
     unit: "characters" as const,
     keptStart: 0,
     keptEnd: 24,
@@ -2498,7 +2630,8 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       ["gc10-event-1", "gc10-event-2", "gc10-event-4"],
       [gc10Truncation],
     ),
-    projectionContext: "room-source:gc10-event-3 30 characters 0:24",
+    projectionContext: "room-source:gc10-event-3 180 characters 0:24",
+    truncationTruth: gc10Truth,
     hiddenWorldFingerprints: ["x", "x", "x"],
     grantedRead: {
       sourceRef: "room-source:gc10-event-3",
@@ -2647,6 +2780,244 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       expect(result.passed, JSON.stringify(failingOperationAttempts)).toBe(false);
       expect(result.detail).toContain("无界");
     }
+  });
+
+  // #206 review 5: duplicates count as recorded; a unique-match readback may never wash them.
+  it("GC-01 counts duplicated forged-body copies in the recorded-author multiset", () => {
+    const base = {
+      legitimateHuman: { accepted: true, authorId: fixture.humanId },
+      legitimate: { accepted: true, authorId: a },
+      forgedEnvelopeAccepted: false,
+      forgedBodyAccepted: true,
+      forgedBodyAuthorId: a,
+      unexpectedAuthors: [],
+      recordedAuthorIds: [fixture.humanId, a, a],
+    };
+    expect(evaluateGroupChatEvidence("GC-01", base).passed).toBe(true);
+    const duplicated = evaluateGroupChatEvidence("GC-01", {
+      ...base,
+      forgedBodyAuthorId: null,
+      recordedAuthorIds: [fixture.humanId, a, a, a],
+    });
+    expect(duplicated.passed).toBe(false);
+  });
+
+  // #206 review 5: bounded worlds reconcile by operationId in host ledger order.
+  it("GC-06 reconciles bounded worlds by operationId in ledger order", () => {
+    expect(evaluateGroupChatEvidence("GC-06", gc06Base()).passed).toBe(true);
+    const withWorld = (
+      records: GroupChatEvidenceById["GC-06"]["boundedWorlds"][number]["records"],
+    ): GroupChatEvidenceById["GC-06"] => ({
+      ...gc06Base(),
+      boundedWorlds: [
+        { budget: 1, records, oneRoot: true, policyVersionStable: true },
+        gc06Base().boundedWorlds[1] as GroupChatEvidenceById["GC-06"]["boundedWorlds"][number],
+      ],
+    });
+    const turn1 = gc06TurnRecord("gc06-B1-turn-1", "permitted", 1);
+    const turn2 = gc06TurnRecord("gc06-B1-turn-2", "blocked", 2, "ROOM_TURN_BUDGET_EXHAUSTED");
+    // Operation labels swapped between the two turns.
+    expect(
+      evaluateGroupChatEvidence(
+        "GC-06",
+        withWorld([
+          gc06TurnRecord("gc06-B1-turn-2", "permitted", 1),
+          { ...turn2, operationId: "gc06-B1-turn-1" },
+        ]),
+      ).passed,
+    ).toBe(false);
+    // Block-before-permit: the ledger order itself is inverted.
+    expect(
+      evaluateGroupChatEvidence(
+        "GC-06",
+        withWorld([
+          { ...turn2, sequence: 1 },
+          { ...turn1, sequence: 2 },
+        ]),
+      ).passed,
+    ).toBe(false);
+    // Missing, duplicated and extra records.
+    expect(evaluateGroupChatEvidence("GC-06", withWorld([turn1])).passed).toBe(false);
+    expect(
+      evaluateGroupChatEvidence("GC-06", withWorld([turn1, turn2, { ...turn2, sequence: 3 }]))
+        .passed,
+    ).toBe(false);
+    // The blocking record must carry a stable reason.
+    expect(
+      evaluateGroupChatEvidence("GC-06", withWorld([turn1, { ...turn2, reasonCode: "" }])).passed,
+    ).toBe(false);
+  });
+
+  // #206 review 5: the generation-change stimulus needs exactly one reasoned blocked record.
+  it("GC-06 requires exactly one reasoned blocked record for the generation-change stimulus", () => {
+    expect(evaluateGroupChatEvidence("GC-06", gc06Base()).passed).toBe(true);
+    const badAttempts: readonly (readonly Pick<RoundRecord, "decision" | "reasonCode">[])[] = [
+      [],
+      [
+        { decision: "blocked", reasonCode: "ROOM_TURN_BUDGET_EXHAUSTED" },
+        { decision: "blocked", reasonCode: "ROOM_TURN_BUDGET_EXHAUSTED" },
+      ],
+      [{ decision: "human-trigger", reasonCode: null }],
+      [{ decision: "passed", reasonCode: null }],
+      [{ decision: "failed", reasonCode: "ROOM_MEMBER_FAILED" }],
+      [{ decision: "retry-replayed", reasonCode: null }],
+      [{ decision: "blocked", reasonCode: "" }],
+      [{ decision: "blocked", reasonCode: null }],
+    ];
+    for (const identityChangeAttempts of badAttempts) {
+      const result = evaluateGroupChatEvidence("GC-06", {
+        ...gc06Base(),
+        identityChangeAttempts,
+      });
+      expect(result.passed, JSON.stringify(identityChangeAttempts)).toBe(false);
+      expect(result.detail).toContain("换代刺激");
+    }
+  });
+
+  // #206 review 5: the unreachable control needs exactly one incomplete record, nothing else.
+  it("GC-07 requires exactly one incomplete record for the unreachable control", () => {
+    expect(evaluateGroupChatEvidence("GC-07", gc07Base()).passed).toBe(true);
+    const unreachableRecord = (overrides: Partial<ControlRecord>): ControlRecord => ({
+      sequence: 1,
+      controlId: "gc07-unreachable",
+      issuerId: fixture.humanId,
+      targetId: fixture.residentIds.c,
+      action: "stop",
+      phase: "incomplete",
+      cutoffId: null,
+      externalEffectReversed: false,
+      ...overrides,
+    });
+    const badRecords: readonly (readonly ControlRecord[])[] = [
+      [],
+      [unreachableRecord({}), unreachableRecord({ sequence: 2 })],
+      [unreachableRecord({}), unreachableRecord({ sequence: 2, phase: "effective" })],
+      [unreachableRecord({ sequence: 2, phase: "accepted" }), unreachableRecord({})],
+      [unreachableRecord({ phase: "effective" })],
+      [unreachableRecord({ cutoffId: "control-cutoff:x" })],
+    ];
+    for (const unreachableRecords of badRecords) {
+      const result = evaluateGroupChatEvidence("GC-07", { ...gc07Base(), unreachableRecords });
+      expect(result.passed, JSON.stringify(unreachableRecords)).toBe(false);
+      expect(result.detail).toContain("不可达");
+    }
+  });
+
+  // #206 review 5: proxy-signed resident receipts and personal-state claims by residents.
+  const gc09Receipt = (overrides: Partial<SystemReceipt>): SystemReceipt => ({
+    actor: "system",
+    phase: "recorded",
+    ...overrides,
+  });
+  const gc09Base = (): GroupChatEvidenceById["GC-09"] => ({
+    receipts: [
+      gc09Receipt({ phase: "recorded", claim: "系统已收" }),
+      gc09Receipt({ phase: "dispatched", claim: "已派发" }),
+      gc09Receipt({
+        phase: "context-committed",
+        claim: "已装入",
+        contextCommitRef: "context-commit:1",
+      }),
+      gc09Receipt({ actor: a, phase: "reaction" }),
+    ],
+    receiptsAfterRecord: [gc09Receipt({ phase: "recorded", claim: "系统已收" })],
+    receiptsAfterDispatch: [
+      gc09Receipt({ phase: "recorded", claim: "系统已收" }),
+      gc09Receipt({ phase: "dispatched", claim: "已派发" }),
+    ],
+    prematureReceiptPhases: [],
+    judgeSeededContextCommitId: "context-commit:1",
+    reactionAuthorsBeforeResidentReacted: [],
+    reactionAuthorsAfterResidentReacted: [a],
+    memoryRecordsAddedByContextCommit: 0,
+  });
+
+  it("GC-09 flags any resident-signed receipt in the snapshots before the resident reacts", () => {
+    expect(evaluateGroupChatEvidence("GC-09", gc09Base()).passed).toBe(true);
+    const proxySigned = {
+      ...gc09Base(),
+      receiptsAfterRecord: [
+        ...gc09Base().receiptsAfterRecord,
+        gc09Receipt({ actor: a, phase: "seen", claim: "成员已读并记住了" }),
+      ],
+    };
+    const result = evaluateGroupChatEvidence("GC-09", proxySigned);
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("代签");
+  });
+
+  it("GC-09 runs personal-state guards over resident-authored receipts even after a real reaction", () => {
+    const claimForgery = evaluateGroupChatEvidence("GC-09", {
+      ...gc09Base(),
+      receipts: [
+        ...gc09Base().receipts,
+        gc09Receipt({ actor: a, phase: "reaction", claim: "成员已读并记住了" }),
+      ],
+    });
+    expect(claimForgery.passed).toBe(false);
+    const phaseForgery = evaluateGroupChatEvidence("GC-09", {
+      ...gc09Base(),
+      receipts: [...gc09Base().receipts, gc09Receipt({ actor: a, phase: "seen" })],
+    });
+    expect(phaseForgery.passed).toBe(false);
+  });
+
+  // #206 review 5: truncation metadata is bound to the judge-seeded truth, field-exact.
+  it("GC-10 binds truncation metadata to judge truth with field-exact context matching", () => {
+    expect(evaluateGroupChatEvidence("GC-10", gc10Base()).passed).toBe(true);
+    const wrongEvent = {
+      ...gc10Base(),
+      truncated: gc10Projection(
+        "gc10-truncate",
+        ["gc10-event-3"],
+        ["gc10-event-1", "gc10-event-2", "gc10-event-4"],
+        [{ ...gc10Truncation, eventId: "gc10-event-2" }],
+      ),
+    };
+    expect(evaluateGroupChatEvidence("GC-10", wrongEvent).passed).toBe(false);
+    // The review's wash: originalLength forged to kept+1 with the context line synced.
+    const forgedLength = {
+      ...gc10Base(),
+      truncated: gc10Projection(
+        "gc10-truncate",
+        ["gc10-event-3"],
+        ["gc10-event-1", "gc10-event-2", "gc10-event-4"],
+        [{ ...gc10Truncation, originalLength: 25 }],
+      ),
+      projectionContext: "room-source:gc10-event-3 25 characters 0:24",
+    };
+    const forgedResult = evaluateGroupChatEvidence("GC-10", forgedLength);
+    expect(forgedResult.passed).toBe(false);
+    expect(forgedResult.detail).toContain("原长");
+    // Kept range over the requested cap / degenerate range.
+    const overCap = {
+      ...gc10Base(),
+      truncated: gc10Projection(
+        "gc10-truncate",
+        ["gc10-event-3"],
+        ["gc10-event-1", "gc10-event-2", "gc10-event-4"],
+        [{ ...gc10Truncation, keptEnd: 25 }],
+      ),
+      projectionContext: "room-source:gc10-event-3 180 characters 0:25",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", overCap).passed).toBe(false);
+    const degenerate = {
+      ...gc10Base(),
+      truncated: gc10Projection(
+        "gc10-truncate",
+        ["gc10-event-3"],
+        ["gc10-event-1", "gc10-event-2", "gc10-event-4"],
+        [{ ...gc10Truncation, keptStart: 24, keptEnd: 24 }],
+      ),
+      projectionContext: "room-source:gc10-event-3 180 characters 24:24",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", degenerate).passed).toBe(false);
+    // Substring washing: "1180" contains "180" but is not the field.
+    const substringWash = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3x 1180 characters 0:24",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", substringWash).passed).toBe(false);
   });
 });
 
