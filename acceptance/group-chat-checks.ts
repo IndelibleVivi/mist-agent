@@ -963,13 +963,13 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         !contextHasExactField(
           e.projectionContext,
           String(truncation.originalLength),
-          "0-9A-Za-z",
+          "A-Za-z0-9_-",
         ) ||
         !contextHasExactField(e.projectionContext, truncation.unit, "A-Za-z0-9_-") ||
         !contextHasExactField(
           e.projectionContext,
           `${truncation.keptStart}:${truncation.keptEnd}`,
-          "0-9A-Za-z",
+          "A-Za-z0-9_-",
         )
       )
         return fail("截断元数据没有以完整字段进入模型可见上下文");

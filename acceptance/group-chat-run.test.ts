@@ -3061,6 +3061,27 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       projectionContext: "room-source:gc10-event-3 180 characters 10:240",
     };
     expect(evaluateGroupChatEvidence("GC-10", rangeExtended).passed).toBe(false);
+    // #206 review 7: same-token `_`/`-` continuations of numeric and range values stay red.
+    const numericUnderscore = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3 _180 characters 0:24",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", numericUnderscore).passed).toBe(false);
+    const numericDashed = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3 180-ext characters 0:24",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", numericDashed).passed).toBe(false);
+    const rangeUnderscore = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3 180 characters _0:24",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", rangeUnderscore).passed).toBe(false);
+    const rangeDashed = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3 180 characters 0:24-ext",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", rangeDashed).passed).toBe(false);
   });
 });
 
