@@ -35,6 +35,8 @@ const nearGreenOverrides: Readonly<Record<string, Partial<RoomMessageEnvelope>>>
   "unknown field": {},
   "invalid body": { body: "hello" },
   "invalid mentions": { mentions: [principalB] },
+  "wrong-type mentions": { mentions: [principalB] },
+  "blank authentication": {},
 };
 
 describe("postRoomMessage", () => {
@@ -92,6 +94,12 @@ describe("postRoomMessage", () => {
     {
       label: "wrong-type authentication",
       auth: { principalId: 7 } as unknown as AuthenticatedPrincipal,
+      envelope: (base: RoomMessageEnvelope) => base,
+      reasonCode: "authentication_required",
+    },
+    {
+      label: "blank authentication",
+      auth: { principalId: " \t " },
       envelope: (base: RoomMessageEnvelope) => base,
       reasonCode: "authentication_required",
     },
@@ -192,6 +200,13 @@ describe("postRoomMessage", () => {
       auth: authA,
       envelope: (base: RoomMessageEnvelope) =>
         ({ ...base, mentions: ["member-a", 7] }) as unknown as RoomMessageEnvelope,
+      reasonCode: "mentions_invalid",
+    },
+    {
+      label: "wrong-type mentions",
+      auth: authA,
+      envelope: (base: RoomMessageEnvelope) =>
+        ({ ...base, mentions: "member-a" }) as unknown as RoomMessageEnvelope,
       reasonCode: "mentions_invalid",
     },
     {

@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   type GroupChatCommand,
   type GroupChatHostDriver,
@@ -19,6 +19,29 @@ import {
 } from "../../src/group-chat-acceptance-driver.ts";
 import { RoomEventStore } from "../../src/group-chat/room-event-store.ts";
 
+const ipcCaptures = vi.hoisted(
+  () => [] as Array<{ pid: number | undefined; sent: unknown[]; received: unknown[] }>,
+);
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return {
+    ...actual,
+    fork: (...args: Parameters<typeof actual.fork>) => {
+      const child = actual.fork(...args);
+      const capture = { pid: child.pid, sent: [] as unknown[], received: [] as unknown[] };
+      const send = child.send.bind(child);
+      vi.spyOn(child, "send").mockImplementation((message, ...rest) => {
+        capture.sent.push(message);
+        return send(message, ...rest);
+      });
+      child.on("message", (message) => capture.received.push(message));
+      ipcCaptures.push(capture);
+      return child;
+    },
+  };
+});
+
 describe("group-chat acceptance host process", () => {
   let driver: ReturnType<typeof createGroupChatHostDriver> | undefined;
   let dataRoot: string | undefined;
@@ -28,6 +51,7 @@ describe("group-chat acceptance host process", () => {
     if (dataRoot !== undefined) await rm(dataRoot, { recursive: true, force: true });
     driver = undefined;
     dataRoot = undefined;
+    ipcCaptures.splice(0);
   });
 
   it("reads a judge-direct durable append after stopping and restarting the child host", async () => {
@@ -227,6 +251,36 @@ describe("group-chat acceptance host process", () => {
         expect(exchange.result.operationId).toBe(operationId);
         expect(exchange.childPid).toBe(run.pid);
         expect(exchange.childRequestHash).toBe(exchange.requestHash);
+
+        const capture = ipcCaptures.find((candidate) => candidate.pid === run.pid);
+        expect(capture).toBeDefined();
+        const asFrame = (frame: unknown): Record<string, unknown> | undefined =>
+          typeof frame === "object" && frame !== null
+            ? (frame as Record<string, unknown>)
+            : undefined;
+        const sentFrame = capture?.sent.map(asFrame).find((frame) => {
+          const envelope = asFrame(frame?.envelope);
+          return frame?.kind === "post" && envelope?.operationId === exchange.envelope.operationId;
+        });
+        expect(sentFrame).toBeDefined();
+        if (sentFrame === undefined) throw new Error("missing post request on child IPC");
+        expect(sentFrame.envelope).toStrictEqual({
+          operationId: exchange.envelope.operationId,
+          ...wireExpectedEnvelope,
+        });
+        expect(sentFrame.principal).toStrictEqual({ principalId: command.principalId });
+        expect(sentFrame.requestHash).toBe(exchange.requestHash);
+
+        const receivedFrame = capture?.received
+          .map(asFrame)
+          .find((frame) => frame?.id === sentFrame.id);
+        expect(receivedFrame).toMatchObject({
+          id: sentFrame.id,
+          ok: true,
+          hostPid: run.pid,
+          requestHash: exchange.requestHash,
+          value: exchange.result,
+        });
       };
       assertUnchangedPostFields(validCommand, exchanges[0]);
       assertUnchangedPostFields(invalidCommand, exchanges[1]);

@@ -97,6 +97,21 @@ describe("RoomEventStore", () => {
     store.close();
   });
 
+  it("rejects replay when an existing receipt claim is omitted or changed", async () => {
+    const store = new RoomEventStore(await makeRoot());
+    const input = appendInput();
+    const original = store.append({ ...input, recordedClaim: ROOM_RECORDED_CLAIM });
+
+    expect(original.receipt?.claim).toBe(ROOM_RECORDED_CLAIM);
+    expect(() => store.append(input)).toThrow(/already used/);
+    expect(() => store.append({ ...input, recordedClaim: "a different claim" })).toThrow(
+      /already used/,
+    );
+    expect(store.readRoomEvents()).toHaveLength(1);
+    expect(store.readSystemReceipts()).toEqual([original.receipt]);
+    store.close();
+  });
+
   it("migrates the existing v1 ledger without losing records or inventing mentions", async () => {
     const root = await makeRoot();
     const legacy = new DatabaseSync(join(root, "room-events.sqlite"));
