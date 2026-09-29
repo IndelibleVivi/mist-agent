@@ -9,6 +9,7 @@ import {
   type GroupChatCommand,
   type GroupChatEvidenceById,
   type GroupChatHostDriver,
+  type GroupChatIndependentControlTruth,
   type GroupChatMentionExpectation,
   type GroupChatMentionOperation,
   type GroupChatNewcomerHistoryEvidence,
@@ -842,6 +843,7 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         e.independentFirstReturnResults,
         e.independentFirstReturnTarget,
         e.independentControls,
+        e.independentControlTruth,
         e.independentFirstReturnBodyInRoom,
         e.independentNewPermitCommitted,
         "continue 后独立世界旧许可的首次迟返仍被提交",
@@ -1104,6 +1106,7 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         e.independentFirstReturnResults,
         e.independentFirstReturnTarget,
         e.independentControls,
+        e.independentControlTruth,
         e.independentFirstReturnBodyInRoom,
         e.independentNewPermitCommitted,
         "stop 前许可在独立世界 continue 后复活（首次迟返被提交）",
@@ -1253,8 +1256,9 @@ function sameDispatchIdentity(left: DispatchIdentity | null, right: DispatchIden
  * Independent-world first late return after continue (GC-07/GC-12): the old permit never
  * returned before stop/continue, so no memoized terminal rejection can stand in for a fresh
  * cutoff decision. The world's own host-owned control ledger must prove the stop/continue
- * pair first (each exactly one accepted and one effective, accepted before effective, stop
- * before continue); then exactly one returned, zero committed, body out of the room, exactly
+ * pair first: each exactly one accepted and one effective, every row matching the judge-owned
+ * controlId/issuerId/targetId, accepted and effective sharing one non-empty cutoffId (the two
+ * controls never share one), accepted before effective, stop before continue; then exactly one returned, zero committed, body out of the room, exactly
  * one reasoned rejected carrying the judge-owned identity, and every result row must land
  * after the continue-effective sequence with returned before rejected — pre-continue rows can
  * never stand in. The post-continue new permit must still commit. `committedDetail` carries
@@ -1264,28 +1268,53 @@ function firstLateReturnProblem(
   results: readonly MemberResultRecord[],
   target: DispatchIdentity,
   controls: readonly ControlRecord[],
+  controlTruth: GroupChatIndependentControlTruth,
   bodyInRoom: boolean,
   newPermitCommitted: boolean,
   committedDetail: string,
 ): string | null {
   const controlShapeProblem = (
     action: "stop" | "continue",
+    expectedControlId: string,
     rows: readonly ControlRecord[],
   ): string | null => {
     const accepted = rows.filter((row) => row.phase === "accepted");
     const effective = rows.filter((row) => row.phase === "effective");
     if (rows.length !== 2 || accepted.length !== 1 || effective.length !== 1)
       return `独立世界 ${action} 控制没有恰好一条 accepted 与一条 effective 记录`;
+    // Every row of the pair must be the judge-authorized control: its own controlId, the
+    // shared issuer and target — a washed identity must not pass with intact phases/counts.
+    if (
+      rows.some(
+        (row) =>
+          row.controlId !== expectedControlId ||
+          row.issuerId !== controlTruth.issuerId ||
+          row.targetId !== controlTruth.targetId,
+      )
+    )
+      return `独立世界 ${action} 控制账目与判卷授权身份不符（controlId/issuerId/targetId）`;
+    // Protocol shape: accepted/effective of one control share its non-empty cutoffId.
+    if ((accepted[0]?.cutoffId ?? "") === "" || accepted[0]?.cutoffId !== effective[0]?.cutoffId)
+      return `独立世界 ${action} 控制的 accepted/effective 未共享同一非空 cutoffId`;
     if ((accepted[0]?.sequence ?? 0) >= (effective[0]?.sequence ?? 0))
       return `独立世界 ${action} 控制的 accepted 没有先于 effective 入账`;
     return null;
   };
   const stopRows = controls.filter((row) => row.action === "stop");
-  const stopProblem = controlShapeProblem("stop", stopRows);
+  const stopProblem = controlShapeProblem("stop", controlTruth.stopControlId, stopRows);
   if (stopProblem !== null) return stopProblem;
   const continueRows = controls.filter((row) => row.action === "continue");
-  const continueProblem = controlShapeProblem("continue", continueRows);
+  const continueProblem = controlShapeProblem(
+    "continue",
+    controlTruth.continueControlId,
+    continueRows,
+  );
   if (continueProblem !== null) return continueProblem;
+  // Protocol shape: cutoffId derives from the controlId, so the two controls never share one.
+  const stopCutoffId = stopRows.find((row) => row.phase === "accepted")?.cutoffId ?? null;
+  const continueCutoffId = continueRows.find((row) => row.phase === "accepted")?.cutoffId ?? null;
+  if (stopCutoffId !== null && stopCutoffId === continueCutoffId)
+    return "独立世界 stop 与 continue 不得共用同一 cutoffId";
   const stopEffectiveSequence = stopRows.find((row) => row.phase === "effective")?.sequence ?? -1;
   const continueEffectiveSequence =
     continueRows.find((row) => row.phase === "effective")?.sequence ?? -1;
@@ -2195,6 +2224,12 @@ export async function runGroupChatCheck(
                   row.sequence > independentContinueEffectiveSequence,
               ),
         independentControls,
+        independentControlTruth: {
+          stopControlId: "gc07-independent-stop",
+          continueControlId: "gc07-independent-continue",
+          issuerId: fixture.humanId,
+          targetId: fixture.residentIds.a,
+        },
         independentFirstReturnTarget: independentTarget,
         independentFirstReturnBodyInRoom: independentRoomEvents.some((event) =>
           event.body.includes("TEST-GC07-INDEPENDENT-LATE"),
@@ -2791,6 +2826,12 @@ export async function runGroupChatCheck(
                   row.sequence > independentContinueEffectiveSequence,
               ),
         independentControls,
+        independentControlTruth: {
+          stopControlId: "gc12-independent-stop",
+          continueControlId: "gc12-independent-continue",
+          issuerId: fixture.humanId,
+          targetId: fixture.residentIds.a,
+        },
         independentFirstReturnTarget: independentTarget,
         independentFirstReturnBodyInRoom: independentRoomEvents.some((event) =>
           event.body.includes("TEST-GC12-INDEPENDENT-LATE"),

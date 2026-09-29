@@ -449,6 +449,14 @@ export interface MemberResultRecord {
   readonly reasonCode: string | null;
 }
 
+/** Judge-owned truth of an independent world's authorized stop/continue control pair. */
+export interface GroupChatIndependentControlTruth {
+  readonly stopControlId: string;
+  readonly continueControlId: string;
+  readonly issuerId: string;
+  readonly targetId: ResidentId;
+}
+
 /** One GC-04 world: add a single newcomer, then read every roster-driven path back. */
 export interface GroupChatRosterWorldEvidence {
   readonly newResidentId: ResidentId;
@@ -580,6 +588,8 @@ export interface GroupChatEvidenceById {
     independentFirstReturnResults: readonly MemberResultRecord[];
     /** Independent world: every host-owned control record of that world's stop/continue pair. */
     independentControls: readonly ControlRecord[];
+    /** Judge-owned truth of that world's authorized stop/continue pair; every row must match it. */
+    independentControlTruth: GroupChatIndependentControlTruth;
     /** Judge-owned identity of the independent world's old permit. */
     independentFirstReturnTarget: DispatchIdentity;
     /** Whether the independent first late-return body leaked into the room ledger. */
@@ -663,6 +673,8 @@ export interface GroupChatEvidenceById {
     independentFirstReturnResults: readonly MemberResultRecord[];
     /** Independent world: every host-owned control record of that world's stop/continue pair. */
     independentControls: readonly ControlRecord[];
+    /** Judge-owned truth of that world's authorized stop/continue pair; every row must match it. */
+    independentControlTruth: GroupChatIndependentControlTruth;
     /** Judge-owned identity of the independent world's old permit. */
     independentFirstReturnTarget: DispatchIdentity;
     /** Whether the independent first late-return body leaked into the room ledger. */

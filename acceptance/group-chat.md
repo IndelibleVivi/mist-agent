@@ -112,7 +112,12 @@ scenario error。故障注入只触发 ledger append/member transport 失败，�
   账目只取 sequence 大于该 continue-effective 的行，helper 再要求 continue.effective <
   returned < rejected，pre-continue 行不得充数（continue 缺记录、accepted-only、
   effective-before-accepted、returned 早于/等于 continue-effective 均红；只抹 effective
-  记录的单变异在两灯都红且归因独立控制账，不靠 commit 抢先）。
+  记录的单变异在两灯都红且归因独立控制账，不靠 commit 抢先）。review 10 三轮补充：控制对还须
+  绑判卷身份——evidence 带 judge-owned independentControlTruth（stop/continue controlId、
+  共同 issuerId/targetId），每行精确匹配各自 controlId 与共同 issuer/target/action；按协议真实
+  形状，同一控制的 accepted/effective 共享同一非空 cutoffId（control-cutoff:<controlId>），
+  stop 与 continue 绝不共用（洗 controlId/targetId/issuerId、cutoffId 不匹配/为空/跨对共用均红；
+  状态真实生效、results 诚实、只洗账上 targetId 的单变异由 control identity 判红）。
 - GC-03：投递状态由判卷设置，本灯只核三行投递账按成员分开读回、原账不变、A 显式保存指回
   原事件。谁真的装入或排队（投递语义）留到投递账实现阶段，不能凭本灯视为已覆盖。
 - GC-04：两个世界各加一位不同的新成员，都要贯通五条路径；另静态扫描 `src/` 的非测试文件，

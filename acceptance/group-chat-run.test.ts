@@ -206,6 +206,8 @@ interface TestOptions {
   readonly washPostContinueTarget?: boolean;
   /** #206 review 10: the independent world's continue takes effect without an effective record. */
   readonly omitIndependentContinueEffective?: boolean;
+  /** #206 review 10 round 3: independent stop/continue ledger rows carry a washed targetId. */
+  readonly washIndependentControlIdentity?: boolean;
 }
 
 interface SyntheticSubmission {
@@ -1278,11 +1280,19 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
           return;
         }
         const cutoffId = `control-cutoff:${command.controlId}`;
+        // Review probe: the independent world's controls still take effect on the real target,
+        // but their ledger rows carry a washed targetId — only an identity-bound judge turns red.
+        const washIndependentIdentity =
+          this.options.washIndependentControlIdentity &&
+          (command.controlId === "gc07-independent-stop" ||
+            command.controlId === "gc07-independent-continue" ||
+            command.controlId === "gc12-independent-stop" ||
+            command.controlId === "gc12-independent-continue");
         const accepted: ControlRecord = {
           sequence: this.nextSequence(),
           controlId: command.controlId,
           issuerId: command.issuerId,
-          targetId: command.targetId,
+          targetId: washIndependentIdentity ? fixture.residentIds.b : command.targetId,
           action: command.action,
           phase: "accepted",
           cutoffId,
@@ -2421,6 +2431,10 @@ describe("#192 stacked red oracle: each A-D behavior has a single-mutation red",
       { omitIndependentContinueEffective: true },
       "独立世界 continue 控制",
     ],
+    // #206 review 10 round 3: independent stop/continue take effect on the real target, but
+    // their ledger rows carry a washed targetId — red must attribute to control identity.
+    ["GC-07C control-identity", "GC-07", { washIndependentControlIdentity: true }, "授权身份"],
+    ["GC-12C control-identity", "GC-12", { washIndependentControlIdentity: true }, "授权身份"],
   ] as const)("%s makes %s red for %j", async (_caseId, id, options, reason) => {
     const result = await check(id, options);
     expect(result.passed).toBe(false);
@@ -2731,6 +2745,12 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       gc07IndependentRow("rejected", 41, "ROOM_CONTROL_CUTOFF"),
     ],
     independentControls: gc07IndependentControls(),
+    independentControlTruth: {
+      stopControlId: "gc07-independent-stop",
+      continueControlId: "gc07-independent-continue",
+      issuerId: fixture.humanId,
+      targetId: a,
+    },
     independentFirstReturnTarget: gc07IndependentTarget,
     independentFirstReturnBodyInRoom: false,
     independentNewPermitCommitted: true,
@@ -3058,6 +3078,12 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       gc12IndependentRow("rejected", 51, "ROOM_CONTROL_CUTOFF"),
     ],
     independentControls: gc12IndependentControls(),
+    independentControlTruth: {
+      stopControlId: "gc12-independent-stop",
+      continueControlId: "gc12-independent-continue",
+      issuerId: fixture.humanId,
+      targetId: a,
+    },
     independentFirstReturnTarget: gc12IndependentTarget,
     independentFirstReturnBodyInRoom: false,
     independentNewPermitCommitted: true,
@@ -3754,6 +3780,62 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       });
       expect(result.passed, JSON.stringify(independentFirstReturnResults)).toBe(false);
       expect(result.detail).toContain("生效之前");
+    }
+    // Control-identity binding (review 10 round 3): every row of the pair must match the
+    // judge-owned controlId/issuerId/targetId, and each control's accepted/effective must
+    // share one non-empty cutoffId (stop and continue never share one).
+    const gc07IdentityShapes: readonly (readonly ControlRecord[])[] = [
+      gc07IndependentControls().map((row) =>
+        row.action === "stop" ? { ...row, controlId: "gc07-independent-washed" } : row,
+      ),
+      gc07IndependentControls().map((row) =>
+        row.action === "continue" ? { ...row, targetId: fixture.residentIds.b } : row,
+      ),
+      gc07IndependentControls().map((row) =>
+        row.action === "stop" ? { ...row, issuerId: fixture.unauthorizedHumanId } : row,
+      ),
+      gc07IndependentControls().map((row) =>
+        row.action === "stop" && row.phase === "effective"
+          ? { ...row, cutoffId: "control-cutoff:other" }
+          : row,
+      ),
+      gc07IndependentControls().map((row) =>
+        row.action === "stop" ? { ...row, cutoffId: null } : row,
+      ),
+      gc07IndependentControls().map((row) =>
+        row.action === "continue"
+          ? { ...row, cutoffId: "control-cutoff:gc07-independent-stop" }
+          : row,
+      ),
+    ];
+    const gc07IdentityReasons = [
+      "授权身份",
+      "授权身份",
+      "授权身份",
+      "cutoffId",
+      "cutoffId",
+      "cutoffId",
+    ] as const;
+    for (const [index, independentControls] of gc07IdentityShapes.entries()) {
+      const result = evaluateGroupChatEvidence("GC-07", { ...gc07Base(), independentControls });
+      expect(result.passed, JSON.stringify(independentControls)).toBe(false);
+      expect(result.detail).toContain(gc07IdentityReasons[index] ?? "");
+    }
+    const gc12IdentityShapes: readonly (readonly ControlRecord[])[] = gc07IdentityShapes.map(
+      (shape) =>
+        shape.map((row) => ({
+          ...row,
+          controlId: row.controlId.replace("gc07-independent", "gc12-independent"),
+          cutoffId:
+            row.cutoffId === null
+              ? null
+              : row.cutoffId.replace("gc07-independent", "gc12-independent"),
+          sequence: row.sequence + 10,
+        })),
+    );
+    for (const independentControls of gc12IdentityShapes) {
+      const result = evaluateGroupChatEvidence("GC-12", { ...gc12Base(), independentControls });
+      expect(result.passed, JSON.stringify(independentControls)).toBe(false);
     }
   });
 });
