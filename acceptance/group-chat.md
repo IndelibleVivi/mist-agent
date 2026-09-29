@@ -98,7 +98,9 @@ scenario error。故障注入只触发 ledger append/member transport 失败，�
   原因码的 rejected、无 committed、旧正文不入房间原账，新许可随后照常提交（宿主在 continue 时
   清掉 cutoff 状态必须红）；GC-10 授权回源正文与判卷种下的完整长正文精确相等（截短/中间改写
   均红，不再只认 marker 前缀）；GC-08 expectedByOperation 加判卷 senderId，每个 operation 的
-  唯一决定与唯一已交付反馈都必须同判卷发送方对得上（决定或反馈记成别人均红）。
+  唯一决定与唯一已交付反馈都必须同判卷发送方对得上（决定或反馈记成别人均红）。review 9
+  补充：continue 后 returned/rejected 两行的身份六元组与判卷原 target 精确对账（按字段比较，
+  不认键序），且 returned 必须先于 rejected 入账；洗 dispatchId 或颠倒顺序均红。
 - GC-03：投递状态由判卷设置，本灯只核三行投递账按成员分开读回、原账不变、A 显式保存指回
   原事件。谁真的装入或排队（投递语义）留到投递账实现阶段，不能凭本灯视为已覆盖。
 - GC-04：两个世界各加一位不同的新成员，都要贯通五条路径；另静态扫描 `src/` 的非测试文件，

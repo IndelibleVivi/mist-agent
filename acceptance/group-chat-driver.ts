@@ -568,6 +568,8 @@ export interface GroupChatEvidenceById {
     postContinueNewPermitCommitted: boolean;
     /** Old-permit result rows recorded after the continue took effect; exactly one returned, one reasoned rejected. */
     postContinueOldPermitResults: readonly MemberResultRecord[];
+    /** Judge-owned identity of the old permit; both post-continue rows must carry it exactly. */
+    postContinueOldTarget: DispatchIdentity;
     /** Whether the post-continue old-permit body leaked into the room ledger. */
     postContinueOldBodyInRoom: boolean;
   };
@@ -635,6 +637,8 @@ export interface GroupChatEvidenceById {
     postContinueResultCommitted: boolean;
     /** Old-permit result rows recorded after the continue took effect; exactly one returned, one reasoned rejected. */
     postContinueStoppedResults: readonly MemberResultRecord[];
+    /** Judge-owned identity of the old permit; both post-continue rows must carry it exactly. */
+    postContinueOldTarget: DispatchIdentity;
     /** Whether the post-continue old-permit body leaked into the room ledger. */
     postContinueOldBodyInRoom: boolean;
     /** The single identity field each of the six forged targets moves; must cover all six exactly once. */

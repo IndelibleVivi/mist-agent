@@ -813,6 +813,21 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         (postContinueRejected[0]?.reasonCode ?? "").trim() === ""
       )
         return fail("continue 后旧许可结果没有恰好一条带稳定非空原因码的 rejected 记录");
+      // Both rows must carry the judge-owned original identity tuple, and the returned row
+      // must land in the ledger before the rejected one.
+      if (
+        [...postContinueReturned, ...postContinueRejected].some(
+          (row) => !sameDispatchIdentity(row.target, e.postContinueOldTarget),
+        )
+      )
+        return fail("continue 后旧许可返回/拒绝记录的身份六元组与判卷原 target 不符");
+      const postContinueReturnedSequence = postContinueReturned[0]?.sequence ?? -1;
+      const postContinueRejectedSequence = postContinueRejected[0]?.sequence ?? -1;
+      if (
+        postContinueReturnedSequence < 0 ||
+        postContinueReturnedSequence >= postContinueRejectedSequence
+      )
+        return fail("continue 后旧许可的 returned 没有先于 rejected 入账");
       if (e.postContinueOldPermitResults.some((row) => row.phase === "committed"))
         return fail("continue 后清除 cutoff 让旧许可结果进了新窗");
       if (e.postContinueOldBodyInRoom) return fail("continue 后旧许可正文泄漏进房间原账");
@@ -1050,6 +1065,18 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         (gc12PostContinueRejected[0]?.reasonCode ?? "").trim() === ""
       )
         return fail("continue 后旧许可结果没有恰好一条带稳定非空原因码的 rejected 记录");
+      // Both rows must carry the judge-owned original identity tuple, and the returned row
+      // must land in the ledger before the rejected one.
+      if (
+        [...gc12PostContinueReturned, ...gc12PostContinueRejected].some(
+          (row) => !sameDispatchIdentity(row.target, e.postContinueOldTarget),
+        )
+      )
+        return fail("continue 后旧许可返回/拒绝记录的身份六元组与判卷原 target 不符");
+      const gc12ReturnedSequence = gc12PostContinueReturned[0]?.sequence ?? -1;
+      const gc12RejectedSequence = gc12PostContinueRejected[0]?.sequence ?? -1;
+      if (gc12ReturnedSequence < 0 || gc12ReturnedSequence >= gc12RejectedSequence)
+        return fail("continue 后旧许可的 returned 没有先于 rejected 入账");
       if (e.postContinueStoppedResults.some((row) => row.phase === "committed"))
         return fail("continue 后清除 cutoff 让旧许可结果进了新窗");
       if (e.postContinueOldBodyInRoom) return fail("continue 后旧许可正文泄漏进房间原账");
@@ -1170,6 +1197,19 @@ function matchingEvent(events: readonly RoomEvent[], marker: string): RoomEvent 
 function contextHasExactField(context: string, value: string, boundary: string): boolean {
   const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`(?<![${boundary}])${escaped}(?![${boundary}])`, "u").test(context);
+}
+
+/** Full six-field dispatch-identity equality, insensitive to object key order. */
+function sameDispatchIdentity(left: DispatchIdentity | null, right: DispatchIdentity): boolean {
+  return (
+    left !== null &&
+    left.residentId === right.residentId &&
+    left.scopeId === right.scopeId &&
+    left.scopeGeneration === right.scopeGeneration &&
+    left.windowId === right.windowId &&
+    left.generation === right.generation &&
+    left.dispatchId === right.dispatchId
+  );
 }
 
 function surfaceText(surface: SurfaceSnapshot): string {
@@ -1953,6 +1993,7 @@ export async function runGroupChatCheck(
                 (row) =>
                   row.operationId === "gc07-old-permit" && row.sequence > continueEffectiveSequence,
               ),
+        postContinueOldTarget: target,
         postContinueOldBodyInRoom: roomEvents.some((event) =>
           event.body.includes("TEST-GC07-POST-CONTINUE-OLD"),
         ),
@@ -2456,6 +2497,7 @@ export async function runGroupChatCheck(
                 (row) =>
                   row.operationId === "gc12-cutoff-old" && row.sequence > gc12ContinueSequence,
               ),
+        postContinueOldTarget: nextTarget,
         postContinueOldBodyInRoom: cutoffRoomEvents.some((event) =>
           event.body.includes("TEST-GC12-POST-CONTINUE-OLD"),
         ),

@@ -202,6 +202,8 @@ interface TestOptions {
   readonly misattributeDecisionSender?: boolean;
   /** #206 review 8: GC-08 sender feedback is recorded under the other resident's id. */
   readonly misattributeFeedbackSender?: boolean;
+  /** #206 review 9: post-continue cutoff rows carry a washed dispatchId on the ledger. */
+  readonly washPostContinueTarget?: boolean;
 }
 
 interface SyntheticSubmission {
@@ -1486,6 +1488,16 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
       case "return-member-result": {
         const held = this.held.get(command.operationId);
         if (held === undefined) return;
+        // Review probe: the post-continue return of a cutoff old permit washes the dispatchId
+        // on both ledger rows while every other fact (returned, reasoned rejected, no commit)
+        // stays honest — only an identity-bound judge can catch it.
+        const postContinueWash: DispatchIdentity =
+          this.options.washPostContinueTarget &&
+          (command.operationId === "gc07-old-permit" ||
+            command.operationId === "gc12-cutoff-old") &&
+          !this.stopped.has(held.residentId)
+            ? { ...command.target, dispatchId: "test-dispatch:washed-post-continue" }
+            : command.target;
         if (!this.options.skipReturnedResultRecord) {
           // Review probe: wash the six forged returned targets into the same residentId variant,
           // so the judge can only catch it by reading the host ledger, never its own stimulus list.
@@ -1502,7 +1514,7 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
                   generation: 1,
                   dispatchId: "test-dispatch:gc12",
                 }
-              : command.target;
+              : postContinueWash;
           this.results.push({
             sequence: this.nextSequence(),
             operationId: command.operationId,
@@ -1525,7 +1537,7 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
           this.results.push({
             sequence: this.nextSequence(),
             operationId: command.operationId,
-            target: command.target,
+            target: postContinueWash,
             phase: accepted ? "committed" : "rejected",
             reasonCode: accepted
               ? null
@@ -2350,6 +2362,9 @@ describe("#192 stacked red oracle: each A-D behavior has a single-mutation red",
       { misattributeFeedbackSender: true },
       "归属于判卷发送方的反馈",
     ],
+    // #206 review 9: post-continue ledger rows with a washed identity tuple.
+    ["GC-07C wash-target", "GC-07", { washPostContinueTarget: true }, "六元组"],
+    ["GC-12C wash-target", "GC-12", { washPostContinueTarget: true }, "六元组"],
   ] as const)("%s makes %s red for %j", async (_caseId, id, options, reason) => {
     const result = await check(id, options);
     expect(result.passed).toBe(false);
@@ -2478,6 +2493,14 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       },
     ],
   });
+  const gc07OldTarget: DispatchIdentity = {
+    residentId: a,
+    scopeId: "test-scope:gc07",
+    scopeGeneration: 1,
+    windowId: "test-window:gc07",
+    generation: 1,
+    dispatchId: "test-dispatch:gc07-old",
+  };
   const gc07ResultRow = (
     operationId: string,
     phase: MemberResultRecord["phase"],
@@ -2486,14 +2509,7 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
   ): MemberResultRecord => ({
     sequence,
     operationId,
-    target: {
-      residentId: a,
-      scopeId: "test-scope:gc07",
-      scopeGeneration: 1,
-      windowId: "test-window:gc07",
-      generation: 1,
-      dispatchId: "test-dispatch:gc07-old",
-    },
+    target: gc07OldTarget,
     phase,
     reasonCode,
   });
@@ -2528,6 +2544,7 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       gc07ResultRow("gc07-old-permit", "returned", 20),
       gc07ResultRow("gc07-old-permit", "rejected", 21, "ROOM_CONTROL_CUTOFF"),
     ],
+    postContinueOldTarget: gc07OldTarget,
     postContinueOldBodyInRoom: false,
   });
 
@@ -2760,6 +2777,26 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
     expect(evaluateGroupChatEvidence("GC-10", duplicatedId).passed).toBe(false);
   });
 
+  const gc12OldTarget: DispatchIdentity = {
+    residentId: a,
+    scopeId: "test-scope:gc12",
+    scopeGeneration: 2,
+    windowId: "test-window:gc12",
+    generation: 2,
+    dispatchId: "test-dispatch:gc12-generation-2",
+  };
+  const gc12ResultRow = (
+    operationId: string,
+    phase: MemberResultRecord["phase"],
+    sequence: number,
+    reasonCode: string | null = null,
+  ): MemberResultRecord => ({
+    sequence,
+    operationId,
+    target: gc12OldTarget,
+    phase,
+    reasonCode,
+  });
   const gc12Base = (): GroupChatEvidenceById["GC-12"] => ({
     revokedDeliveryCommitted: false,
     revokedDeliveryReasoned: true,
@@ -2783,9 +2820,10 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
     forgedTupleCommits: 0,
     currentTupleCommits: 1,
     postContinueStoppedResults: [
-      gc07ResultRow("gc12-cutoff-old", "returned", 30),
-      gc07ResultRow("gc12-cutoff-old", "rejected", 31, "ROOM_CONTROL_CUTOFF"),
+      gc12ResultRow("gc12-cutoff-old", "returned", 30),
+      gc12ResultRow("gc12-cutoff-old", "rejected", 31, "ROOM_CONTROL_CUTOFF"),
     ],
+    postContinueOldTarget: gc12OldTarget,
     postContinueOldBodyInRoom: false,
   });
 
@@ -3260,6 +3298,64 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
     const feedbackResult = evaluateGroupChatEvidence("GC-08", wrongFeedbackSender);
     expect(feedbackResult.passed).toBe(false);
     expect(feedbackResult.detail).toContain("判卷发送方");
+  });
+
+  // #206 review 9: post-continue rows must carry the judge-owned target, in ledger order.
+  it("GC-07/GC-12 bind post-continue rows to the judge target and ledger order", () => {
+    expect(evaluateGroupChatEvidence("GC-07", gc07Base()).passed).toBe(true);
+    expect(evaluateGroupChatEvidence("GC-12", gc12Base()).passed).toBe(true);
+    // Wrong dispatchId on both rows.
+    const gc07WrongDispatch = gc07Base().postContinueOldPermitResults.map((row) => ({
+      ...row,
+      target: { ...gc07OldTarget, dispatchId: "test-dispatch:other" },
+    }));
+    const gc07DispatchResult = evaluateGroupChatEvidence("GC-07", {
+      ...gc07Base(),
+      postContinueOldPermitResults: gc07WrongDispatch,
+    });
+    expect(gc07DispatchResult.passed).toBe(false);
+    expect(gc07DispatchResult.detail).toContain("六元组");
+    // Another identity field moved instead.
+    const gc07WrongGeneration = gc07Base().postContinueOldPermitResults.map((row) => ({
+      ...row,
+      target: { ...gc07OldTarget, generation: 99 },
+    }));
+    expect(
+      evaluateGroupChatEvidence("GC-07", {
+        ...gc07Base(),
+        postContinueOldPermitResults: gc07WrongGeneration,
+      }).passed,
+    ).toBe(false);
+    // Reversed ledger order: rejected before returned.
+    const gc07Reversed = {
+      ...gc07Base(),
+      postContinueOldPermitResults: [
+        gc07ResultRow("gc07-old-permit", "rejected", 20, "ROOM_CONTROL_CUTOFF"),
+        gc07ResultRow("gc07-old-permit", "returned", 21),
+      ],
+    };
+    const gc07ReversedResult = evaluateGroupChatEvidence("GC-07", gc07Reversed);
+    expect(gc07ReversedResult.passed).toBe(false);
+    expect(gc07ReversedResult.detail).toContain("没有先于");
+    // GC-12: same bindings.
+    const gc12WrongDispatch = gc12Base().postContinueStoppedResults.map((row) => ({
+      ...row,
+      target: { ...gc12OldTarget, dispatchId: "test-dispatch:other" },
+    }));
+    expect(
+      evaluateGroupChatEvidence("GC-12", {
+        ...gc12Base(),
+        postContinueStoppedResults: gc12WrongDispatch,
+      }).passed,
+    ).toBe(false);
+    const gc12Reversed = {
+      ...gc12Base(),
+      postContinueStoppedResults: [
+        gc12ResultRow("gc12-cutoff-old", "rejected", 30, "ROOM_CONTROL_CUTOFF"),
+        gc12ResultRow("gc12-cutoff-old", "returned", 31),
+      ],
+    };
+    expect(evaluateGroupChatEvidence("GC-12", gc12Reversed).passed).toBe(false);
   });
 });
 
