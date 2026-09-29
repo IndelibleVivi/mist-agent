@@ -106,7 +106,13 @@ scenario error。故障注入只触发 ledger append/member transport 失败，�
   committed、正文不入账、新许可照常提交，证据与 stop 期间已返回过的 operation 不混账）。合成
   宿主按 operation+六元组对终态拒绝做 memoization（普通生命周期正对照，不按灯号或夹具特判）：
   诚实 memoized host 绿；同一宿主仅清 cutoff 必须在两灯都红，并由首次迟返的 committed/旧正文
-  归因，缓存不得洗绿。
+  归因，缓存不得洗绿。review 10 二轮补充：独立世界的证据须含该 world 自身的 stop/continue
+  宿主控制账全量行——stop 与 continue 各恰一 accepted + 恰一 effective、accepted 先于
+  effective、stop.effective 先于 continue.effective，无 rejected/incomplete/伪形；首次迟返
+  账目只取 sequence 大于该 continue-effective 的行，helper 再要求 continue.effective <
+  returned < rejected，pre-continue 行不得充数（continue 缺记录、accepted-only、
+  effective-before-accepted、returned 早于/等于 continue-effective 均红；只抹 effective
+  记录的单变异在两灯都红且归因独立控制账，不靠 commit 抢先）。
 - GC-03：投递状态由判卷设置，本灯只核三行投递账按成员分开读回、原账不变、A 显式保存指回
   原事件。谁真的装入或排队（投递语义）留到投递账实现阶段，不能凭本灯视为已覆盖。
 - GC-04：两个世界各加一位不同的新成员，都要贯通五条路径；另静态扫描 `src/` 的非测试文件，

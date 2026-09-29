@@ -575,8 +575,11 @@ export interface GroupChatEvidenceById {
     /**
      * Independent world: this old permit never called return-member-result before stop/continue,
      * so every row here belongs to the original tuple's FIRST late return after continue.
+     * Only rows recorded after the independent continue took effect may appear.
      */
     independentFirstReturnResults: readonly MemberResultRecord[];
+    /** Independent world: every host-owned control record of that world's stop/continue pair. */
+    independentControls: readonly ControlRecord[];
     /** Judge-owned identity of the independent world's old permit. */
     independentFirstReturnTarget: DispatchIdentity;
     /** Whether the independent first late-return body leaked into the room ledger. */
@@ -655,8 +658,11 @@ export interface GroupChatEvidenceById {
     /**
      * Independent world: this old permit never called return-member-result before stop/continue,
      * so every row here belongs to the original tuple's FIRST late return after continue.
+     * Only rows recorded after the independent continue took effect may appear.
      */
     independentFirstReturnResults: readonly MemberResultRecord[];
+    /** Independent world: every host-owned control record of that world's stop/continue pair. */
+    independentControls: readonly ControlRecord[];
     /** Judge-owned identity of the independent world's old permit. */
     independentFirstReturnTarget: DispatchIdentity;
     /** Whether the independent first late-return body leaked into the room ledger. */

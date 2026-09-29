@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   type AccessAudit,
   type CallReceipt,
+  type ControlRecord,
   type DispatchIdentity,
   GROUP_CHAT_CHECK_IDS,
   type GroupChatCheckId,
@@ -840,6 +841,7 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
       const independentProblem = firstLateReturnProblem(
         e.independentFirstReturnResults,
         e.independentFirstReturnTarget,
+        e.independentControls,
         e.independentFirstReturnBodyInRoom,
         e.independentNewPermitCommitted,
         "continue 后独立世界旧许可的首次迟返仍被提交",
@@ -1101,6 +1103,7 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
       const independentProblem = firstLateReturnProblem(
         e.independentFirstReturnResults,
         e.independentFirstReturnTarget,
+        e.independentControls,
         e.independentFirstReturnBodyInRoom,
         e.independentNewPermitCommitted,
         "stop 前许可在独立世界 continue 后复活（首次迟返被提交）",
@@ -1246,13 +1249,50 @@ function sameDispatchIdentity(left: DispatchIdentity | null, right: DispatchIden
  * post-continue new permit must still commit. `committedDetail` carries the lamp-specific
  * attribution for a committed first late return.
  */
+/**
+ * Independent-world first late return after continue (GC-07/GC-12): the old permit never
+ * returned before stop/continue, so no memoized terminal rejection can stand in for a fresh
+ * cutoff decision. The world's own host-owned control ledger must prove the stop/continue
+ * pair first (each exactly one accepted and one effective, accepted before effective, stop
+ * before continue); then exactly one returned, zero committed, body out of the room, exactly
+ * one reasoned rejected carrying the judge-owned identity, and every result row must land
+ * after the continue-effective sequence with returned before rejected — pre-continue rows can
+ * never stand in. The post-continue new permit must still commit. `committedDetail` carries
+ * the lamp-specific attribution for a committed first late return.
+ */
 function firstLateReturnProblem(
   results: readonly MemberResultRecord[],
   target: DispatchIdentity,
+  controls: readonly ControlRecord[],
   bodyInRoom: boolean,
   newPermitCommitted: boolean,
   committedDetail: string,
 ): string | null {
+  const controlShapeProblem = (
+    action: "stop" | "continue",
+    rows: readonly ControlRecord[],
+  ): string | null => {
+    const accepted = rows.filter((row) => row.phase === "accepted");
+    const effective = rows.filter((row) => row.phase === "effective");
+    if (rows.length !== 2 || accepted.length !== 1 || effective.length !== 1)
+      return `独立世界 ${action} 控制没有恰好一条 accepted 与一条 effective 记录`;
+    if ((accepted[0]?.sequence ?? 0) >= (effective[0]?.sequence ?? 0))
+      return `独立世界 ${action} 控制的 accepted 没有先于 effective 入账`;
+    return null;
+  };
+  const stopRows = controls.filter((row) => row.action === "stop");
+  const stopProblem = controlShapeProblem("stop", stopRows);
+  if (stopProblem !== null) return stopProblem;
+  const continueRows = controls.filter((row) => row.action === "continue");
+  const continueProblem = controlShapeProblem("continue", continueRows);
+  if (continueProblem !== null) return continueProblem;
+  const stopEffectiveSequence = stopRows.find((row) => row.phase === "effective")?.sequence ?? -1;
+  const continueEffectiveSequence =
+    continueRows.find((row) => row.phase === "effective")?.sequence ?? -1;
+  if (stopEffectiveSequence < 0 || stopEffectiveSequence >= continueEffectiveSequence)
+    return "独立世界 stop 的 effective 没有先于 continue 的 effective 入账";
+  if (results.some((row) => row.sequence <= continueEffectiveSequence))
+    return "首次迟返账目落在独立 continue 生效之前（pre-continue 行不得充数）";
   const returned = results.filter((row) => row.phase === "returned");
   const rejected = results.filter((row) => row.phase === "rejected");
   if (returned.length !== 1) return "旧许可的首次迟返没有真实送回宿主一次";
@@ -2101,7 +2141,12 @@ export async function runGroupChatCheck(
         body: "TEST-GC07-INDEPENDENT-NEW-RESULT",
       });
       const independentResults = await driver.readMemberResults();
+      const independentControls = await driver.readControlRecords();
       const independentRoomEvents = await driver.readRoomEvents();
+      const independentContinueEffectiveSequence =
+        independentControls.find(
+          (row) => row.controlId === "gc07-independent-continue" && row.phase === "effective",
+        )?.sequence ?? null;
       return evaluateGroupChatEvidence(id, {
         ordinaryQueueDepthBeforeControl: beforeControl.ordinaryQueueDepth,
         heldBeforeControl: beforeControl.heldOperationIds.includes("gc07-old-permit"),
@@ -2141,9 +2186,15 @@ export async function runGroupChatCheck(
         postContinueOldBodyInRoom: roomEvents.some((event) =>
           event.body.includes("TEST-GC07-POST-CONTINUE-OLD"),
         ),
-        independentFirstReturnResults: independentResults.filter(
-          (row) => row.operationId === "gc07-independent-permit",
-        ),
+        independentFirstReturnResults:
+          independentContinueEffectiveSequence === null
+            ? []
+            : independentResults.filter(
+                (row) =>
+                  row.operationId === "gc07-independent-permit" &&
+                  row.sequence > independentContinueEffectiveSequence,
+              ),
+        independentControls,
         independentFirstReturnTarget: independentTarget,
         independentFirstReturnBodyInRoom: independentRoomEvents.some((event) =>
           event.body.includes("TEST-GC07-INDEPENDENT-LATE"),
@@ -2621,7 +2672,12 @@ export async function runGroupChatCheck(
         body: "TEST-GC12-INDEPENDENT-NEW-RESULT",
       });
       const independentResults = await driver.readMemberResults();
+      const independentControls = await driver.readControlRecords();
       const independentRoomEvents = await driver.readRoomEvents();
+      const independentContinueEffectiveSequence =
+        independentControls.find(
+          (row) => row.controlId === "gc12-independent-continue" && row.phase === "effective",
+        )?.sequence ?? null;
 
       await driver.resetScenario(id, fixture);
       await prepareWorld(baseTarget);
@@ -2726,9 +2782,15 @@ export async function runGroupChatCheck(
         postContinueOldBodyInRoom: cutoffRoomEvents.some((event) =>
           event.body.includes("TEST-GC12-POST-CONTINUE-OLD"),
         ),
-        independentFirstReturnResults: independentResults.filter(
-          (row) => row.operationId === "gc12-independent-old",
-        ),
+        independentFirstReturnResults:
+          independentContinueEffectiveSequence === null
+            ? []
+            : independentResults.filter(
+                (row) =>
+                  row.operationId === "gc12-independent-old" &&
+                  row.sequence > independentContinueEffectiveSequence,
+              ),
+        independentControls,
         independentFirstReturnTarget: independentTarget,
         independentFirstReturnBodyInRoom: independentRoomEvents.some((event) =>
           event.body.includes("TEST-GC12-INDEPENDENT-LATE"),

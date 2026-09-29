@@ -204,6 +204,8 @@ interface TestOptions {
   readonly misattributeFeedbackSender?: boolean;
   /** #206 review 9: post-continue cutoff rows carry a washed dispatchId on the ledger. */
   readonly washPostContinueTarget?: boolean;
+  /** #206 review 10: the independent world's continue takes effect without an effective record. */
+  readonly omitIndependentContinueEffective?: boolean;
 }
 
 interface SyntheticSubmission {
@@ -1319,7 +1321,13 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
           sequence: this.nextSequence(),
           phase,
         };
-        this.controlRecords.push(effective);
+        // Review probe: the independent world's continue still takes effect, but its effective
+        // record is dropped — results stay honest, only the control truth goes missing.
+        const dropIndependentContinueEffective =
+          this.options.omitIndependentContinueEffective &&
+          (command.controlId === "gc07-independent-continue" ||
+            command.controlId === "gc12-independent-continue");
+        if (!dropIndependentContinueEffective) this.controlRecords.push(effective);
         if (phase === "effective") {
           if (command.action === "stop") {
             this.stopped.add(command.targetId);
@@ -2399,6 +2407,20 @@ describe("#192 stacked red oracle: each A-D behavior has a single-mutation red",
     // #206 review 9: post-continue ledger rows with a washed identity tuple.
     ["GC-07C wash-target", "GC-07", { washPostContinueTarget: true }, "六元组"],
     ["GC-12C wash-target", "GC-12", { washPostContinueTarget: true }, "六元组"],
+    // #206 review 10 second pass: the independent continue takes effect but its effective
+    // record is dropped — red must attribute to the missing control truth, not to a commit.
+    [
+      "GC-07C continue-unproven",
+      "GC-07",
+      { omitIndependentContinueEffective: true },
+      "独立世界 continue 控制",
+    ],
+    [
+      "GC-12C continue-unproven",
+      "GC-12",
+      { omitIndependentContinueEffective: true },
+      "独立世界 continue 控制",
+    ],
   ] as const)("%s makes %s red for %j", async (_caseId, id, options, reason) => {
     const result = await check(id, options);
     expect(result.passed).toBe(false);
@@ -2639,6 +2661,26 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
     phase,
     reasonCode,
   });
+  const gc07IndependentControlRow = (
+    action: "stop" | "continue",
+    phase: ControlRecord["phase"],
+    sequence: number,
+  ): ControlRecord => ({
+    sequence,
+    controlId: `gc07-independent-${action}`,
+    issuerId: fixture.humanId,
+    targetId: a,
+    action,
+    phase,
+    cutoffId: `control-cutoff:gc07-independent-${action}`,
+    externalEffectReversed: false,
+  });
+  const gc07IndependentControls = (): ControlRecord[] => [
+    gc07IndependentControlRow("stop", "accepted", 30),
+    gc07IndependentControlRow("stop", "effective", 31),
+    gc07IndependentControlRow("continue", "accepted", 32),
+    gc07IndependentControlRow("continue", "effective", 33),
+  ];
   const gc07ResultRow = (
     operationId: string,
     phase: MemberResultRecord["phase"],
@@ -2688,6 +2730,7 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       gc07IndependentRow("returned", 40),
       gc07IndependentRow("rejected", 41, "ROOM_CONTROL_CUTOFF"),
     ],
+    independentControls: gc07IndependentControls(),
     independentFirstReturnTarget: gc07IndependentTarget,
     independentFirstReturnBodyInRoom: false,
     independentNewPermitCommitted: true,
@@ -2950,6 +2993,26 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
     phase,
     reasonCode,
   });
+  const gc12IndependentControlRow = (
+    action: "stop" | "continue",
+    phase: ControlRecord["phase"],
+    sequence: number,
+  ): ControlRecord => ({
+    sequence,
+    controlId: `gc12-independent-${action}`,
+    issuerId: fixture.humanId,
+    targetId: a,
+    action,
+    phase,
+    cutoffId: `control-cutoff:gc12-independent-${action}`,
+    externalEffectReversed: false,
+  });
+  const gc12IndependentControls = (): ControlRecord[] => [
+    gc12IndependentControlRow("stop", "accepted", 40),
+    gc12IndependentControlRow("stop", "effective", 41),
+    gc12IndependentControlRow("continue", "accepted", 42),
+    gc12IndependentControlRow("continue", "effective", 43),
+  ];
   const gc12ResultRow = (
     operationId: string,
     phase: MemberResultRecord["phase"],
@@ -2994,6 +3057,7 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       gc12IndependentRow("returned", 50),
       gc12IndependentRow("rejected", 51, "ROOM_CONTROL_CUTOFF"),
     ],
+    independentControls: gc12IndependentControls(),
     independentFirstReturnTarget: gc12IndependentTarget,
     independentFirstReturnBodyInRoom: false,
     independentNewPermitCommitted: true,
@@ -3619,6 +3683,78 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       evaluateGroupChatEvidence("GC-12", { ...gc12Base(), independentNewPermitCommitted: false })
         .passed,
     ).toBe(false);
+    // Control truth and continue-sequence binding (review 10 second pass): the world's own
+    // stop/continue ledger must prove the pair, and every first-return row must land after
+    // the continue-effective sequence.
+    const gc07ControlShapes: readonly (readonly ControlRecord[])[] = [
+      gc07IndependentControls().filter((row) => row.action !== "continue"),
+      gc07IndependentControls().filter(
+        (row) => row.action !== "continue" || row.phase !== "effective",
+      ),
+      [
+        gc07IndependentControlRow("stop", "accepted", 30),
+        gc07IndependentControlRow("stop", "effective", 31),
+        gc07IndependentControlRow("continue", "effective", 32),
+        gc07IndependentControlRow("continue", "accepted", 33),
+      ],
+      [
+        gc07IndependentControlRow("stop", "accepted", 30),
+        gc07IndependentControlRow("continue", "accepted", 32),
+        gc07IndependentControlRow("continue", "effective", 33),
+        gc07IndependentControlRow("stop", "effective", 34),
+      ],
+    ];
+    for (const independentControls of gc07ControlShapes) {
+      const result = evaluateGroupChatEvidence("GC-07", { ...gc07Base(), independentControls });
+      expect(result.passed, JSON.stringify(independentControls)).toBe(false);
+    }
+    for (const independentFirstReturnResults of [
+      [
+        gc07IndependentRow("returned", 33),
+        gc07IndependentRow("rejected", 41, "ROOM_CONTROL_CUTOFF"),
+      ],
+      [
+        gc07IndependentRow("returned", 20),
+        gc07IndependentRow("rejected", 21, "ROOM_CONTROL_CUTOFF"),
+      ],
+    ]) {
+      const result = evaluateGroupChatEvidence("GC-07", {
+        ...gc07Base(),
+        independentFirstReturnResults,
+      });
+      expect(result.passed, JSON.stringify(independentFirstReturnResults)).toBe(false);
+      expect(result.detail).toContain("生效之前");
+    }
+    const gc12ControlShapes: readonly (readonly ControlRecord[])[] = gc07ControlShapes.map(
+      (shape) =>
+        shape.map((row) => ({
+          ...row,
+          controlId: `gc12-independent-${row.action}`,
+          cutoffId: `control-cutoff:gc12-independent-${row.action}`,
+          sequence: row.sequence + 10,
+        })),
+    );
+    for (const independentControls of gc12ControlShapes) {
+      const result = evaluateGroupChatEvidence("GC-12", { ...gc12Base(), independentControls });
+      expect(result.passed, JSON.stringify(independentControls)).toBe(false);
+    }
+    for (const independentFirstReturnResults of [
+      [
+        gc12IndependentRow("returned", 43),
+        gc12IndependentRow("rejected", 51, "ROOM_CONTROL_CUTOFF"),
+      ],
+      [
+        gc12IndependentRow("returned", 30),
+        gc12IndependentRow("rejected", 31, "ROOM_CONTROL_CUTOFF"),
+      ],
+    ]) {
+      const result = evaluateGroupChatEvidence("GC-12", {
+        ...gc12Base(),
+        independentFirstReturnResults,
+      });
+      expect(result.passed, JSON.stringify(independentFirstReturnResults)).toBe(false);
+      expect(result.detail).toContain("生效之前");
+    }
   });
 });
 
