@@ -194,6 +194,14 @@ interface TestOptions {
   readonly forgeTruncationMetadata?: boolean;
   /** #206 review 5: the forged envelope is recorded twice, defeating unique-match readbacks. */
   readonly duplicateForgedEnvelope?: boolean;
+  /** #206 review 8: continue wipes the cutoff state, reviving pre-stop permits afterwards. */
+  readonly clearCutoffOnContinue?: boolean;
+  /** #206 review 8: the granted source read returns only the truncated prefix of the body. */
+  readonly truncateSourceReadBody?: boolean;
+  /** #206 review 8: GC-08 delivery decisions are recorded under the other resident's id. */
+  readonly misattributeDecisionSender?: boolean;
+  /** #206 review 8: GC-08 sender feedback is recorded under the other resident's id. */
+  readonly misattributeFeedbackSender?: boolean;
 }
 
 interface SyntheticSubmission {
@@ -448,6 +456,11 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
       count,
       rosterVersion: this.rosterVersion,
       ...input,
+      // Review probe: a decision recorded under another resident's id must fail sender binding.
+      senderId:
+        this.options.misattributeDecisionSender && this.scenarioId === "GC-08"
+          ? fixture.residentIds.b
+          : input.senderId,
     });
   }
 
@@ -456,7 +469,11 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
     const online = this.senderOnline.get(submission.residentId) ?? true;
     this.feedback.push({
       operationId: submission.operationId,
-      senderId: submission.residentId,
+      // Review probe: feedback recorded under another resident's id must fail sender binding.
+      senderId:
+        this.options.misattributeFeedbackSender && this.scenarioId === "GC-08"
+          ? fixture.residentIds.b
+          : submission.residentId,
       roomId: fixture.roomId,
       scopeId: submission.target?.scopeId ?? "test-scope:room",
       reasonCode,
@@ -1300,6 +1317,8 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
             this.lastStopSequence.set(command.targetId, effective.sequence);
           } else {
             this.stopped.delete(command.targetId);
+            // Review probe: wiping the cutoff state at continue revives pre-stop permits.
+            if (this.options.clearCutoffOnContinue) this.lastStopSequence.delete(command.targetId);
           }
         }
         return;
@@ -1423,7 +1442,9 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
             allowed && source?.authorized
               ? this.options.wrongSourceRead
                 ? "wrong-body"
-                : source.body
+                : this.options.truncateSourceReadBody
+                  ? source.body.slice(0, 24)
+                  : source.body
               : null,
           errorCode: allowed && source?.authorized ? null : "not-found",
         });
@@ -2313,6 +2334,22 @@ describe("#192 stacked red oracle: each A-D behavior has a single-mutation red",
     ["GC-07C unreachable-effective", "GC-07", { unreachableAlsoEffective: true }, "不可达"],
     ["GC-09B proxy-sign", "GC-09", { proxySignedReceiptAtRecord: true }, "代签"],
     ["GC-10B forge-length", "GC-10", { forgeTruncationMetadata: true }, "原长"],
+    // #206 review 8: cutoff wiped at continue, truncated source body, sender misattribution.
+    ["GC-07C cutoff-clear", "GC-07", { clearCutoffOnContinue: true }, "仍被提交"],
+    ["GC-12C cutoff-clear", "GC-12", { clearCutoffOnContinue: true }, "复活"],
+    ["GC-10D truncate-body", "GC-10", { truncateSourceReadBody: true }, "精确相等"],
+    [
+      "GC-08B decision-sender",
+      "GC-08",
+      { misattributeDecisionSender: true },
+      "senderId 不是判卷发送方",
+    ],
+    [
+      "GC-08B feedback-sender",
+      "GC-08",
+      { misattributeFeedbackSender: true },
+      "归属于判卷发送方的反馈",
+    ],
   ] as const)("%s makes %s red for %j", async (_caseId, id, options, reason) => {
     const result = await check(id, options);
     expect(result.passed).toBe(false);
@@ -2441,6 +2478,25 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       },
     ],
   });
+  const gc07ResultRow = (
+    operationId: string,
+    phase: MemberResultRecord["phase"],
+    sequence: number,
+    reasonCode: string | null = null,
+  ): MemberResultRecord => ({
+    sequence,
+    operationId,
+    target: {
+      residentId: a,
+      scopeId: "test-scope:gc07",
+      scopeGeneration: 1,
+      windowId: "test-window:gc07",
+      generation: 1,
+      dispatchId: "test-dispatch:gc07-old",
+    },
+    phase,
+    reasonCode,
+  });
   const gc07Base = (): GroupChatEvidenceById["GC-07"] => ({
     ordinaryQueueDepthBeforeControl: 3,
     heldBeforeControl: true,
@@ -2468,6 +2524,11 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
     externalEffectClaimedReversed: false,
     continueEffectiveWhileQueueBlocked: true,
     postContinueNewPermitCommitted: true,
+    postContinueOldPermitResults: [
+      gc07ResultRow("gc07-old-permit", "returned", 20),
+      gc07ResultRow("gc07-old-permit", "rejected", 21, "ROOM_CONTROL_CUTOFF"),
+    ],
+    postContinueOldBodyInRoom: false,
   });
 
   it("GC-07 requires every forged control explicitly rejected without a cutoff", () => {
@@ -2534,10 +2595,10 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
   });
   const gc08Base = (): GroupChatEvidenceById["GC-08"] => ({
     expectedByOperation: [
-      { operationId: "op-batch", state: "batched" },
-      { operationId: "op-not-included", state: "not-included" },
-      { operationId: "op-stopped", state: "stop-blocked" },
-      { operationId: "op-dispatch", state: "dispatch-failed" },
+      { operationId: "op-batch", senderId: a, state: "batched" },
+      { operationId: "op-not-included", senderId: a, state: "not-included" },
+      { operationId: "op-stopped", senderId: a, state: "stop-blocked" },
+      { operationId: "op-dispatch", senderId: a, state: "dispatch-failed" },
     ],
     decisions: [
       gc08Decision("op-batch", "batched", "ROOM_BATCHED"),
@@ -2602,7 +2663,13 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
     errorCode: null,
     truncations,
   });
-  const gc10Truth = { eventId: "gc10-event-3", originalLength: 180, maxCharacters: 24 } as const;
+  const gc10LongBody = "TEST-GC10-LONG-".repeat(12);
+  const gc10Truth = {
+    eventId: "gc10-event-3",
+    originalLength: 180,
+    maxCharacters: 24,
+    body: gc10LongBody,
+  } as const;
   const gc10Truncation = {
     eventId: "gc10-event-3",
     originalLength: 180,
@@ -2638,7 +2705,7 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       viewerId: fixture.residentIds.a,
       outcome: "granted",
       eventId: "gc10-event-3",
-      body: "TEST-GC10-LONG-body",
+      body: gc10LongBody,
       errorCode: null,
     },
     deniedRead: {
@@ -2715,6 +2782,11 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
     forgedTupleAttempts: 6,
     forgedTupleCommits: 0,
     currentTupleCommits: 1,
+    postContinueStoppedResults: [
+      gc07ResultRow("gc12-cutoff-old", "returned", 30),
+      gc07ResultRow("gc12-cutoff-old", "rejected", 31, "ROOM_CONTROL_CUTOFF"),
+    ],
+    postContinueOldBodyInRoom: false,
   });
 
   it("GC-12 requires a rejected cutoff record and one distinct field moved per forgery", () => {
@@ -3082,6 +3154,112 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       projectionContext: "room-source:gc10-event-3 180 characters 0:24-ext",
     };
     expect(evaluateGroupChatEvidence("GC-10", rangeDashed).passed).toBe(false);
+  });
+
+  // #206 review 8: the old permit's first return after continue must still meet the cutoff.
+  it("GC-07/GC-12 hold the cutoff for the old permit's first return after continue", () => {
+    expect(evaluateGroupChatEvidence("GC-07", gc07Base()).passed).toBe(true);
+    expect(evaluateGroupChatEvidence("GC-12", gc12Base()).passed).toBe(true);
+    const shapes: readonly (readonly MemberResultRecord[])[] = [
+      [],
+      [gc07ResultRow("gc07-old-permit", "returned", 20)],
+      [
+        gc07ResultRow("gc07-old-permit", "returned", 20),
+        gc07ResultRow("gc07-old-permit", "committed", 21),
+      ],
+      [
+        gc07ResultRow("gc07-old-permit", "returned", 20),
+        gc07ResultRow("gc07-old-permit", "rejected", 21, ""),
+      ],
+      [
+        gc07ResultRow("gc07-old-permit", "returned", 20),
+        gc07ResultRow("gc07-old-permit", "rejected", 21, "ROOM_CONTROL_CUTOFF"),
+        gc07ResultRow("gc07-old-permit", "committed", 22),
+      ],
+      [
+        gc07ResultRow("gc07-old-permit", "returned", 20),
+        gc07ResultRow("gc07-old-permit", "rejected", 21, "ROOM_CONTROL_CUTOFF"),
+        gc07ResultRow("gc07-old-permit", "rejected", 22, "ROOM_CONTROL_CUTOFF"),
+      ],
+    ];
+    for (const postContinueOldPermitResults of shapes) {
+      const result = evaluateGroupChatEvidence("GC-07", {
+        ...gc07Base(),
+        postContinueOldPermitResults,
+      });
+      expect(result.passed, JSON.stringify(postContinueOldPermitResults)).toBe(false);
+    }
+    const gc07Leak = evaluateGroupChatEvidence("GC-07", {
+      ...gc07Base(),
+      postContinueOldBodyInRoom: true,
+    });
+    expect(gc07Leak.passed).toBe(false);
+    for (const postContinueStoppedResults of shapes) {
+      const result = evaluateGroupChatEvidence("GC-12", {
+        ...gc12Base(),
+        postContinueStoppedResults: postContinueStoppedResults.map((row) => ({
+          ...row,
+          operationId: "gc12-cutoff-old",
+        })),
+      });
+      expect(result.passed, JSON.stringify(postContinueStoppedResults)).toBe(false);
+    }
+    const gc12Leak = evaluateGroupChatEvidence("GC-12", {
+      ...gc12Base(),
+      postContinueOldBodyInRoom: true,
+    });
+    expect(gc12Leak.passed).toBe(false);
+  });
+
+  // #206 review 8: the granted source read must equal the judge-seeded body, not a prefix.
+  it("GC-10 binds the granted source-read body to the full judge-seeded truth", () => {
+    expect(evaluateGroupChatEvidence("GC-10", gc10Base()).passed).toBe(true);
+    const honestRead = gc10Base().grantedRead as SourceReadAudit;
+    const truncatedBody = {
+      ...gc10Base(),
+      grantedRead: { ...honestRead, body: gc10LongBody.slice(0, 24) },
+    };
+    const truncatedResult = evaluateGroupChatEvidence("GC-10", truncatedBody);
+    expect(truncatedResult.passed).toBe(false);
+    expect(truncatedResult.detail).toContain("精确相等");
+    const rewrittenBody = {
+      ...gc10Base(),
+      grantedRead: {
+        ...honestRead,
+        body: `${gc10LongBody.slice(0, 60)}XXXX${gc10LongBody.slice(64)}`,
+      },
+    };
+    expect(evaluateGroupChatEvidence("GC-10", rewrittenBody).passed).toBe(false);
+  });
+
+  // #206 review 8: decisions and feedback must carry the judge-owned senderId.
+  it("GC-08 binds each decision and its feedback to the judge-owned senderId", () => {
+    expect(evaluateGroupChatEvidence("GC-08", gc08Base()).passed).toBe(true);
+    const b = fixture.residentIds.b;
+    const wrongDecisionSender = {
+      ...gc08Base(),
+      decisions: [
+        gc08Decision("op-batch", "batched", "ROOM_BATCHED"),
+        { ...gc08Decision("op-not-included", "not-included", "ROOM_NOT_INCLUDED"), senderId: b },
+        gc08Decision("op-stopped", "stop-blocked", "ROOM_STOPPED"),
+        gc08Decision("op-dispatch", "dispatch-failed", "ROOM_DISPATCH_FAILED"),
+      ],
+    };
+    const decisionResult = evaluateGroupChatEvidence("GC-08", wrongDecisionSender);
+    expect(decisionResult.passed).toBe(false);
+    expect(decisionResult.detail).toContain("senderId");
+    const wrongFeedbackSender = {
+      ...gc08Base(),
+      deliveredFeedback: [
+        gc08Feedback("op-batch", "ROOM_BATCHED"),
+        { ...gc08Feedback("op-not-included", "ROOM_NOT_INCLUDED"), senderId: b },
+        gc08Feedback("op-stopped", "ROOM_STOPPED"),
+        gc08Feedback("op-dispatch", "ROOM_DISPATCH_FAILED"),
+      ],
+    };
+    const feedbackResult = evaluateGroupChatEvidence("GC-08", wrongFeedbackSender);
+    expect(feedbackResult.passed).toBe(false);
+    expect(feedbackResult.detail).toContain("判卷发送方");
   });
 });
 

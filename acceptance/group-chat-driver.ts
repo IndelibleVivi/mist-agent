@@ -566,11 +566,17 @@ export interface GroupChatEvidenceById {
     externalEffectClaimedReversed: boolean;
     continueEffectiveWhileQueueBlocked: boolean;
     postContinueNewPermitCommitted: boolean;
+    /** Old-permit result rows recorded after the continue took effect; exactly one returned, one reasoned rejected. */
+    postContinueOldPermitResults: readonly MemberResultRecord[];
+    /** Whether the post-continue old-permit body leaked into the room ledger. */
+    postContinueOldBodyInRoom: boolean;
   };
   "GC-08": {
     /** Judge ground truth: the exact state each stimulus operation must get exactly one decision for. */
     expectedByOperation: readonly {
       operationId: string;
+      /** Judge-owned sender of the stimulus; decision and feedback must both carry it. */
+      senderId: ResidentId;
       state: DeliveryDecisionRecord["state"];
     }[];
     decisions: readonly DeliveryDecisionRecord[];
@@ -607,6 +613,8 @@ export interface GroupChatEvidenceById {
       readonly eventId: string;
       readonly originalLength: number;
       readonly maxCharacters: number;
+      /** Judge-owned full body of the seeded long event; granted source reads must equal it. */
+      readonly body: string;
     };
     projectionContext: string;
     hiddenWorldFingerprints: readonly string[];
@@ -625,6 +633,10 @@ export interface GroupChatEvidenceById {
     /** The cutoff-stopped late result must carry an explicit rejected record with a stable reason. */
     stoppedResultReasoned: boolean;
     postContinueResultCommitted: boolean;
+    /** Old-permit result rows recorded after the continue took effect; exactly one returned, one reasoned rejected. */
+    postContinueStoppedResults: readonly MemberResultRecord[];
+    /** Whether the post-continue old-permit body leaked into the room ledger. */
+    postContinueOldBodyInRoom: boolean;
     /** The single identity field each of the six forged targets moves; must cover all six exactly once. */
     forgedTupleFields: readonly string[];
     forgedTupleAttempts: number;

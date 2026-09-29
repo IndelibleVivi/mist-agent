@@ -197,6 +197,7 @@ const methodsByCheck: Record<GroupChatCheckId, readonly (keyof GroupChatHostDriv
     "readScheduler",
     "readControlRecords",
     "readMemberResults",
+    "readRoomEvents",
   ],
   "GC-08": [
     "startHost",
@@ -231,6 +232,8 @@ const methodsByCheck: Record<GroupChatCheckId, readonly (keyof GroupChatHostDriv
     "readRoster",
     "readDeliveryDecisions",
     "readMemberResults",
+    "readControlRecords",
+    "readRoomEvents",
   ],
   "GC-15": [
     "startHost",
@@ -795,6 +798,24 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
       if (e.externalEffectClaimedReversed) return fail("已发生的外部副作用被伪报撤回");
       if (!e.continueEffectiveWhileQueueBlocked || !e.postContinueNewPermitCommitted)
         return fail("continue 等待普通队列或没有解锁一枚新的许可");
+      // The old permit's first return after continue must still meet the cutoff: really
+      // returned, exactly one reasoned rejected, never committed, body out of the ledger.
+      const postContinueReturned = e.postContinueOldPermitResults.filter(
+        (row) => row.phase === "returned",
+      );
+      const postContinueRejected = e.postContinueOldPermitResults.filter(
+        (row) => row.phase === "rejected",
+      );
+      if (postContinueReturned.length !== 1)
+        return fail("continue 后旧许可结果没有真实送回宿主一次");
+      if (
+        postContinueRejected.length !== 1 ||
+        (postContinueRejected[0]?.reasonCode ?? "").trim() === ""
+      )
+        return fail("continue 后旧许可结果没有恰好一条带稳定非空原因码的 rejected 记录");
+      if (e.postContinueOldPermitResults.some((row) => row.phase === "committed"))
+        return fail("continue 后清除 cutoff 让旧许可结果进了新窗");
+      if (e.postContinueOldBodyInRoom) return fail("continue 后旧许可正文泄漏进房间原账");
       return {
         passed: true,
         detail: "非空队列与 held permit 下 stop/continue 独立；伪造控制无效；双回执与 cutoff 诚实",
@@ -802,20 +823,28 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
     }
     case "GC-08": {
       const e = evidence as GroupChatEvidenceById["GC-08"];
-      for (const { operationId, state } of e.expectedByOperation) {
+      for (const { operationId, senderId, state } of e.expectedByOperation) {
         const rows = e.decisions.filter((row) => row.operationId === operationId);
         if (
           rows.length !== 1 ||
           rows[0]?.state !== state ||
-          !rows[0]?.senderId ||
+          rows[0]?.senderId !== senderId ||
           !rows[0]?.reasonCode ||
           !Number.isSafeInteger(rows[0]?.count) ||
           (rows[0]?.count ?? 0) < 1
         )
-          return fail(`${operationId} 缺恰好一条 ${state} 决定，或决定缺归属、稳定原因码或计数`);
+          return fail(
+            `${operationId} 缺恰好一条 ${state} 决定，或决定 senderId 不是判卷发送方，或缺稳定原因码/计数`,
+          );
         const feedbackRows = e.deliveredFeedback.filter((row) => row.operationId === operationId);
-        if (feedbackRows.length !== 1 || feedbackRows[0]?.reasonCode !== rows[0]?.reasonCode)
-          return fail(`${operationId} 没有恰好一条反馈，或反馈原因码与决定不对齐`);
+        if (
+          feedbackRows.length !== 1 ||
+          feedbackRows[0]?.senderId !== senderId ||
+          feedbackRows[0]?.reasonCode !== rows[0]?.reasonCode
+        )
+          return fail(
+            `${operationId} 没有恰好一条归属于判卷发送方的反馈，或反馈原因码与决定不对齐`,
+          );
       }
       if (e.offlineFeedbackMarkedDelivered) return fail("发送方离线时反馈已冒充 delivered");
       if (
@@ -977,12 +1006,10 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         return fail("被截断的事件不在 truncated 投影的纳入集合里");
       if (e.hiddenWorldFingerprints.length !== 3 || new Set(e.hiddenWorldFingerprints).size !== 1)
         return fail("隐藏内容或其存在通过投影计数、错误或回执泄漏");
-      if (
-        e.grantedRead?.outcome !== "granted" ||
-        e.grantedRead.eventId !== truncation.eventId ||
-        !e.grantedRead.body?.includes("TEST-GC10-LONG-")
-      )
+      if (e.grantedRead?.outcome !== "granted" || e.grantedRead.eventId !== truncation.eventId)
         return fail("授权时 source ref 没有回到同一原事件");
+      if (e.grantedRead.body !== truncationTruth.body)
+        return fail("授权回源正文与判卷种下的完整长正文不精确相等");
       if (
         e.deniedRead?.outcome !== "denied" ||
         e.deniedRead.eventId !== null ||
@@ -1008,6 +1035,24 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         return fail("stop 前许可在 continue 后复活，或新许可没有正常提交");
       if (!e.stoppedResultReasoned)
         return fail("stop cutoff 后的旧许可结果没有明确 rejected 记录与可归属原因");
+      // The old permit's first return after continue must still meet the cutoff: really
+      // returned, exactly one reasoned rejected, never committed, body out of the ledger.
+      const gc12PostContinueReturned = e.postContinueStoppedResults.filter(
+        (row) => row.phase === "returned",
+      );
+      const gc12PostContinueRejected = e.postContinueStoppedResults.filter(
+        (row) => row.phase === "rejected",
+      );
+      if (gc12PostContinueReturned.length !== 1)
+        return fail("continue 后旧许可结果没有真实送回宿主一次");
+      if (
+        gc12PostContinueRejected.length !== 1 ||
+        (gc12PostContinueRejected[0]?.reasonCode ?? "").trim() === ""
+      )
+        return fail("continue 后旧许可结果没有恰好一条带稳定非空原因码的 rejected 记录");
+      if (e.postContinueStoppedResults.some((row) => row.phase === "committed"))
+        return fail("continue 后清除 cutoff 让旧许可结果进了新窗");
+      if (e.postContinueOldBodyInRoom) return fail("continue 后旧许可正文泄漏进房间原账");
       if (e.forgedTupleAttempts !== 6 || e.forgedTupleCommits !== 0 || e.currentTupleCommits !== 1)
         return fail("完整目标六字段的伪造负例或当前身份正对照不成立");
       if (
@@ -1841,6 +1886,14 @@ export async function runGroupChatCheck(
         structured: true,
         binding: "test-control-binding:owner",
       });
+      // The old permit's first return after continue, with its original identity tuple:
+      // the cutoff must still reject it even though the resident is running again.
+      await act({
+        kind: "return-member-result",
+        operationId: "gc07-old-permit",
+        target,
+        body: "TEST-GC07-POST-CONTINUE-OLD",
+      });
       const newTarget = { ...target, dispatchId: "test-dispatch:gc07-new" };
       await act({ kind: "set-delivery-target", target: newTarget });
       await act({
@@ -1860,7 +1913,11 @@ export async function runGroupChatCheck(
       const controls = await driver.readControlRecords();
       const results = await driver.readMemberResults();
       const finalScheduler = await driver.readScheduler();
+      const roomEvents = await driver.readRoomEvents();
       const authorizedStop = controls.filter((row) => row.controlId === "gc07-authorized-stop");
+      const continueEffectiveSequence =
+        controls.find((row) => row.controlId === "gc07-continue" && row.phase === "effective")
+          ?.sequence ?? null;
       return evaluateGroupChatEvidence(id, {
         ordinaryQueueDepthBeforeControl: beforeControl.ordinaryQueueDepth,
         heldBeforeControl: beforeControl.heldOperationIds.includes("gc07-old-permit"),
@@ -1888,6 +1945,16 @@ export async function runGroupChatCheck(
           finalScheduler.ordinaryQueueDepth === beforeControl.ordinaryQueueDepth,
         postContinueNewPermitCommitted: results.some(
           (row) => row.operationId === "gc07-new-permit" && row.phase === "committed",
+        ),
+        postContinueOldPermitResults:
+          continueEffectiveSequence === null
+            ? []
+            : results.filter(
+                (row) =>
+                  row.operationId === "gc07-old-permit" && row.sequence > continueEffectiveSequence,
+              ),
+        postContinueOldBodyInRoom: roomEvents.some((event) =>
+          event.body.includes("TEST-GC07-POST-CONTINUE-OLD"),
         ),
       });
     }
@@ -1963,7 +2030,11 @@ export async function runGroupChatCheck(
       const reasonsBefore = reasonMap(decisionsBeforeRestart);
       const reasonsAfter = reasonMap(decisionsAfterRestart);
       return evaluateGroupChatEvidence(id, {
-        expectedByOperation: stimuli.map(([, state, operationId]) => ({ operationId, state })),
+        expectedByOperation: stimuli.map(([, state, operationId]) => ({
+          operationId,
+          senderId: sender,
+          state,
+        })),
         decisions: decisionsBeforeRestart.filter((row) =>
           stimuli.some(([, , operationId]) => operationId === row.operationId),
         ),
@@ -2059,6 +2130,7 @@ export async function runGroupChatCheck(
         eventId: "gc10-event-3",
         originalLength: longBody.length,
         maxCharacters: 24,
+        body: longBody,
       } as const;
       const runWorld = async (hiddenBodies: readonly string[]) => {
         await driver.resetScenario(id, fixture);
@@ -2254,6 +2326,14 @@ export async function runGroupChatCheck(
         structured: true,
         binding: "test-control-binding:owner",
       });
+      // The old permit's first return after continue, with its original identity tuple:
+      // the cutoff must still reject it even though the resident is running again.
+      await act({
+        kind: "return-member-result",
+        operationId: "gc12-cutoff-old",
+        target: nextTarget,
+        body: "TEST-GC12-POST-CONTINUE-OLD",
+      });
       const continuedTarget = { ...nextTarget, dispatchId: "test-dispatch:gc12-after-continue" };
       await act({ kind: "set-delivery-target", target: continuedTarget });
       await act({
@@ -2271,6 +2351,11 @@ export async function runGroupChatCheck(
         body: "TEST-GC12-NEW-RESULT",
       });
       const cutoffResults = await driver.readMemberResults();
+      const cutoffControls = await driver.readControlRecords();
+      const cutoffRoomEvents = await driver.readRoomEvents();
+      const gc12ContinueSequence =
+        cutoffControls.find((row) => row.controlId === "gc12-continue" && row.phase === "effective")
+          ?.sequence ?? null;
 
       await driver.resetScenario(id, fixture);
       await prepareWorld(baseTarget);
@@ -2363,6 +2448,16 @@ export async function runGroupChatCheck(
         ),
         postContinueResultCommitted: cutoffResults.some(
           (row) => row.operationId === "gc12-cutoff-new" && row.phase === "committed",
+        ),
+        postContinueStoppedResults:
+          gc12ContinueSequence === null
+            ? []
+            : cutoffResults.filter(
+                (row) =>
+                  row.operationId === "gc12-cutoff-old" && row.sequence > gc12ContinueSequence,
+              ),
+        postContinueOldBodyInRoom: cutoffRoomEvents.some((event) =>
+          event.body.includes("TEST-GC12-POST-CONTINUE-OLD"),
         ),
         forgedTupleFields,
         forgedTupleAttempts: tupleResults.filter(
