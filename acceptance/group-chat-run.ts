@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 /**
  * #191/#192 stacked red contract for GC-01..10, GC-12, GC-15 and GC-16.
  *
@@ -9,17 +10,18 @@
  * checked against facts the judge reads itself — the pid is a live descendant of this judge
  * process running the same node binary with an entry file from this checkout's src/, and the
  * commit is the checked-out HEAD. After stopHost() the process must be gone and readbacks must
- * reject. These checks stop lazy stand-ins; a judge-written durable challenge proving that
- * readbacks come from the host's own ledger waits for the #191 adapter's data-root contract.
- * A host that fails these checks gets seven red lamps naming the reason and a nonzero exit in
+ * reject. These checks stop lazy stand-ins; a judge-written durable challenge also proves that
+ * readbacks come from the host's own ledger. A host that fails these checks gets every lamp red and a nonzero exit in
  * both modes: it is a broken adapter, not the missing-driver baseline.
  * STUBBED follows the repo's acceptance convention: declared methods turn a lamp yellow.
  */
-import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { RoomEventStore } from "../src/group-chat/room-event-store.ts";
 import { groupChatChecks, runGroupChatCheck } from "./group-chat-checks.ts";
 import {
   type GroupChatCheckId,
@@ -40,6 +42,16 @@ export interface GroupChatRunResult {
   readonly passed: boolean;
   readonly stubbed: boolean;
   readonly detail: string;
+}
+
+interface JudgeDurabilityResult {
+  readonly passed: boolean;
+  readonly detail: string;
+}
+
+interface HostChecksResult {
+  readonly lamps: GroupChatRunResult[];
+  readonly judgeDurability: JudgeDurabilityResult;
 }
 
 export function scoreGroupChatResults(results: readonly GroupChatRunResult[]): {
@@ -186,6 +198,106 @@ export async function hostStopProblem(
     return null;
   }
   return "readRoomEvents() still answered after stopHost(), so readbacks do not come from the host process";
+}
+
+/**
+ * Prove the adapter reads the host's durable ledger, not a judge/adapter memory copy: stop the
+ * real child, append directly through the judge's independent store handle, restart the host,
+ * then ask the adapter to read the judge-only event back.
+ */
+export async function judgeDirectWriteReadback(
+  driver: GroupChatHostDriver,
+  stoppedHost: GroupChatHostRun,
+  facts: HostProvenanceFacts,
+): Promise<JudgeDurabilityResult> {
+  const dataRoot = stoppedHost.dataRoot;
+  if (dataRoot === undefined)
+    return { passed: false, detail: "adapter did not expose its acceptance dataRoot" };
+
+  let canonicalRoot: string;
+  try {
+    canonicalRoot = realpathSync(dataRoot);
+    if (
+      dirname(canonicalRoot) !== realpathSync(tmpdir()) ||
+      !basename(canonicalRoot).startsWith("mist-group-chat-")
+    ) {
+      return {
+        passed: false,
+        detail: "refused judge write: dataRoot is not this adapter's isolated temporary ledger",
+      };
+    }
+  } catch (error) {
+    return {
+      passed: false,
+      detail: `cannot resolve adapter dataRoot: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+
+  const probeId = randomUUID();
+  const roomId = groupChatSyntheticFixture.roomId;
+  const body = `judge-direct-write-${probeId}`;
+  let restarted: GroupChatHostRun | null = null;
+  let detail = "judge direct-write challenge did not complete";
+  let passed = false;
+  try {
+    const judgeStore = new RoomEventStore(canonicalRoot);
+    let eventId: string;
+    try {
+      eventId = judgeStore.append({
+        operationId: `judge-direct-${probeId}`,
+        roomId,
+        principalId: groupChatSyntheticFixture.residentIds.a,
+        authorId: groupChatSyntheticFixture.residentIds.a,
+        body,
+        visibility: "public",
+        requestSemantics: JSON.stringify({ probeId, roomId, body }),
+      }).event.id;
+    } finally {
+      judgeStore.close();
+    }
+
+    restarted = await driver.startHost();
+    const restartProblem =
+      restarted.pid === stoppedHost.pid
+        ? "restarted host reused the stopped process id"
+        : (hostProvenanceProblem(restarted, facts) ??
+          (restarted.commit.trim().toLowerCase() === stoppedHost.commit.trim().toLowerCase()
+            ? null
+            : "restarted host changed the source commit"));
+    if (restartProblem !== null) {
+      detail = `judge direct write was recorded, but restart provenance failed: ${restartProblem}`;
+    } else if (restarted.dataRoot !== canonicalRoot) {
+      detail = "restarted host did not reopen the same durable dataRoot";
+    } else {
+      const events = await driver.readRoomEvents(roomId);
+      const recovered = events.find((event) => event.id === eventId);
+      passed =
+        recovered?.body === body &&
+        recovered.authorId === groupChatSyntheticFixture.residentIds.a &&
+        recovered.roomId === roomId;
+      detail = passed
+        ? `judge-only event ${eventId} survived host restart and adapter readback`
+        : "adapter readback missed or altered the judge-only event after host restart";
+    }
+  } catch (error) {
+    detail = `judge direct-write challenge failed: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    try {
+      await driver.stopHost();
+    } catch (error) {
+      passed = false;
+      detail = `${detail}; restart stop failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  if (restarted !== null) {
+    const stopProblem = await hostStopProblem(driver, restarted.pid, facts.readProcess);
+    if (stopProblem !== null) {
+      passed = false;
+      detail = `${detail}; cleanup check failed: ${stopProblem}`;
+    }
+  }
+  return { passed, detail };
 }
 
 function currentHeadCommit(): string {
@@ -342,17 +454,28 @@ export interface GroupChatAcceptanceOptions {
 
 export interface GroupChatAcceptanceOutcome {
   readonly results: readonly GroupChatRunResult[];
+  readonly judgeDurability: JudgeDurabilityResult | null;
   readonly driverMissing: boolean;
   readonly provenanceFailed: boolean;
   readonly strict: boolean;
   readonly exitCode: number;
 }
 
+interface JudgeDurabilityResult {
+  readonly passed: boolean;
+  readonly detail: string;
+}
+
+interface HostChecksResult {
+  readonly lamps: GroupChatRunResult[];
+  readonly judgeDurability: JudgeDurabilityResult;
+}
+
 async function runHostChecks(
   loaded: LoadedDriver,
   factsOverride?: HostProvenanceFacts,
   log: (line: string) => void = console.log,
-): Promise<GroupChatRunResult[]> {
+): Promise<HostChecksResult> {
   const { driver, stubbed } = loaded;
   const facts: HostProvenanceFacts = factsOverride ?? {
     headCommit: currentHeadCommit(),
@@ -422,10 +545,11 @@ async function runHostChecks(
       `real-host provenance check failed after stopHost(): ${stopProblem}`,
     );
   log(`真实宿主进程 PID ${activeHost.pid}；代码 ${activeHost.commit}`);
+  const judgeDurability = await judgeDirectWriteReadback(driver, activeHost, facts);
   log(
-    "宿主来源已由判卷核对：判卷子进程、同一 node、src/ 入口、当前 HEAD、停机后进程退出且读回拒绝。判卷绕过 adapter 直写原账再读回的挑战，待 #191 adapter 定下数据根后补。",
+    "宿主来源已由判卷核对：判卷子进程、同一 node、src/ 入口、当前 HEAD、停机后进程退出且读回拒绝。",
   );
-  return results;
+  return { lamps: results, judgeDurability };
 }
 
 export async function executeGroupChatAcceptance(
@@ -439,12 +563,15 @@ export async function executeGroupChatAcceptance(
   log("");
 
   let provenanceFailed = false;
+  let judgeDurability: JudgeDurabilityResult | null = null;
   let results: GroupChatRunResult[];
   if (driver === null) {
     results = missingDriverResults();
   } else {
     try {
-      results = await runHostChecks(driver, options.facts, log);
+      const hostResults = await runHostChecks(driver, options.facts, log);
+      results = hostResults.lamps;
+      judgeDurability = hostResults.judgeDurability;
     } catch (error) {
       if (!(error instanceof HostProvenanceError)) throw error;
       provenanceFailed = true;
@@ -458,6 +585,10 @@ export async function executeGroupChatAcceptance(
     );
     log(`   ${result.detail}`);
   }
+  if (judgeDurability !== null) {
+    log(`${judgeDurability.passed ? "🟢" : "🔴"} 判卷直写耐久原账并重启后经 adapter 读回`);
+    log(`   ${judgeDurability.detail}`);
+  }
   log("");
   log(
     `真实宿主通过 ${driver === null ? 0 : score.trueGreen} / ${results.length}${score.stubGreen > 0 ? `；桩灯 ${score.stubGreen}` : ""}`,
@@ -467,9 +598,15 @@ export async function executeGroupChatAcceptance(
   if (provenanceFailed) {
     log("宿主来源核对未通过：这是坏 adapter，不是缺驱动的起点，报告模式同样非零退出。");
   }
-  const exitCode = provenanceFailed || (isStrict && !score.strictPass) ? 1 : 0;
+  const exitCode =
+    provenanceFailed ||
+    (judgeDurability !== null && !judgeDurability.passed) ||
+    (isStrict && !score.strictPass)
+      ? 1
+      : 0;
   return {
     results,
+    judgeDurability,
     driverMissing: driver === null,
     provenanceFailed,
     strict: isStrict,
