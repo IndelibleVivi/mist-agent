@@ -68,4 +68,44 @@ describe("RoomMessageHost", () => {
     expect(host.readRoomEvents()).toHaveLength(1);
     expect(host.readSystemReceipts()).toHaveLength(1);
   });
+
+  it("rejects a conflicting replacement without discarding the previous host grant", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mist-room-host-"));
+    roots.push(root);
+    const host = new RoomMessageHost(root);
+    hosts.push(host);
+    const principalId = "resident-a";
+    const roomId = "room-a";
+    const oldBinding = "setup-issued-token";
+    const oldEnvelope = {
+      operationId: "original-binding-still-valid",
+      roomId,
+      principalId,
+      visibility: "public" as const,
+      binding: oldBinding,
+      body: "hello",
+    };
+
+    host.replaceBindingGrants([{ principalId, roomId, bindingId: oldBinding }]);
+    expect(() =>
+      host.replaceBindingGrants([
+        { principalId, roomId, bindingId: oldBinding },
+        { principalId, roomId, bindingId: "replacement-token" },
+      ]),
+    ).toThrow(/cannot be rebound/);
+
+    expect(host.post({ principalId }, oldEnvelope).status).toBe("recorded");
+    expect(
+      host.post(
+        { principalId },
+        { ...oldEnvelope, operationId: "rejected-new-binding", binding: "replacement-token" },
+      ),
+    ).toMatchObject({
+      status: "rejected",
+      recipient: "sender",
+      reasonCode: "room_binding_denied",
+    });
+    expect(host.readRoomEvents()).toHaveLength(1);
+    expect(host.readSystemReceipts()).toHaveLength(1);
+  });
 });

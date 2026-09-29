@@ -7,6 +7,7 @@ const writerId = process.argv[3];
 if (dataRoot === undefined || writerId === undefined)
   throw new Error("room-event-store worker requires a data root and writer id");
 
+const store = new RoomEventStore(dataRoot);
 await writeFile(join(dataRoot, `${writerId}.ready`), "ready", { flag: "wx" });
 const startFile = join(dataRoot, "start");
 for (;;) {
@@ -18,10 +19,11 @@ for (;;) {
   }
 }
 
-const store = new RoomEventStore(dataRoot);
 try {
   for (let sequence = 0; sequence < 64; sequence++) {
     const body = `${writerId}:${sequence}`;
+    if (sequence === 0)
+      await writeFile(join(dataRoot, `${writerId}.attempting`), "attempting", { flag: "wx" });
     store.append({
       operationId: body,
       roomId: "shared-room",
@@ -36,3 +38,4 @@ try {
 } finally {
   store.close();
 }
+await writeFile(join(dataRoot, `${writerId}.done`), "done", { flag: "wx" });

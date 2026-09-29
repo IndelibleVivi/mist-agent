@@ -84,6 +84,19 @@ describe("RoomEventStore", () => {
     store.close();
   });
 
+  it("rejects replay when the original operation had no receipt claim", async () => {
+    const store = new RoomEventStore(await makeRoot());
+    const original = store.append(appendInput());
+
+    expect(original.receipt).toBeNull();
+    expect(() => store.append({ ...appendInput(), recordedClaim: ROOM_RECORDED_CLAIM })).toThrow(
+      /already used/,
+    );
+    expect(store.readRoomEvents()).toHaveLength(1);
+    expect(store.readSystemReceipts()).toHaveLength(0);
+    store.close();
+  });
+
   it("migrates the existing v1 ledger without losing records or inventing mentions", async () => {
     const root = await makeRoot();
     const legacy = new DatabaseSync(join(root, "room-events.sqlite"));
@@ -212,6 +225,42 @@ describe("RoomEventStore", () => {
     expect(events).toHaveLength(128);
     expect(positions).toEqual(Array.from({ length: 128 }, (_, index) => index + 1));
     expect(new Set(events.map((event) => event.id)).size).toBe(128);
+    reader.close();
+  }, 20_000);
+
+  it("waits for an external SQLite writer lock and commits after it is released", async () => {
+    const root = await makeRoot();
+    const initialize = new RoomEventStore(root);
+    initialize.close();
+
+    const writerId = "locked-writer";
+    const worker = fileURLToPath(new URL("./room-event-store-worker.ts", import.meta.url));
+    const writer = runWriter(worker, root, writerId);
+    await waitForFile(join(root, `${writerId}.ready`));
+
+    const blocker = new DatabaseSync(join(root, "room-events.sqlite"));
+    blocker.exec("PRAGMA busy_timeout = 10000; BEGIN IMMEDIATE");
+    try {
+      await writeFile(join(root, "start"), "go", { flag: "wx" });
+      await waitForFile(join(root, `${writerId}.attempting`));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      await expect(access(join(root, `${writerId}.done`))).rejects.toThrow();
+      blocker.exec("COMMIT");
+      await writer;
+      await expect(access(join(root, `${writerId}.done`))).resolves.toBeUndefined();
+    } finally {
+      try {
+        blocker.exec("ROLLBACK");
+      } catch {
+        // The successful path has already committed the lock transaction.
+      }
+      blocker.close();
+      await writer.catch(() => undefined);
+    }
+
+    const reader = new RoomEventStore(root);
+    expect(reader.readRoomEvents("shared-room")).toHaveLength(64);
     reader.close();
   }, 20_000);
 });

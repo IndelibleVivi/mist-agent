@@ -121,6 +121,7 @@ describe("group-chat acceptance host process", () => {
         principalId: fixture.humanId,
         binding: fixture.trustedOwnerBinding,
         body: "missing-visibility",
+        mentions: undefined,
       }),
       reasonCode: "public_declaration_required",
     },
@@ -215,11 +216,17 @@ describe("group-chat acceptance host process", () => {
         const expectedEnvelope = Object.fromEntries(
           Object.entries(command).filter(([key]) => key !== "kind"),
         );
+        const wireExpectedEnvelope = JSON.parse(JSON.stringify(expectedEnvelope)) as Record<
+          string,
+          unknown
+        >;
         const { operationId, ...observedFields } = exchange.envelope;
         expect(operationId).toBeTruthy();
-        expect(observedFields).toStrictEqual(expectedEnvelope);
+        expect(observedFields).toStrictEqual(wireExpectedEnvelope);
         expect(exchange.principal).toStrictEqual({ principalId: command.principalId });
         expect(exchange.result.operationId).toBe(operationId);
+        expect(exchange.childPid).toBe(run.pid);
+        expect(exchange.childRequestHash).toBe(exchange.requestHash);
       };
       assertUnchangedPostFields(validCommand, exchanges[0]);
       assertUnchangedPostFields(invalidCommand, exchanges[1]);

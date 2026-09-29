@@ -18,9 +18,16 @@ const authA: AuthenticatedPrincipal = { principalId: principalA };
 const nearGreenOverrides: Readonly<Record<string, Partial<RoomMessageEnvelope>>> = {
   "missing authentication": {},
   "missing room": { roomId },
+  "whitespace room": { roomId },
+  "wrong-type room": { roomId },
   "missing public declaration": { visibility: "public" },
+  "wrong-type visibility": { visibility: "public" },
   "missing room binding": { binding: allowedBinding },
+  "whitespace room binding": { binding: allowedBinding },
+  "wrong-type room binding": { binding: allowedBinding },
   "binding from another principal": { binding: allowedBinding },
+  "whitespace operation id": { operationId: "positive-control" },
+  "wrong-type operation id": { operationId: "positive-control" },
   "forged author claim": { claimedAuthorId: principalA },
   "private fields": {},
   "principal field contradicts authenticated context": { principalId: principalA },
@@ -88,6 +95,19 @@ describe("postRoomMessage", () => {
       reasonCode: "room_required",
     },
     {
+      label: "whitespace room",
+      auth: authA,
+      envelope: (base: RoomMessageEnvelope) => ({ ...base, roomId: " \t " }),
+      reasonCode: "room_required",
+    },
+    {
+      label: "wrong-type room",
+      auth: authA,
+      envelope: (base: RoomMessageEnvelope) =>
+        ({ ...base, roomId: 7 }) as unknown as RoomMessageEnvelope,
+      reasonCode: "room_required",
+    },
+    {
       label: "missing public declaration",
       auth: authA,
       envelope: (base: RoomMessageEnvelope) => {
@@ -98,9 +118,29 @@ describe("postRoomMessage", () => {
       reasonCode: "public_declaration_required",
     },
     {
+      label: "wrong-type visibility",
+      auth: authA,
+      envelope: (base: RoomMessageEnvelope) =>
+        ({ ...base, visibility: 7 }) as unknown as RoomMessageEnvelope,
+      reasonCode: "public_declaration_required",
+    },
+    {
       label: "missing room binding",
       auth: authA,
       envelope: (base: RoomMessageEnvelope) => ({ ...base, binding: "" }),
+      reasonCode: "room_binding_denied",
+    },
+    {
+      label: "whitespace room binding",
+      auth: authA,
+      envelope: (base: RoomMessageEnvelope) => ({ ...base, binding: " \t " }),
+      reasonCode: "room_binding_denied",
+    },
+    {
+      label: "wrong-type room binding",
+      auth: authA,
+      envelope: (base: RoomMessageEnvelope) =>
+        ({ ...base, binding: 7 }) as unknown as RoomMessageEnvelope,
       reasonCode: "room_binding_denied",
     },
     {
@@ -147,6 +187,19 @@ describe("postRoomMessage", () => {
         ({ ...base, mentions: ["member-a", 7] }) as unknown as RoomMessageEnvelope,
       reasonCode: "mentions_invalid",
     },
+    {
+      label: "whitespace operation id",
+      auth: authA,
+      envelope: (base: RoomMessageEnvelope) => ({ ...base, operationId: " \t " }),
+      reasonCode: "operation_id_required",
+    },
+    {
+      label: "wrong-type operation id",
+      auth: authA,
+      envelope: (base: RoomMessageEnvelope) =>
+        ({ ...base, operationId: 7 }) as unknown as RoomMessageEnvelope,
+      reasonCode: "operation_id_required",
+    },
   ] as const)(
     "rejects $label without writing an event or public receipt, with a positive control",
     ({ label, auth, envelope, reasonCode }) => {
@@ -156,17 +209,14 @@ describe("postRoomMessage", () => {
         access,
         store,
       );
-      const rejected = postRoomMessage(
-        auth,
-        envelope(validEnvelope({ operationId: "negative-case" })),
-        access,
-        store,
-      );
+      const negativeEnvelope = envelope(validEnvelope({ operationId: "negative-case" }));
+      const rejected = postRoomMessage(auth, negativeEnvelope, access, store);
 
       expect(accepted.status).toBe("recorded");
       expect(rejected).toEqual({
         status: "rejected",
-        operationId: "negative-case",
+        operationId:
+          typeof negativeEnvelope.operationId === "string" ? negativeEnvelope.operationId : "",
         recipient: "sender",
         reasonCode,
       });
@@ -193,6 +243,60 @@ describe("postRoomMessage", () => {
       operationId: "retry",
       recipient: "sender",
       reasonCode: "operation_id_conflict",
+    });
+    expect(store.readRoomEvents()).toHaveLength(1);
+    expect(store.readSystemReceipts()).toHaveLength(1);
+  });
+
+  it("does not replay another principal's operation even with the same binding and body", () => {
+    access.register(principalB, roomId, allowedBinding);
+    const { principalId: _principalId, ...sharedEnvelope } = validEnvelope({
+      operationId: "principal-scoped-replay",
+    });
+    void _principalId;
+
+    const original = postRoomMessage(authA, sharedEnvelope, access, store);
+    const replay = postRoomMessage({ principalId: principalB }, sharedEnvelope, access, store);
+
+    expect(original.status).toBe("recorded");
+    expect(replay).toEqual({
+      status: "conflict",
+      operationId: "principal-scoped-replay",
+      recipient: "sender",
+      reasonCode: "operation_id_conflict",
+    });
+    expect(store.readRoomEvents()).toHaveLength(1);
+    expect(store.readRoomEvents()[0]).toMatchObject({
+      principalId: principalA,
+      authorId: principalA,
+      body: "hello",
+    });
+    expect(store.readSystemReceipts()).toHaveLength(1);
+  });
+
+  it("keeps the existing binding after rejecting a same-member rebind", () => {
+    expect(() => access.register(principalA, roomId, "membership-token-b")).toThrow(
+      /cannot be rebound/,
+    );
+
+    const oldGrant = postRoomMessage(
+      authA,
+      validEnvelope({ operationId: "old-binding-remains-valid" }),
+      access,
+      store,
+    );
+    const newGrant = postRoomMessage(
+      authA,
+      validEnvelope({ operationId: "new-binding-not-installed", binding: "membership-token-b" }),
+      access,
+      store,
+    );
+
+    expect(oldGrant.status).toBe("recorded");
+    expect(newGrant).toMatchObject({
+      status: "rejected",
+      recipient: "sender",
+      reasonCode: "room_binding_denied",
     });
     expect(store.readRoomEvents()).toHaveLength(1);
     expect(store.readSystemReceipts()).toHaveLength(1);

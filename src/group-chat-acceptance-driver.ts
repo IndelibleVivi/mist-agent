@@ -1,5 +1,5 @@
 import { type ChildProcess, execFileSync, fork } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -23,6 +23,9 @@ export interface RoomPostExchangeObservation {
   readonly principal: { readonly principalId: string };
   readonly envelope: RoomMessageEnvelope;
   readonly result: RoomPostResult;
+  readonly childPid: number;
+  readonly requestHash: string;
+  readonly childRequestHash: string;
 }
 
 export interface GroupChatHostDriverOptions {
@@ -32,12 +35,35 @@ export interface GroupChatHostDriverOptions {
 
 type ResponseMessage =
   | { readonly kind: "ready"; readonly pid: number }
-  | { readonly id: string; readonly ok: true; readonly value?: unknown }
-  | { readonly id: string; readonly ok: false; readonly error: string };
+  | {
+      readonly id: string;
+      readonly ok: true;
+      readonly value?: unknown;
+      readonly hostPid: number;
+      readonly requestHash: string;
+    }
+  | {
+      readonly id: string;
+      readonly ok: false;
+      readonly error: string;
+      readonly hostPid: number;
+      readonly requestHash: string;
+    };
+
+interface HostProcessExchange<T> {
+  readonly request: Readonly<Record<string, unknown>>;
+  readonly response: T;
+  readonly requestHash: string;
+  readonly childRequestHash: string;
+  readonly childPid: number;
+}
 
 interface PendingResponse {
   readonly resolve: (value: unknown) => void;
   readonly reject: (error: Error) => void;
+  readonly request: Readonly<Record<string, unknown>>;
+  readonly requestHash: string;
+  readonly observe?: (exchange: HostProcessExchange<unknown>) => void;
 }
 
 class HostProcessClient {
@@ -73,13 +99,31 @@ class HostProcessClient {
     await this.#ready;
   }
 
-  async request<T>(kind: string, fields: Record<string, unknown> = {}): Promise<T> {
+  async request<T>(
+    kind: string,
+    fields: Record<string, unknown> = {},
+    observe?: (exchange: HostProcessExchange<T>) => void,
+  ): Promise<T> {
     await this.#ready;
     const id = randomUUID();
+    const request = JSON.parse(JSON.stringify({ kind, ...fields })) as Record<string, unknown>;
+    const requestHash = hashRequest(request);
     const response = new Promise<unknown>((resolve, reject) => {
-      this.#pending.set(id, { resolve, reject });
+      const pending: PendingResponse = {
+        resolve,
+        reject,
+        request,
+        requestHash,
+        ...(observe === undefined
+          ? {}
+          : {
+              observe: (exchange: HostProcessExchange<unknown>) =>
+                observe(exchange as HostProcessExchange<T>),
+            }),
+      };
+      this.#pending.set(id, pending);
     });
-    this.#child.send({ id, kind, ...fields }, (error) => {
+    this.#child.send({ id, ...request, requestHash }, (error) => {
       if (error !== null) {
         const pending = this.#pending.get(id);
         this.#pending.delete(id);
@@ -112,6 +156,21 @@ class HostProcessClient {
     const pending = this.#pending.get(message.id);
     if (pending === undefined) return;
     this.#pending.delete(message.id);
+    if (pending.observe !== undefined) {
+      if (message.hostPid !== this.pid || message.requestHash !== pending.requestHash) {
+        pending.reject(new Error("group-chat host IPC receipt did not match the sent request"));
+        return;
+      }
+      if (message.ok) {
+        pending.observe({
+          request: pending.request,
+          response: message.value,
+          requestHash: pending.requestHash,
+          childRequestHash: message.requestHash,
+          childPid: message.hostPid,
+        });
+      }
+    }
     if (message.ok) pending.resolve(message.value);
     else pending.reject(new Error(message.error));
   }
@@ -215,11 +274,23 @@ export function createGroupChatHostDriver(
       void _kind;
       const envelope = { ...rawFields, operationId: randomUUID() } as RoomMessageEnvelope;
       const principal = { principalId: command.principalId };
-      const result = await active().request<RoomPostResult>("post", {
-        principal,
-        envelope,
-      });
-      options.onPostExchange?.({ principal, envelope, result });
+      const result = await active().request<RoomPostResult>(
+        "post",
+        {
+          principal,
+          envelope,
+        },
+        (exchange) => {
+          options.onPostExchange?.({
+            principal: exchange.request.principal as { readonly principalId: string },
+            envelope: exchange.request.envelope as RoomMessageEnvelope,
+            result: exchange.response,
+            childPid: exchange.childPid,
+            requestHash: exchange.requestHash,
+            childRequestHash: exchange.childRequestHash,
+          });
+        },
+      );
     },
     readRoomEvents: async (roomId?: string) => {
       const rows = await active().request<readonly RoomEvent[]>("read-room-events", { roomId });
@@ -255,4 +326,10 @@ function unsupported<T>(operation: string): (...args: never[]) => Promise<T> {
   return async () => {
     throw new Error(`group-chat host does not implement ${operation}`);
   };
+}
+
+function hashRequest(request: Readonly<Record<string, unknown>>): string {
+  const serialized = JSON.stringify(request);
+  if (serialized === undefined) throw new Error("group-chat host request is not serializable");
+  return createHash("sha256").update(serialized).digest("hex");
 }
