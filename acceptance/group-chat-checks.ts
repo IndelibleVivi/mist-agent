@@ -12,6 +12,7 @@ import {
   type GroupChatMentionOperation,
   type GroupChatNewcomerHistoryEvidence,
   type GroupChatRosterWorldEvidence,
+  type MemberResultRecord,
   type ResidentId,
   type RoomEvent,
   type RosterPath,
@@ -101,6 +102,7 @@ const groupChatCheckDefinitions: Omit<GroupChatCheck, "uses">[] = [
       "先证明普通队列非空且有真实 held permit，再在不释放普通队列时提交授权 stop",
       "引用的停、住户伪造与越权人类均不得改 latch；accepted/effective 分开",
       "不可达与已发生外部副作用诚实外显；continue 解锁新许可但不复活旧许可",
+      "另立独立世界：旧许可在 stop/continue 前从未送回，原六元组首次迟返发生在 continue 之后，仍实返实拒、零提交、正文不入账（终态拒绝缓存不得洗绿）",
     ],
   },
   {
@@ -137,6 +139,7 @@ const groupChatCheckDefinitions: Omit<GroupChatCheck, "uses">[] = [
       "排队后撤成员资格并真正尝试投递，旧 roster version 不得续权",
       "hold gen1 结果、换成 gen2 后实际送回旧结果；逐字段伪造完整目标身份",
       "stop 生效后送回旧许可结果，再 continue 并只接受新许可结果",
+      "另立独立世界：旧许可在 stop/continue 前从未送回，原六元组首次迟返发生在 continue 之后，拒绝缓存无账可洗",
     ],
   },
   {
@@ -831,9 +834,21 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
       if (e.postContinueOldPermitResults.some((row) => row.phase === "committed"))
         return fail("continue 后清除 cutoff 让旧许可结果进了新窗");
       if (e.postContinueOldBodyInRoom) return fail("continue 后旧许可正文泄漏进房间原账");
+      // Independent world: the old permit's FIRST late return happens after continue, so a
+      // memoized terminal rejection cannot wash a wiped cutoff green — attribution lands on
+      // the first late return's committed row or leaked body.
+      const independentProblem = firstLateReturnProblem(
+        e.independentFirstReturnResults,
+        e.independentFirstReturnTarget,
+        e.independentFirstReturnBodyInRoom,
+        e.independentNewPermitCommitted,
+        "continue 后独立世界旧许可的首次迟返仍被提交",
+      );
+      if (independentProblem !== null) return fail(`独立世界：${independentProblem}`);
       return {
         passed: true,
-        detail: "非空队列与 held permit 下 stop/continue 独立；伪造控制无效；双回执与 cutoff 诚实",
+        detail:
+          "非空队列与 held permit 下 stop/continue 独立；伪造控制无效；双回执与 cutoff 诚实；独立世界首次迟返实返实拒",
       };
     }
     case "GC-08": {
@@ -1080,6 +1095,17 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
       if (e.postContinueStoppedResults.some((row) => row.phase === "committed"))
         return fail("continue 后清除 cutoff 让旧许可结果进了新窗");
       if (e.postContinueOldBodyInRoom) return fail("continue 后旧许可正文泄漏进房间原账");
+      // Independent world: the old permit's FIRST late return happens after continue, so a
+      // memoized terminal rejection cannot wash a wiped cutoff green — attribution lands on
+      // the first late return's committed row or leaked body.
+      const independentProblem = firstLateReturnProblem(
+        e.independentFirstReturnResults,
+        e.independentFirstReturnTarget,
+        e.independentFirstReturnBodyInRoom,
+        e.independentNewPermitCommitted,
+        "stop 前许可在独立世界 continue 后复活（首次迟返被提交）",
+      );
+      if (independentProblem !== null) return fail(`独立世界：${independentProblem}`);
       if (e.forgedTupleAttempts !== 6 || e.forgedTupleCommits !== 0 || e.currentTupleCommits !== 1)
         return fail("完整目标六字段的伪造负例或当前身份正对照不成立");
       if (
@@ -1210,6 +1236,38 @@ function sameDispatchIdentity(left: DispatchIdentity | null, right: DispatchIden
     left.generation === right.generation &&
     left.dispatchId === right.dispatchId
   );
+}
+
+/**
+ * Independent-world first late return after continue (GC-07/GC-12): the old permit never
+ * returned before stop/continue, so no memoized terminal rejection can stand in for a fresh
+ * cutoff decision. Exactly one returned, zero committed, body out of the room, then exactly
+ * one reasoned rejected carrying the judge-owned identity, returned before rejected; the
+ * post-continue new permit must still commit. `committedDetail` carries the lamp-specific
+ * attribution for a committed first late return.
+ */
+function firstLateReturnProblem(
+  results: readonly MemberResultRecord[],
+  target: DispatchIdentity,
+  bodyInRoom: boolean,
+  newPermitCommitted: boolean,
+  committedDetail: string,
+): string | null {
+  const returned = results.filter((row) => row.phase === "returned");
+  const rejected = results.filter((row) => row.phase === "rejected");
+  if (returned.length !== 1) return "旧许可的首次迟返没有真实送回宿主一次";
+  if (results.some((row) => row.phase === "committed")) return committedDetail;
+  if (bodyInRoom) return "旧许可首次迟返的正文泄漏进房间原账";
+  if (rejected.length !== 1 || (rejected[0]?.reasonCode ?? "").trim() === "")
+    return "旧许可首次迟返没有恰好一条带稳定非空原因码的 rejected 记录";
+  if ([...returned, ...rejected].some((row) => !sameDispatchIdentity(row.target, target)))
+    return "首次迟返/拒绝记录的身份六元组与判卷原 target 不符";
+  const returnedSequence = returned[0]?.sequence ?? -1;
+  const rejectedSequence = rejected[0]?.sequence ?? -1;
+  if (returnedSequence < 0 || returnedSequence >= rejectedSequence)
+    return "首次迟返的 returned 没有先于 rejected 入账";
+  if (!newPermitCommitted) return "continue 后独立世界的新许可没有正常提交";
+  return null;
 }
 
 function surfaceText(surface: SurfaceSnapshot): string {
@@ -1958,6 +2016,92 @@ export async function runGroupChatCheck(
       const continueEffectiveSequence =
         controls.find((row) => row.controlId === "gc07-continue" && row.phase === "effective")
           ?.sequence ?? null;
+      // Independent world: this old permit has never returned before stop/continue, so a host
+      // memoizing terminal rejections has no cache entry to hide behind — the original
+      // identity tuple's FIRST late return lands after continue and must meet the cutoff.
+      await driver.resetScenario(id, fixture);
+      const independentTarget = {
+        residentId: fixture.residentIds.a,
+        scopeId: "test-scope:gc07-independent",
+        scopeGeneration: 1,
+        windowId: "test-window:gc07-independent",
+        generation: 1,
+        dispatchId: "test-dispatch:gc07-independent-old",
+      } as const;
+      await act({ kind: "set-delivery-target", target: independentTarget });
+      await act({
+        kind: "set-member-behavior",
+        residentId: fixture.residentIds.a,
+        behavior: "hold",
+      });
+      await act({
+        kind: "configure-orchestration",
+        rootId: fixture.roots.first,
+        policyVersion: "test-policy:control",
+        turnBudget: 4,
+        deadlineTicks: 2,
+        maxMemberAttempts: 1,
+      });
+      await act({
+        kind: "human-trigger",
+        operationId: "gc07-independent-human",
+        rootId: fixture.roots.first,
+        body: "TEST-GC07-INDEPENDENT-HUMAN",
+      });
+      await act({
+        kind: "member-turn",
+        operationId: "gc07-independent-permit",
+        rootId: fixture.roots.first,
+        residentId: fixture.residentIds.a,
+        body: "TEST-GC07-INDEPENDENT-PERMIT",
+        target: independentTarget,
+      });
+      await act({
+        kind: "submit-control",
+        controlId: "gc07-independent-stop",
+        issuerId: fixture.humanId,
+        targetId: fixture.residentIds.a,
+        action: "stop",
+        structured: true,
+        binding: "test-control-binding:owner",
+      });
+      await act({
+        kind: "submit-control",
+        controlId: "gc07-independent-continue",
+        issuerId: fixture.humanId,
+        targetId: fixture.residentIds.a,
+        action: "continue",
+        structured: true,
+        binding: "test-control-binding:owner",
+      });
+      // The original identity tuple returns for the first time only now, after continue.
+      await act({
+        kind: "return-member-result",
+        operationId: "gc07-independent-permit",
+        target: independentTarget,
+        body: "TEST-GC07-INDEPENDENT-LATE",
+      });
+      const independentNewTarget = {
+        ...independentTarget,
+        dispatchId: "test-dispatch:gc07-independent-new",
+      };
+      await act({ kind: "set-delivery-target", target: independentNewTarget });
+      await act({
+        kind: "member-turn",
+        operationId: "gc07-independent-new-permit",
+        rootId: fixture.roots.first,
+        residentId: fixture.residentIds.a,
+        body: "TEST-GC07-INDEPENDENT-NEW-PERMIT",
+        target: independentNewTarget,
+      });
+      await act({
+        kind: "return-member-result",
+        operationId: "gc07-independent-new-permit",
+        target: independentNewTarget,
+        body: "TEST-GC07-INDEPENDENT-NEW-RESULT",
+      });
+      const independentResults = await driver.readMemberResults();
+      const independentRoomEvents = await driver.readRoomEvents();
       return evaluateGroupChatEvidence(id, {
         ordinaryQueueDepthBeforeControl: beforeControl.ordinaryQueueDepth,
         heldBeforeControl: beforeControl.heldOperationIds.includes("gc07-old-permit"),
@@ -1996,6 +2140,16 @@ export async function runGroupChatCheck(
         postContinueOldTarget: target,
         postContinueOldBodyInRoom: roomEvents.some((event) =>
           event.body.includes("TEST-GC07-POST-CONTINUE-OLD"),
+        ),
+        independentFirstReturnResults: independentResults.filter(
+          (row) => row.operationId === "gc07-independent-permit",
+        ),
+        independentFirstReturnTarget: independentTarget,
+        independentFirstReturnBodyInRoom: independentRoomEvents.some((event) =>
+          event.body.includes("TEST-GC07-INDEPENDENT-LATE"),
+        ),
+        independentNewPermitCommitted: independentResults.some(
+          (row) => row.operationId === "gc07-independent-new-permit" && row.phase === "committed",
         ),
       });
     }
@@ -2398,6 +2552,77 @@ export async function runGroupChatCheck(
         cutoffControls.find((row) => row.controlId === "gc12-continue" && row.phase === "effective")
           ?.sequence ?? null;
 
+      // Independent world: this old permit has never returned before stop/continue, so a host
+      // memoizing terminal rejections has no cache entry to hide behind — the original
+      // identity tuple's FIRST late return lands after continue and must meet the cutoff.
+      await driver.resetScenario(id, fixture);
+      const independentTarget = {
+        ...baseTarget,
+        scopeId: "test-scope:gc12-independent",
+        windowId: "test-window:gc12-independent",
+        dispatchId: "test-dispatch:gc12-independent-old",
+      };
+      await prepareWorld(independentTarget);
+      await act({
+        kind: "set-member-behavior",
+        residentId: fixture.residentIds.a,
+        behavior: "hold",
+      });
+      await act({
+        kind: "member-turn",
+        operationId: "gc12-independent-old",
+        rootId: fixture.roots.first,
+        residentId: fixture.residentIds.a,
+        body: "TEST-GC12-INDEPENDENT-OLD",
+        target: independentTarget,
+      });
+      await act({
+        kind: "submit-control",
+        controlId: "gc12-independent-stop",
+        issuerId: fixture.humanId,
+        targetId: fixture.residentIds.a,
+        action: "stop",
+        structured: true,
+        binding: "test-control-binding:owner",
+      });
+      await act({
+        kind: "submit-control",
+        controlId: "gc12-independent-continue",
+        issuerId: fixture.humanId,
+        targetId: fixture.residentIds.a,
+        action: "continue",
+        structured: true,
+        binding: "test-control-binding:owner",
+      });
+      // The original identity tuple returns for the first time only now, after continue.
+      await act({
+        kind: "return-member-result",
+        operationId: "gc12-independent-old",
+        target: independentTarget,
+        body: "TEST-GC12-INDEPENDENT-LATE",
+      });
+      const independentContinuedTarget = {
+        ...independentTarget,
+        dispatchId: "test-dispatch:gc12-independent-new",
+      };
+      await act({ kind: "set-delivery-target", target: independentContinuedTarget });
+      await act({
+        kind: "member-turn",
+        operationId: "gc12-independent-new",
+        rootId: fixture.roots.first,
+        residentId: fixture.residentIds.a,
+        body: "TEST-GC12-INDEPENDENT-NEW",
+        target: independentContinuedTarget,
+      });
+      await act({
+        kind: "return-member-result",
+        operationId: "gc12-independent-new",
+        target: independentContinuedTarget,
+        body: "TEST-GC12-INDEPENDENT-NEW-RESULT",
+      });
+      const independentResults = await driver.readMemberResults();
+      const independentRoomEvents = await driver.readRoomEvents();
+
       await driver.resetScenario(id, fixture);
       await prepareWorld(baseTarget);
       await act({
@@ -2500,6 +2725,16 @@ export async function runGroupChatCheck(
         postContinueOldTarget: nextTarget,
         postContinueOldBodyInRoom: cutoffRoomEvents.some((event) =>
           event.body.includes("TEST-GC12-POST-CONTINUE-OLD"),
+        ),
+        independentFirstReturnResults: independentResults.filter(
+          (row) => row.operationId === "gc12-independent-old",
+        ),
+        independentFirstReturnTarget: independentTarget,
+        independentFirstReturnBodyInRoom: independentRoomEvents.some((event) =>
+          event.body.includes("TEST-GC12-INDEPENDENT-LATE"),
+        ),
+        independentNewPermitCommitted: independentResults.some(
+          (row) => row.operationId === "gc12-independent-new" && row.phase === "committed",
         ),
         forgedTupleFields,
         forgedTupleAttempts: tupleResults.filter(

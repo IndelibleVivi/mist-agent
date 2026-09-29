@@ -100,7 +100,13 @@ scenario error。故障注入只触发 ledger append/member transport 失败，�
   均红，不再只认 marker 前缀）；GC-08 expectedByOperation 加判卷 senderId，每个 operation 的
   唯一决定与唯一已交付反馈都必须同判卷发送方对得上（决定或反馈记成别人均红）。review 9
   补充：continue 后 returned/rejected 两行的身份六元组与判卷原 target 精确对账（按字段比较，
-  不认键序），且 returned 必须先于 rejected 入账；洗 dispatchId 或颠倒顺序均红。
+  不认键序），且 returned 必须先于 rejected 入账；洗 dispatchId 或颠倒顺序均红。review 10
+  补充：GC-07/GC-12 的首次迟返刺激独立成世界——旧许可在 stop/continue 之前从未送回（reset
+  后重建），continue 后原六元组第一次迟返才接受判卷（恰一 returned、恰一带原因 rejected、零
+  committed、正文不入账、新许可照常提交，证据与 stop 期间已返回过的 operation 不混账）。合成
+  宿主按 operation+六元组对终态拒绝做 memoization（普通生命周期正对照，不按灯号或夹具特判）：
+  诚实 memoized host 绿；同一宿主仅清 cutoff 必须在两灯都红，并由首次迟返的 committed/旧正文
+  归因，缓存不得洗绿。
 - GC-03：投递状态由判卷设置，本灯只核三行投递账按成员分开读回、原账不变、A 显式保存指回
   原事件。谁真的装入或排队（投递语义）留到投递账实现阶段，不能凭本灯视为已覆盖。
 - GC-04：两个世界各加一位不同的新成员，都要贯通五条路径；另静态扫描 `src/` 的非测试文件，

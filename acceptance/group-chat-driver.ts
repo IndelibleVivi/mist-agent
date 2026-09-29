@@ -572,6 +572,17 @@ export interface GroupChatEvidenceById {
     postContinueOldTarget: DispatchIdentity;
     /** Whether the post-continue old-permit body leaked into the room ledger. */
     postContinueOldBodyInRoom: boolean;
+    /**
+     * Independent world: this old permit never called return-member-result before stop/continue,
+     * so every row here belongs to the original tuple's FIRST late return after continue.
+     */
+    independentFirstReturnResults: readonly MemberResultRecord[];
+    /** Judge-owned identity of the independent world's old permit. */
+    independentFirstReturnTarget: DispatchIdentity;
+    /** Whether the independent first late-return body leaked into the room ledger. */
+    independentFirstReturnBodyInRoom: boolean;
+    /** Independent world: the post-continue new permit still commits normally. */
+    independentNewPermitCommitted: boolean;
   };
   "GC-08": {
     /** Judge ground truth: the exact state each stimulus operation must get exactly one decision for. */
@@ -641,6 +652,17 @@ export interface GroupChatEvidenceById {
     postContinueOldTarget: DispatchIdentity;
     /** Whether the post-continue old-permit body leaked into the room ledger. */
     postContinueOldBodyInRoom: boolean;
+    /**
+     * Independent world: this old permit never called return-member-result before stop/continue,
+     * so every row here belongs to the original tuple's FIRST late return after continue.
+     */
+    independentFirstReturnResults: readonly MemberResultRecord[];
+    /** Judge-owned identity of the independent world's old permit. */
+    independentFirstReturnTarget: DispatchIdentity;
+    /** Whether the independent first late-return body leaked into the room ledger. */
+    independentFirstReturnBodyInRoom: boolean;
+    /** Independent world: the post-continue new permit still commits normally. */
+    independentNewPermitCommitted: boolean;
     /** The single identity field each of the six forged targets moves; must cover all six exactly once. */
     forgedTupleFields: readonly string[];
     forgedTupleAttempts: number;

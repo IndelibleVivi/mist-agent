@@ -290,6 +290,12 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   private currentTarget: DispatchIdentity | null = null;
   private attempts: MemberAttemptRecord[] = [];
   private results: MemberResultRecord[] = [];
+  /**
+   * Terminal rejections are durable: keyed by operation + full identity tuple (never by lamp
+   * or fixture), the recorded reason is replayed on every later return of the same result
+   * instead of being re-evaluated — a rejected result can never be committed afterwards.
+   */
+  private terminalRejections = new Map<string, string>();
 
   constructor(options: TestOptions = {}) {
     this.options = options;
@@ -383,6 +389,7 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
     this.currentTarget = null;
     this.attempts = [];
     this.results = [];
+    this.terminalRejections.clear();
   }
 
   /** Per-room event ids: a global counter would itself reveal hidden-room traffic (GC-15). */
@@ -1523,6 +1530,28 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
             reasonCode: null,
           });
         }
+        const memoKey = [
+          command.operationId,
+          command.target.residentId,
+          command.target.scopeId,
+          command.target.scopeGeneration,
+          command.target.windowId,
+          command.target.generation,
+          command.target.dispatchId,
+        ].join("|");
+        const memoizedReason = this.terminalRejections.get(memoKey);
+        if (memoizedReason !== undefined) {
+          // A terminally rejected result replays its recorded rejection on every later return
+          // of the same operation+identity; it is never re-evaluated and never committed.
+          this.results.push({
+            sequence: this.nextSequence(),
+            operationId: command.operationId,
+            target: postContinueWash,
+            phase: "rejected",
+            reasonCode: memoizedReason,
+          });
+          return;
+        }
         const targetMatchesPermit = this.sameTarget(command.target, held.target);
         const targetCurrent = this.sameTarget(command.target, this.currentTarget);
         const stoppedAfterIssue =
@@ -1532,6 +1561,11 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
           this.options.acceptStaleTarget === true ||
           (this.options.acceptForgedTarget === true && command.operationId === "gc12-tuple") ||
           (this.options.acceptPreCutoffResult === true && stoppedAfterIssue);
+        const reasonCode = accepted
+          ? null
+          : stoppedAfterIssue
+            ? "ROOM_CONTROL_CUTOFF"
+            : "ROOM_DISPATCH_IDENTITY_STALE";
         // Review probe: dropping the rejection leaves the cutoff without attributable evidence.
         if (!(this.options.omitStoppedResultRejection && !accepted && stoppedAfterIssue)) {
           this.results.push({
@@ -1539,12 +1573,9 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
             operationId: command.operationId,
             target: postContinueWash,
             phase: accepted ? "committed" : "rejected",
-            reasonCode: accepted
-              ? null
-              : stoppedAfterIssue
-                ? "ROOM_CONTROL_CUTOFF"
-                : "ROOM_DISPATCH_IDENTITY_STALE",
+            reasonCode,
           });
+          if (!accepted && reasonCode !== null) this.terminalRejections.set(memoKey, reasonCode);
         }
         if (accepted) {
           this.addEvent({
@@ -2347,6 +2378,9 @@ describe("#192 stacked red oracle: each A-D behavior has a single-mutation red",
     ["GC-09B proxy-sign", "GC-09", { proxySignedReceiptAtRecord: true }, "代签"],
     ["GC-10B forge-length", "GC-10", { forgeTruncationMetadata: true }, "原长"],
     // #206 review 8: cutoff wiped at continue, truncated source body, sender misattribution.
+    // review 10: the host now memoizes terminal rejections by operation+identity — these two
+    // rows prove the memoized host still goes red, attributed by the independent world's
+    // first late return (empty cache) landing committed/body-leaked, never washed green.
     ["GC-07C cutoff-clear", "GC-07", { clearCutoffOnContinue: true }, "仍被提交"],
     ["GC-12C cutoff-clear", "GC-12", { clearCutoffOnContinue: true }, "复活"],
     ["GC-10D truncate-body", "GC-10", { truncateSourceReadBody: true }, "精确相等"],
@@ -2386,6 +2420,90 @@ describe("#192 stacked red oracle: each A-D behavior has a single-mutation red",
         readProcess: () => null,
       }),
     ).not.toBeNull();
+  });
+
+  // #206 review 10: terminal-rejection memoization is a normal-lifecycle positive control.
+  it("replays memoized terminal rejections by operation+identity, never re-committing", async () => {
+    // Even with the cutoff wiped at continue (the review-8 mutation), the second return of
+    // an already-rejected operation+identity replays the memoized rejection and is never
+    // committed. The lamp suites prove the same memoized host still goes red on GC-07/GC-12:
+    // their independent worlds force a FIRST late return with an empty cache.
+    const host = new SyntheticGroupChatHost({ clearCutoffOnContinue: true });
+    await host.resetScenario("GC-07", fixture);
+    const target: DispatchIdentity = {
+      residentId: fixture.residentIds.a,
+      scopeId: "test-scope:memo",
+      scopeGeneration: 1,
+      windowId: "test-window:memo",
+      generation: 1,
+      dispatchId: "test-dispatch:memo-old",
+    };
+    await host.perform({ kind: "set-delivery-target", target });
+    await host.perform({
+      kind: "configure-orchestration",
+      rootId: fixture.roots.first,
+      policyVersion: "test-policy:memo",
+      turnBudget: 4,
+      deadlineTicks: 2,
+      maxMemberAttempts: 1,
+    });
+    await host.perform({
+      kind: "human-trigger",
+      operationId: "memo-human",
+      rootId: fixture.roots.first,
+      body: "TEST-MEMO-HUMAN",
+    });
+    await host.perform({
+      kind: "set-member-behavior",
+      residentId: fixture.residentIds.a,
+      behavior: "hold",
+    });
+    await host.perform({
+      kind: "member-turn",
+      operationId: "memo-old",
+      rootId: fixture.roots.first,
+      residentId: fixture.residentIds.a,
+      body: "TEST-MEMO-OLD",
+      target,
+    });
+    await host.perform({
+      kind: "submit-control",
+      controlId: "memo-stop",
+      issuerId: fixture.humanId,
+      targetId: fixture.residentIds.a,
+      action: "stop",
+      structured: true,
+      binding: "test-control-binding:owner",
+    });
+    await host.perform({
+      kind: "return-member-result",
+      operationId: "memo-old",
+      target,
+      body: "TEST-MEMO-LATE",
+    });
+    await host.perform({
+      kind: "submit-control",
+      controlId: "memo-continue",
+      issuerId: fixture.humanId,
+      targetId: fixture.residentIds.a,
+      action: "continue",
+      structured: true,
+      binding: "test-control-binding:owner",
+    });
+    // Cutoff is wiped in this host; only the memoized rejection can stop the second return.
+    await host.perform({
+      kind: "return-member-result",
+      operationId: "memo-old",
+      target,
+      body: "TEST-MEMO-LATE-AGAIN",
+    });
+    const rows = (await host.readMemberResults()).filter((row) => row.operationId === "memo-old");
+    expect(rows.map((row) => row.phase)).toEqual(["returned", "rejected", "returned", "rejected"]);
+    expect(rows[1]?.reasonCode).toBe("ROOM_CONTROL_CUTOFF");
+    expect(rows[3]?.reasonCode).toBe("ROOM_CONTROL_CUTOFF");
+    expect(
+      (await host.readRoomEvents()).some((event) => event.body.includes("TEST-MEMO-LATE")),
+    ).toBe(false);
   });
 
   it("deep-copies new orchestration readbacks as well as commands", async () => {
@@ -2501,6 +2619,26 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
     generation: 1,
     dispatchId: "test-dispatch:gc07-old",
   };
+  const gc07IndependentTarget: DispatchIdentity = {
+    residentId: a,
+    scopeId: "test-scope:gc07-independent",
+    scopeGeneration: 1,
+    windowId: "test-window:gc07-independent",
+    generation: 1,
+    dispatchId: "test-dispatch:gc07-independent-old",
+  };
+  const gc07IndependentRow = (
+    phase: MemberResultRecord["phase"],
+    sequence: number,
+    reasonCode: string | null = null,
+    target: DispatchIdentity = gc07IndependentTarget,
+  ): MemberResultRecord => ({
+    sequence,
+    operationId: "gc07-independent-permit",
+    target,
+    phase,
+    reasonCode,
+  });
   const gc07ResultRow = (
     operationId: string,
     phase: MemberResultRecord["phase"],
@@ -2546,6 +2684,13 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
     ],
     postContinueOldTarget: gc07OldTarget,
     postContinueOldBodyInRoom: false,
+    independentFirstReturnResults: [
+      gc07IndependentRow("returned", 40),
+      gc07IndependentRow("rejected", 41, "ROOM_CONTROL_CUTOFF"),
+    ],
+    independentFirstReturnTarget: gc07IndependentTarget,
+    independentFirstReturnBodyInRoom: false,
+    independentNewPermitCommitted: true,
   });
 
   it("GC-07 requires every forged control explicitly rejected without a cutoff", () => {
@@ -2785,6 +2930,26 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
     generation: 2,
     dispatchId: "test-dispatch:gc12-generation-2",
   };
+  const gc12IndependentTarget: DispatchIdentity = {
+    residentId: a,
+    scopeId: "test-scope:gc12-independent",
+    scopeGeneration: 1,
+    windowId: "test-window:gc12-independent",
+    generation: 1,
+    dispatchId: "test-dispatch:gc12-independent-old",
+  };
+  const gc12IndependentRow = (
+    phase: MemberResultRecord["phase"],
+    sequence: number,
+    reasonCode: string | null = null,
+    target: DispatchIdentity = gc12IndependentTarget,
+  ): MemberResultRecord => ({
+    sequence,
+    operationId: "gc12-independent-old",
+    target,
+    phase,
+    reasonCode,
+  });
   const gc12ResultRow = (
     operationId: string,
     phase: MemberResultRecord["phase"],
@@ -2825,6 +2990,13 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
     ],
     postContinueOldTarget: gc12OldTarget,
     postContinueOldBodyInRoom: false,
+    independentFirstReturnResults: [
+      gc12IndependentRow("returned", 50),
+      gc12IndependentRow("rejected", 51, "ROOM_CONTROL_CUTOFF"),
+    ],
+    independentFirstReturnTarget: gc12IndependentTarget,
+    independentFirstReturnBodyInRoom: false,
+    independentNewPermitCommitted: true,
   });
 
   it("GC-12 requires a rejected cutoff record and one distinct field moved per forgery", () => {
@@ -3356,6 +3528,97 @@ describe("#206 review 3: evaluator pins identities and sequences, not just count
       ],
     };
     expect(evaluateGroupChatEvidence("GC-12", gc12Reversed).passed).toBe(false);
+  });
+
+  // #206 review 10: the independent world's first late return after continue, pinned — a
+  // memoized terminal rejection has no cache entry for this operation, so commit/leak,
+  // missing/extra rows, blank reasons, wrong identity and reversed order all go red.
+  it("GC-07/GC-12 pin the independent world's first late return after continue", () => {
+    expect(evaluateGroupChatEvidence("GC-07", gc07Base()).passed).toBe(true);
+    expect(evaluateGroupChatEvidence("GC-12", gc12Base()).passed).toBe(true);
+    const shapes: readonly (readonly MemberResultRecord[])[] = [
+      [],
+      [gc07IndependentRow("returned", 40)],
+      [gc07IndependentRow("returned", 40), gc07IndependentRow("committed", 41)],
+      [gc07IndependentRow("returned", 40), gc07IndependentRow("rejected", 41, "")],
+      [
+        gc07IndependentRow("returned", 40),
+        gc07IndependentRow("rejected", 41, "ROOM_CONTROL_CUTOFF"),
+        gc07IndependentRow("committed", 42),
+      ],
+      [
+        gc07IndependentRow("returned", 40),
+        gc07IndependentRow("rejected", 41, "ROOM_CONTROL_CUTOFF"),
+        gc07IndependentRow("rejected", 42, "ROOM_CONTROL_CUTOFF"),
+      ],
+      [
+        gc07IndependentRow("rejected", 40, "ROOM_CONTROL_CUTOFF"),
+        gc07IndependentRow("returned", 41),
+      ],
+      [
+        gc07IndependentRow("returned", 40),
+        gc07IndependentRow("rejected", 41, "ROOM_CONTROL_CUTOFF", {
+          ...gc07IndependentTarget,
+          dispatchId: "test-dispatch:other",
+        }),
+      ],
+    ];
+    for (const independentFirstReturnResults of shapes) {
+      const result = evaluateGroupChatEvidence("GC-07", {
+        ...gc07Base(),
+        independentFirstReturnResults,
+      });
+      expect(result.passed, JSON.stringify(independentFirstReturnResults)).toBe(false);
+    }
+    const gc07Committed = evaluateGroupChatEvidence("GC-07", {
+      ...gc07Base(),
+      independentFirstReturnResults: [
+        gc07IndependentRow("returned", 40),
+        gc07IndependentRow("committed", 41),
+      ],
+    });
+    expect(gc07Committed.passed).toBe(false);
+    expect(gc07Committed.detail).toContain("仍被提交");
+    expect(
+      evaluateGroupChatEvidence("GC-07", { ...gc07Base(), independentFirstReturnBodyInRoom: true })
+        .passed,
+    ).toBe(false);
+    expect(
+      evaluateGroupChatEvidence("GC-07", { ...gc07Base(), independentNewPermitCommitted: false })
+        .passed,
+    ).toBe(false);
+    for (const shape of shapes) {
+      const independentFirstReturnResults = shape.map((row) => ({
+        ...row,
+        operationId: "gc12-independent-old",
+        target:
+          row.target.dispatchId === "test-dispatch:other"
+            ? { ...gc12IndependentTarget, dispatchId: "test-dispatch:other" }
+            : gc12IndependentTarget,
+      }));
+      const result = evaluateGroupChatEvidence("GC-12", {
+        ...gc12Base(),
+        independentFirstReturnResults,
+      });
+      expect(result.passed, JSON.stringify(independentFirstReturnResults)).toBe(false);
+    }
+    const gc12Committed = evaluateGroupChatEvidence("GC-12", {
+      ...gc12Base(),
+      independentFirstReturnResults: [
+        gc12IndependentRow("returned", 50),
+        gc12IndependentRow("committed", 51),
+      ],
+    });
+    expect(gc12Committed.passed).toBe(false);
+    expect(gc12Committed.detail).toContain("复活");
+    expect(
+      evaluateGroupChatEvidence("GC-12", { ...gc12Base(), independentFirstReturnBodyInRoom: true })
+        .passed,
+    ).toBe(false);
+    expect(
+      evaluateGroupChatEvidence("GC-12", { ...gc12Base(), independentNewPermitCommitted: false })
+        .passed,
+    ).toBe(false);
   });
 });
 
