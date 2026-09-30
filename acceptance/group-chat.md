@@ -2,8 +2,8 @@
 
 对应 [#157](https://github.com/mist-agent-harness/mist-agent/issues/157) 和
 [设计图](../docs/design/group-chat-phase-0.md)。全部未勾选：这是未实现的语义规格。
-PR1 已接入可复跑判卷器：`npm run acceptance:group-chat`；严格模式为
-`npm run acceptance:group-chat:strict`。在真实宿主 adapter 尚不存在时，七灯报告
+PR1 与 #192 第一笔 stacked 红灯已接入同一个可复跑判卷器：`npm run acceptance:group-chat`；
+严格模式为 `npm run acceptance:group-chat:strict`。在真实宿主 adapter 尚不存在时，十三灯报告
 `real-host driver missing` 红灯；这只证明验收入口和基线，不代表宿主行为已运行或失败。
 
 PR1 冻结 GC-01～05、GC-09、GC-15 的合成场景与证据判据，不实现群聊写口，也不使用
@@ -19,7 +19,40 @@ GC-05、GC-09、GC-15 均因 `real-host driver missing` 报预期红，真实宿
 只是判卷器自检，既不算宿主正向对照，也不点亮任何 GC 灯。首个群聊写口 PR 仍须补真实
 宿主 adapter，并通过授权正向和拒绝负例；GC-03/GC-09 的完整账本/投递结论继续留后。
 
-## PR1 判卷边界（2026-09-27 按 #202 初审修订，09-28 按第二、三轮复审及批准意见再修订）
+## #192 第一笔 stacked 红测（2026-09-27 初稿，2026-09-28 重基到 #202 合入后的 main）
+
+本笔 stack 在 main `9f8e3b326424f062d92e53337a721e7fbbdea866`（#202 已合入）之上；
+只扩写同一组 driver/judge 文件，不建立第二套 runner、房间账或生产 adapter。
+#191 的房间原账、成员注册表和结构化 mention 合入前，只冻结 API-agnostic 行为 oracle；
+`src/group-chat-acceptance-driver.ts` 及所有真实宿主正向证据仍须等待 #191 的实际接口。
+
+新增 GC-06、GC-07、GC-08、GC-10、GC-12、GC-16 六灯。报告模式退出码为 0，十三灯均因
+`real-host driver missing` 报预期红，真实宿主通过 `0/13`；strict 模式退出非 0。没有导出
+`STUBBED`，也没有修改下表的冻结输入、层级、通过判据或灯位。
+
+合成 judge 自测只证明判卷可证伪，不算宿主正向对照：
+
+- GC-06 A-D：B=1/B=3 同根有界；pass/失败/重试/身份与自报根不续杯；新进程同 commit
+  续高水位；人类新触发与非法配置边界。
+- GC-07 A-D：先读回非空普通队列与真实 held permit，再测独立 stop；伪造/越权控制无效；
+  accepted/effective 分离且不撤销既有副作用；continue 不死锁也不复活旧许可。
+- GC-08 A-D：batch/未纳入/stop/派发失败四类决定；离线 feedback 必须待取并带真实 delivery
+  receipt；零原文与跨私域泄漏；决定落盘失败不消费许可、恢复不双计数。
+- GC-10 A-D：batch 与 latest 缺口、水位和策略显式；单条截断元数据进入模型可见上下文；
+  隐藏三世界不泄漏；source ref 每次重验授权，撤权后旧引用失效。
+- GC-12 A-D：旧 roster 不续权；旧 generation 结果必须实际注入后被拒；stop cutoff 后旧许可
+  实返实拒、continue 只开新许可；六字段 target 逐字段伪造均拒并保留当前身份正对照。
+- GC-16 A-D：持续失败不饿死 B/人类/控制；真实 in-flight wedge 经 controlled scheduler 截止，
+  同步快抛错不能冒充；retry 有界且 partial restart 不洗 failure/high-water；反馈与回执不假在场。
+
+所有 command 入参与 host readback 继续在 driver 边界统一 `structuredClone`。时间只由 controlled
+scheduler 推进，不用 sleep；重启必须返回新 PID、同 checkout commit，并再次通过 runner 的
+provenance 核验。重启 provenance 失败与启动/停机核验同级：抛 `HostProvenanceError` 一路到
+runner 边界，十三灯全部按坏 adapter 判红、report 与 strict 都非零退出——不降级成当前一盏灯的
+scenario error。故障注入只触发 ledger append/member transport 失败，被验宿主仍负责身份、
+权限、编排、提交与耐久回读。
+
+## PR1 判卷边界（2026-09-27 按 #202 初审修订，09-28 按第二、三轮复审、批准意见及 #206 复审再修订）
 
 - 宿主来源：`kind: "mist-host"` 只是类型标签。跑灯前判卷自己读进程事实（Linux 读 `/proc`，
   其他 POSIX 用 `ps`）：`startHost()` 报的进程活着、是本次判卷进程的后代、跑的是判卷同一个
@@ -30,6 +63,61 @@ GC-05、GC-09、GC-15 均因 `real-host driver missing` 报预期红，真实宿
   留着 todo）。桩灯沿用仓内 `STUBBED` 惯例：申报的方法所在灯记黄，不计真绿。
 - GC-02：四个越界负例（缺公开声明、缺房间、缺绑定、夹带私有字段）都由同一发送方住户 A 提交，
   每条只缺或多一项。人类入口是否也须显式声明公开，设计图没有单列，PR1 不判。
+- 可信 owner binding 分层（#206 复审）：`groupChatSyntheticFixture.trustedOwnerBinding` 是判卷
+  持有的 setup grant，只经 `resetScenario(id, fixture)` 登记给宿主；`perform()` 命令里的
+  `binding` 字段永远是不可信请求输入，宿主只拿它与当轮已登记的 grant 比对。同一个字符串只
+  塞进命令、没有 setup grant 时不得写入；判卷自己发出的合法绑定一律从夹具读取，不在判卷或
+  宿主源码里硬编码自授权。回归探针证明：未 reset 时同串命令写入为零，正常 reset 后可写，
+  错误/空串仍拒。控制通道的 `submit-control` 绑定是另一条缝，本次不动。
+- #206 review 3（09-29）六灯假绿收紧：GC-06 自报新根须恰好一条带稳定非空原因码的 blocked
+  记录；GC-07 三条伪造控制逐条核宿主控制账，全 rejected 且无 cutoff，静默丢弃也算红；GC-08
+  四种受压决定以判卷 stimuli 为真源按 operationId 绑定期望 state，反馈按 operationId 恰一条
+  且原因码与决定对齐；GC-10 每种投影模式的纳入/省略按本轮判卷授权 event id 对账——纳入非空、
+  互不重叠、并集为授权全集、latest 必含最新授权事件、truncated 恰一条且被截断事件在纳入集合里；
+  GC-12 cutoff 旧许可结果须明确 rejected 带可归属原因，六个伪造目标各只改一个不同身份字段、
+  六字段恰全覆盖一次；GC-16 故障成员尝试序号从 1 起、唯一、连续且不超过配置 maxMemberAttempts，
+  单条 attempt=999 也算红。
+- #206 review 4（09-29）重复账封口：GC-10 全集对账改为纳入/省略各自无重复且合并后与授权全集
+  多重集精确相等（included=[1,1]+omitted=[2,3] 这类漏项必须红）；GC-12 六字段差异改从宿主
+  returned 账回读逐条计算，不再信判卷发出的刺激清单（宿主把六条全洗成同一变异必须红）；
+  GC-07 每条伪造控制要求恰好一条 rejected 且无 cutoff，重复账也红。
+- #206 review 5（09-29）六条新假绿收口：GC-01 合法/伪造事件的接受判定改为按出现次数计，
+  matchingEvent 的「多条 ⇒ null」不再能把双份伪造 envelope 洗绿，伪造正文副本也计入原账作者
+  多重集；GC-06 有限回合按 operationId 逐条对账且按宿主账序先放行 B 次再截住一次（对调、先截
+  后放、缺/重复/多出均红），换代刺激须恰好一条带稳定非空原因码的 blocked（human-trigger /
+  passed / failed / retry-replayed / 缺 / 重复均红）；GC-07 不可达控制须恰好一条 incomplete，
+  不得同时出现 accepted/effective/cutoff；GC-09 住户本人 reaction 前的收据快照里任何非系统
+  署名即红（代签），所有非系统收据同样过个人状态阶段与声称两把尺；GC-10 截断元数据绑定判卷
+  真值（事件须为判卷种下的 gc10-event-3、原长精确等于种下正文实长、保留范围正值且不超过请求
+  上限），投影上下文按转义值加字段种类边界精确匹配（空白/JSON 标点/key=value/括号都是合法
+  边界），includes("25") 不再被 "125" 洗过。review 6/7 补充：边界按字段种类定——sourceRef 拒绝
+  同 token 字符延续，数值与范围拒绝 [A-Za-z0-9_-] 延续（保留 : 作 JSON/key 分隔），单位拒绝
+  标识符字符延续，但不强制空白协议。
+- #206 review 8（09-29）三灯再收紧：GC-07/GC-12 各补一条独立路径——held 旧许可 → 合法 stop →
+  合法 continue → 用原身份六元组第一次迟返旧结果，判卷证明真实 returned、恰好一条带稳定非空
+  原因码的 rejected、无 committed、旧正文不入房间原账，新许可随后照常提交（宿主在 continue 时
+  清掉 cutoff 状态必须红）；GC-10 授权回源正文与判卷种下的完整长正文精确相等（截短/中间改写
+  均红，不再只认 marker 前缀）；GC-08 expectedByOperation 加判卷 senderId，每个 operation 的
+  唯一决定与唯一已交付反馈都必须同判卷发送方对得上（决定或反馈记成别人均红）。review 9
+  补充：continue 后 returned/rejected 两行的身份六元组与判卷原 target 精确对账（按字段比较，
+  不认键序），且 returned 必须先于 rejected 入账；洗 dispatchId 或颠倒顺序均红。review 10
+  补充：GC-07/GC-12 的首次迟返刺激独立成世界——旧许可在 stop/continue 之前从未送回（reset
+  后重建），continue 后原六元组第一次迟返才接受判卷（恰一 returned、恰一带原因 rejected、零
+  committed、正文不入账、新许可照常提交，证据与 stop 期间已返回过的 operation 不混账）。合成
+  宿主按 operation+六元组对终态拒绝做 memoization（普通生命周期正对照，不按灯号或夹具特判）：
+  诚实 memoized host 绿；同一宿主仅清 cutoff 必须在两灯都红，并由首次迟返的 committed/旧正文
+  归因，缓存不得洗绿。review 10 二轮补充：独立世界的证据须含该 world 自身的 stop/continue
+  宿主控制账全量行——stop 与 continue 各恰一 accepted + 恰一 effective、accepted 先于
+  effective、stop.effective 先于 continue.effective，无 rejected/incomplete/伪形；首次迟返
+  账目只取 sequence 大于该 continue-effective 的行，helper 再要求 continue.effective <
+  returned < rejected，pre-continue 行不得充数（continue 缺记录、accepted-only、
+  effective-before-accepted、returned 早于/等于 continue-effective 均红；只抹 effective
+  记录的单变异在两灯都红且归因独立控制账，不靠 commit 抢先）。review 10 三轮补充：控制对还须
+  绑判卷身份——evidence 带 judge-owned independentControlTruth（stop/continue controlId、
+  共同 issuerId/targetId），每行精确匹配各自 controlId 与共同 issuer/target/action（洗
+  controlId/targetId/issuerId 均红；状态真实生效、results 诚实、只洗账上 targetId 的单变异由
+  control identity 判红）。cutoffId 只按 driver 契约 string|null 处理，不另立语义——三轮初版
+  误钉的「同对共享非空 cutoffId / 跨对不得共用」判据缺冻结协议依据，已按澈的修正撤回。
 - GC-03：投递状态由判卷设置，本灯只核三行投递账按成员分开读回、原账不变、A 显式保存指回
   原事件。谁真的装入或排队（投递语义）留到投递账实现阶段，不能凭本灯视为已覆盖。
 - GC-04：两个世界各加一位不同的新成员，都要贯通五条路径；另静态扫描 `src/` 的非测试文件，
@@ -49,6 +137,9 @@ GC-05、GC-09、GC-15 均因 `real-host driver missing` 报预期红，真实宿
   不发送」之类）；其余说法还认同一子句里更早出现的「不代表 / 不等于 / 不证明」，但「不是未读是
   已读」这种纠正句不算否认；紧贴在前的「待 / 将 / 会」说的是还没发生的事。冒号也分子句（「系统：
   已读」照样拦）。系统自己读配置、看到投递失败，不算替成员声称已读，「已读」「已阅」本身除外。
+  夹具成员 id（`test-resident:<id>`、`test-human:owner`）里的冒号是身份的一部分：切子句时护住不切，
+  且这些 id 永远算成员主语——「test-resident:a 已读完配置」照样拦；非夹具的冒号字符串不泛化，
+  照旧切开看残余子句。GC-08 的发送方反馈正文与 GC-16 的系统收据声称也过同一把文字尺。
   判卷不解析整句语义，与上文「不判模型措辞」一致。
 - GC-15：三个世界——隐藏房间内容不同的两个，加一个没有隐藏房间的；未授权方看到的正文、候选、
   计数、错误和回执须三个世界一致。另由住户 B 以房间成员资格读住户 A 的内部 scope，须被拒，

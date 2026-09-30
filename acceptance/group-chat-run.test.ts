@@ -17,19 +17,32 @@ import {
   type AccessAudit,
   type CallReceipt,
   type ContextCommit,
+  type ControlRecord,
+  type DeliveryDecisionRecord,
   type DeliveryRecord,
+  type DispatchIdentity,
   GROUP_CHAT_CHECK_IDS,
   type GroupChatCheckId,
   type GroupChatCommand,
+  type GroupChatEvidenceById,
   type GroupChatHostDriver,
+  type MemberAttemptRecord,
+  type MemberBehavior,
+  type MemberResultRecord,
   type MemoryRecord,
   type MentionDecision,
+  type PressureMode,
+  type ProjectionReceipt,
   type ResidentId,
   type ResidentReaction,
   type RoomEvent,
   type RosterPath,
   type RosterProjection,
   type RosterSnapshot,
+  type RoundRecord,
+  type SchedulerSnapshot,
+  type SenderFeedbackRecord,
+  type SourceReadAudit,
   type SurfaceSnapshot,
   type SystemReceipt,
   cloneGroupChatDriverBoundary,
@@ -38,12 +51,14 @@ import {
 import {
   type HostProcessInfo,
   type HostProvenanceFacts,
+  executeGroupChatAcceptance,
   findSourceLiterals,
   hostProvenanceProblem,
   hostStopProblem,
   isRepoEntryFile,
   provenanceFailedResults,
   readProcessInfo,
+  restartedHostProvenanceProblem,
   missingDriverResults as runnerMissingDriverResults,
   scoreGroupChatResults,
 } from "./group-chat-run.ts";
@@ -88,6 +103,10 @@ interface TestOptions {
   readonly omitPlainDecisions?: boolean;
   readonly holdGatedMentions?: boolean;
   readonly acceptUnknownTargetWithoutCall?: boolean;
+  /** #206 review 1: sender feedback free text carries a resident id claiming a personal state. */
+  readonly feedbackClaimsMemberRead?: boolean;
+  /** #206 review 1: a failure receipt carries a canonical resident id claiming a personal state. */
+  readonly failureReceiptClaimsMemberRead?: boolean;
   /** #202 second-review probes: calls the decisions do not account for. */
   readonly plainCallOffDecision?: boolean;
   readonly orphanCalls?: boolean;
@@ -103,6 +122,107 @@ interface TestOptions {
   readonly newcomerSeesPreJoinIds?: boolean;
   readonly newcomerMissesPostJoin?: boolean;
   readonly duplicatePositions?: boolean;
+  readonly ignoreTurnBudget?: boolean;
+  readonly duplicateRetry?: boolean;
+  readonly omitPassRecord?: boolean;
+  readonly omitFailureRecord?: boolean;
+  readonly resetBudgetOnIdentityChange?: boolean;
+  readonly omitRoundTarget?: boolean;
+  readonly acceptSelfDeclaredRoot?: boolean;
+  readonly resetRoundOnRestart?: boolean;
+  readonly reuseRestartPid?: boolean;
+  readonly changeRestartCommit?: boolean;
+  readonly dispatchWithInvalidPolicy?: boolean;
+  readonly emptyOrdinaryQueue?: boolean;
+  readonly controlSharesOrdinaryQueue?: boolean;
+  readonly acceptFalseControl?: boolean;
+  readonly mergeControlReceipts?: boolean;
+  readonly reportUnreachableEffective?: boolean;
+  readonly claimExternalEffectReversed?: boolean;
+  readonly continueDeadlocks?: boolean;
+  readonly acceptPreCutoffResult?: boolean;
+  readonly markOfflineFeedbackDelivered?: boolean;
+  readonly feedbackNoteOnly?: boolean;
+  readonly leakBlockedBody?: boolean;
+  readonly crossDeliverFeedback?: boolean;
+  readonly unstableReasonAfterRestart?: boolean;
+  readonly consumeOnDecisionPersistFailure?: boolean;
+  readonly duplicateDecisionOnRetry?: boolean;
+  readonly omitProjectionGaps?: boolean;
+  readonly truncationMetadataNotModelVisible?: boolean;
+  readonly leakHiddenProjection?: boolean;
+  readonly allowRevokedSourceRead?: boolean;
+  readonly wrongSourceRead?: boolean;
+  readonly useStaleRoster?: boolean;
+  readonly skipReturnedResultRecord?: boolean;
+  readonly acceptStaleTarget?: boolean;
+  readonly acceptForgedTarget?: boolean;
+  readonly starveOtherMembers?: boolean;
+  readonly synchronousHoldFailure?: boolean;
+  readonly neverTimeoutHeld?: boolean;
+  readonly unboundedMemberRetries?: boolean;
+  readonly washFailuresOnRestart?: boolean;
+  readonly dropFailureFeedback?: boolean;
+  readonly falseFailurePresenceReceipt?: boolean;
+  /** #206 review 3: the host keeps no record at all for the self-declared-root stimulus. */
+  readonly omitSelfRootRecord?: boolean;
+  /** #206 review 3: forged controls are silently dropped without an explicit rejected record. */
+  readonly omitFalseControlRecords?: boolean;
+  /** #206 review 3: two pressured decision states are swapped between their operations. */
+  readonly permuteDeliveryStates?: boolean;
+  /** #206 review 3: every projection mode includes nothing, omitting the whole authorized set. */
+  readonly omitAllProjected?: boolean;
+  /** #206 review 3: the cutoff-stopped late result is dropped without a rejected record. */
+  readonly omitStoppedResultRejection?: boolean;
+  /** #206 review 3: the first failing attempt is numbered far beyond the configured bound. */
+  readonly forgeAttemptOutOfBound?: boolean;
+  /** #206 review 4: every forged control's rejected record is written twice. */
+  readonly duplicateFalseControlRecord?: boolean;
+  /** #206 review 4: the batch projection repeats one authorized id while dropping another. */
+  readonly duplicateProjectedId?: boolean;
+  /** #206 review 4: every returned gc12-tuple target is washed into the same residentId variant. */
+  readonly washForgedTupleTargets?: boolean;
+  /** #206 review 5: a receipt signed by a resident (seen/已读/记住) appears at record time. */
+  readonly proxySignedReceiptAtRecord?: boolean;
+  /** #206 review 5: an unreachable control reports an extra effective row next to incomplete. */
+  readonly unreachableAlsoEffective?: boolean;
+  /** #206 review 5: the generation-change stimulus is washed into a zero-cost human trigger. */
+  readonly identityChangeAsHumanTrigger?: boolean;
+  /** #206 review 5: the B=1 world's turn-1/turn-2 records carry each other's operationId. */
+  readonly swapBoundedTurnRecords?: boolean;
+  /** #206 review 5: truncation originalLength is forged to kept+1 and the context synced. */
+  readonly forgeTruncationMetadata?: boolean;
+  /** #206 review 5: the forged envelope is recorded twice, defeating unique-match readbacks. */
+  readonly duplicateForgedEnvelope?: boolean;
+  /** #206 review 8: continue wipes the cutoff state, reviving pre-stop permits afterwards. */
+  readonly clearCutoffOnContinue?: boolean;
+  /** #206 review 8: the granted source read returns only the truncated prefix of the body. */
+  readonly truncateSourceReadBody?: boolean;
+  /** #206 review 8: GC-08 delivery decisions are recorded under the other resident's id. */
+  readonly misattributeDecisionSender?: boolean;
+  /** #206 review 8: GC-08 sender feedback is recorded under the other resident's id. */
+  readonly misattributeFeedbackSender?: boolean;
+  /** #206 review 9: post-continue cutoff rows carry a washed dispatchId on the ledger. */
+  readonly washPostContinueTarget?: boolean;
+  /** #206 review 10: the independent world's continue takes effect without an effective record. */
+  readonly omitIndependentContinueEffective?: boolean;
+  /** #206 review 10 round 3: independent stop/continue ledger rows carry a washed targetId. */
+  readonly washIndependentControlIdentity?: boolean;
+}
+
+interface SyntheticSubmission {
+  readonly operationId: string;
+  readonly rootId: string;
+  readonly residentId: ResidentId;
+  readonly body: string;
+  readonly target: DispatchIdentity | null;
+  persistFailed: boolean;
+}
+
+interface ProjectionSource {
+  readonly eventId: string;
+  readonly body: string;
+  readonly authorized: boolean;
 }
 
 /** Test-only host model; production runner never imports this adapter. */
@@ -131,17 +251,91 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   private gateTurnOpen = true;
   private crossResidentPrivateReads = 0;
   private unauthorizedReadResults: string[] = [];
+  private hostPid = 12345;
+  private hostCommit = "synthetic-test-only";
+  private scenarioId: GroupChatCheckId = "GC-01";
+  /** The owner binding is trusted only after resetScenario registers the judge-owned setup grant. */
+  private trustedOwnerBinding: string | null = null;
+  private sequence = 0;
+  private roundRecords: RoundRecord[] = [];
+  private policy: {
+    rootId: string;
+    policyVersion: string;
+    turnBudget: number | null;
+    deadlineTicks: number;
+    maxMemberAttempts: number;
+  } | null = null;
+  private knownRoots = new Set<string>();
+  private consumedByRoot = new Map<string, number>();
+  private submissions = new Map<string, SyntheticSubmission>();
+  private memberBehaviors = new Map<ResidentId, MemberBehavior>();
+  private pressure = new Map<ResidentId, PressureMode>();
+  private schedulerTick = 0;
+  private ordinaryQueueDepth = 0;
+  private held = new Map<
+    string,
+    SyntheticSubmission & { readonly startedAt: number; readonly issuedControlSequence: number }
+  >();
+  private stopped = new Set<ResidentId>();
+  private controlRecords: ControlRecord[] = [];
+  private lastStopSequence = new Map<ResidentId, number>();
+  private externalEffects = new Set<ResidentId>();
+  private deliveryDecisions: DeliveryDecisionRecord[] = [];
+  private feedback: SenderFeedbackRecord[] = [];
+  private senderOnline = new Map<ResidentId, boolean>();
+  private nextDecisionPersistFault = false;
+  private nextDispatchFaultFor: ResidentId | null = null;
+  private projectionSources: ProjectionSource[] = [];
+  private projectionReceipts: ProjectionReceipt[] = [];
+  private projectionContexts = new Map<ResidentId, string[]>();
+  private sourceReads: SourceReadAudit[] = [];
+  private roomAccess = new Map<ResidentId, boolean>();
+  private roomMembers = new Set<ResidentId>([fixture.residentIds.a, fixture.residentIds.b]);
+  private currentTarget: DispatchIdentity | null = null;
+  private attempts: MemberAttemptRecord[] = [];
+  private results: MemberResultRecord[] = [];
+  /**
+   * Terminal rejections are durable: keyed by operation + full identity tuple (never by lamp
+   * or fixture), the recorded reason is replayed on every later return of the same result
+   * instead of being re-evaluated — a rejected result can never be committed afterwards.
+   */
+  private terminalRejections = new Map<string, string>();
 
   constructor(options: TestOptions = {}) {
     this.options = options;
   }
 
   async startHost() {
-    return { pid: 12345, commit: "synthetic-test-only" };
+    return { pid: this.hostPid, commit: this.hostCommit };
+  }
+  async restartHost() {
+    if (!this.options.reuseRestartPid) this.hostPid += 1;
+    if (this.options.changeRestartCommit) this.hostCommit = "synthetic-test-changed";
+    if (this.options.resetRoundOnRestart) this.consumedByRoot.clear();
+    if (this.options.washFailuresOnRestart) {
+      this.attempts = this.attempts.filter((row) => row.outcome === "completed");
+      this.roundRecords = this.roundRecords.filter((row) => row.decision !== "failed");
+      this.feedback = [];
+    }
+    if (this.options.unstableReasonAfterRestart) {
+      this.deliveryDecisions = this.deliveryDecisions.map((row) => ({
+        ...row,
+        reasonCode: `${row.reasonCode}:changed`,
+      }));
+      this.feedback = this.feedback.map((row) => ({
+        ...row,
+        reasonCode: `${row.reasonCode}:changed`,
+      }));
+    }
+    return { pid: this.hostPid, commit: this.hostCommit };
   }
   async stopHost(): Promise<void> {}
 
-  async resetScenario(_id: GroupChatCheckId): Promise<void> {
+  async resetScenario(id: GroupChatCheckId, setup: typeof fixture): Promise<void> {
+    this.scenarioId = id;
+    // Setup grant: the only moment the owner binding becomes trusted. A perform() command
+    // carrying the same string is still untrusted request input and proves nothing alone.
+    this.trustedOwnerBinding = setup.trustedOwnerBinding;
     this.events = [];
     this.eventTime.clear();
     this.roomCounters.clear();
@@ -170,6 +364,36 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
     this.gateTurnOpen = true;
     this.crossResidentPrivateReads = 0;
     this.unauthorizedReadResults = [];
+    this.sequence = 0;
+    this.roundRecords = [];
+    this.policy = null;
+    this.knownRoots.clear();
+    this.consumedByRoot.clear();
+    this.submissions.clear();
+    this.memberBehaviors.clear();
+    this.pressure.clear();
+    this.schedulerTick = 0;
+    this.ordinaryQueueDepth = 0;
+    this.held.clear();
+    this.stopped.clear();
+    this.controlRecords = [];
+    this.lastStopSequence.clear();
+    this.externalEffects.clear();
+    this.deliveryDecisions = [];
+    this.feedback = [];
+    this.senderOnline.clear();
+    this.nextDecisionPersistFault = false;
+    this.nextDispatchFaultFor = null;
+    this.projectionSources = [];
+    this.projectionReceipts = [];
+    this.projectionContexts.clear();
+    this.sourceReads = [];
+    this.roomAccess.clear();
+    this.roomMembers = new Set([fixture.residentIds.a, fixture.residentIds.b]);
+    this.currentTarget = null;
+    this.attempts = [];
+    this.results = [];
+    this.terminalRejections.clear();
   }
 
   /** Per-room event ids: a global counter would itself reveal hidden-room traffic (GC-15). */
@@ -195,21 +419,419 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
       this.decisions.push({ ...recorded });
   }
 
+  private nextSequence(): number {
+    this.sequence += 1;
+    return this.sequence;
+  }
+
+  private consumed(rootId: string): number {
+    return this.consumedByRoot.get(rootId) ?? 0;
+  }
+
+  private appendRound(
+    input: Omit<RoundRecord, "sequence" | "consumedTurns" | "policyVersion" | "target"> & {
+      readonly target?: DispatchIdentity | null;
+    },
+  ): void {
+    // Review probe: the B=1 bounded world mislabels turn-1/turn-2 records with each other's
+    // operationId — a count-only judge stays green, an operationId-pinned judge goes red.
+    const operationId =
+      this.options.swapBoundedTurnRecords && this.scenarioId === "GC-06"
+        ? input.operationId === "gc06-B1-turn-1"
+          ? "gc06-B1-turn-2"
+          : input.operationId === "gc06-B1-turn-2"
+            ? "gc06-B1-turn-1"
+            : input.operationId
+        : input.operationId;
+    this.roundRecords.push({
+      sequence: this.nextSequence(),
+      consumedTurns: this.consumed(input.rootId),
+      policyVersion: this.policy?.policyVersion ?? null,
+      ...input,
+      operationId,
+      target: this.options.omitRoundTarget ? null : (input.target ?? null),
+    });
+  }
+
+  private sameTarget(left: DispatchIdentity | null, right: DispatchIdentity | null): boolean {
+    return JSON.stringify(left) === JSON.stringify(right);
+  }
+
+  private appendDecision(
+    input: Omit<DeliveryDecisionRecord, "sequence" | "count" | "rosterVersion">,
+  ): void {
+    const count =
+      this.deliveryDecisions.filter(
+        (row) => row.operationId === input.operationId && row.state !== "persist-failed",
+      ).length + (input.state === "persist-failed" ? 0 : 1);
+    this.deliveryDecisions.push({
+      sequence: this.nextSequence(),
+      count,
+      rosterVersion: this.rosterVersion,
+      ...input,
+      // Review probe: a decision recorded under another resident's id must fail sender binding.
+      senderId:
+        this.options.misattributeDecisionSender && this.scenarioId === "GC-08"
+          ? fixture.residentIds.b
+          : input.senderId,
+    });
+  }
+
+  private appendFeedback(submission: SyntheticSubmission, reasonCode: string, count = 1): void {
+    if (this.options.dropFailureFeedback && this.scenarioId === "GC-16") return;
+    const online = this.senderOnline.get(submission.residentId) ?? true;
+    this.feedback.push({
+      operationId: submission.operationId,
+      // Review probe: feedback recorded under another resident's id must fail sender binding.
+      senderId:
+        this.options.misattributeFeedbackSender && this.scenarioId === "GC-08"
+          ? fixture.residentIds.b
+          : submission.residentId,
+      roomId: fixture.roomId,
+      scopeId: submission.target?.scopeId ?? "test-scope:room",
+      reasonCode,
+      count,
+      phase: online || this.options.markOfflineFeedbackDelivered ? "delivered" : "pending",
+      deliveryReceipt:
+        online || this.options.markOfflineFeedbackDelivered
+          ? `feedback-receipt:${submission.operationId}`
+          : null,
+      body: this.options.leakBlockedBody
+        ? submission.body
+        : this.options.feedbackClaimsMemberRead
+          ? `${submission.residentId} 已读完配置`
+          : null,
+    });
+  }
+
+  private appendAttempt(
+    operationId: string,
+    memberId: ResidentId,
+    outcome: MemberAttemptRecord["outcome"],
+    reasonCode: string | null,
+  ): void {
+    // Review probe: a single attempt numbered far past the configured bound must still go red.
+    const attempt =
+      this.options.forgeAttemptOutOfBound &&
+      outcome === "failed" &&
+      !this.attempts.some((row) => row.operationId === operationId && row.memberId === memberId)
+        ? 999
+        : this.attempts.filter(
+            (row) => row.operationId === operationId && row.memberId === memberId,
+          ).length + 1;
+    this.attempts.push({
+      sequence: this.nextSequence(),
+      operationId,
+      memberId,
+      attempt,
+      outcome,
+      reasonCode,
+    });
+  }
+
+  private decisionForPressure(submission: SyntheticSubmission, mode: PressureMode): void {
+    let state: DeliveryDecisionRecord["state"] =
+      mode === "batch"
+        ? "batched"
+        : mode === "not-included"
+          ? "not-included"
+          : mode === "stopped"
+            ? "stop-blocked"
+            : "queued";
+    // Review probe: states swapped between operations — the judge must pin state to operationId.
+    if (this.options.permuteDeliveryStates) {
+      if (state === "batched") state = "not-included";
+      else if (state === "not-included") state = "batched";
+    }
+    const reasonCode =
+      mode === "batch"
+        ? "ROOM_BATCHED"
+        : mode === "not-included"
+          ? "ROOM_NOT_INCLUDED"
+          : mode === "stopped"
+            ? "ROOM_STOPPED"
+            : "ROOM_COOLING";
+    this.appendDecision({
+      operationId: submission.operationId,
+      senderId: submission.residentId,
+      state,
+      reasonCode,
+      permitConsumed: mode !== "cooling",
+      target: submission.target,
+    });
+    if (mode !== "cooling") this.appendFeedback(submission, reasonCode);
+  }
+
+  private processMemberTurn(submission: SyntheticSubmission, claimedRootId?: string): void {
+    if (
+      this.options.identityChangeAsHumanTrigger &&
+      submission.operationId === "gc06-identity-change"
+    ) {
+      // Review probe: the generation-change stimulus washed into a zero-cost human trigger —
+      // the judge must require exactly one reasoned blocked record from the host's own ledger.
+      this.roundRecords.push({
+        sequence: this.nextSequence(),
+        operationId: submission.operationId,
+        rootId: submission.rootId,
+        senderId: fixture.humanId,
+        policyVersion: this.policy?.policyVersion ?? null,
+        decision: "human-trigger",
+        consumedTurns: 0,
+        reasonCode: null,
+        target: submission.target,
+      });
+      return;
+    }
+    const policyValid =
+      this.policy !== null &&
+      Number.isSafeInteger(this.policy.turnBudget) &&
+      (this.policy.turnBudget ?? 0) > 0;
+    if (!policyValid && !this.options.dispatchWithInvalidPolicy) {
+      this.appendRound({
+        operationId: submission.operationId,
+        rootId: submission.rootId,
+        senderId: submission.residentId,
+        decision: "blocked",
+        reasonCode: "ROOM_POLICY_INVALID",
+        target: submission.target,
+      });
+      return;
+    }
+    if (
+      claimedRootId !== undefined &&
+      claimedRootId !== submission.rootId &&
+      !this.options.acceptSelfDeclaredRoot
+    ) {
+      this.appendRound({
+        operationId: submission.operationId,
+        rootId: submission.rootId,
+        senderId: submission.residentId,
+        decision: "blocked",
+        reasonCode: "ROOM_ROOT_FORGED",
+        target: submission.target,
+      });
+      return;
+    }
+    if (!this.knownRoots.has(submission.rootId) && !this.options.acceptSelfDeclaredRoot) {
+      this.appendRound({
+        operationId: submission.operationId,
+        rootId: submission.rootId,
+        senderId: submission.residentId,
+        decision: "blocked",
+        reasonCode: "ROOM_ROOT_UNKNOWN",
+        target: submission.target,
+      });
+      return;
+    }
+    const pressure = this.pressure.get(submission.residentId) ?? "normal";
+    if (this.nextDecisionPersistFault) {
+      this.nextDecisionPersistFault = false;
+      submission.persistFailed = true;
+      this.appendDecision({
+        operationId: submission.operationId,
+        senderId: submission.residentId,
+        state: "persist-failed",
+        reasonCode: "ROOM_DECISION_PERSIST_FAILED",
+        permitConsumed: this.options.consumeOnDecisionPersistFailure === true,
+        target: submission.target,
+      });
+      if (this.options.consumeOnDecisionPersistFailure) {
+        this.consumedByRoot.set(submission.rootId, this.consumed(submission.rootId) + 1);
+      }
+      return;
+    }
+    if (pressure !== "normal") {
+      this.decisionForPressure(submission, pressure);
+      return;
+    }
+    if (this.nextDispatchFaultFor === submission.residentId) {
+      this.nextDispatchFaultFor = null;
+      this.appendDecision({
+        operationId: submission.operationId,
+        senderId: submission.residentId,
+        state: "dispatch-failed",
+        reasonCode: "ROOM_DISPATCH_FAILED",
+        permitConsumed: true,
+        target: submission.target,
+      });
+      this.appendFeedback(submission, "ROOM_DISPATCH_FAILED");
+      this.appendAttempt(
+        submission.operationId,
+        submission.residentId,
+        "failed",
+        "ROOM_DISPATCH_FAILED",
+      );
+      return;
+    }
+    if (
+      this.options.resetBudgetOnIdentityChange &&
+      submission.operationId === "gc06-identity-change" &&
+      this.roundRecords.some(
+        (row) => row.senderId !== submission.residentId && row.senderId !== fixture.humanId,
+      )
+    ) {
+      this.consumedByRoot.set(submission.rootId, 0);
+    }
+    const budget = this.policy?.turnBudget ?? (this.options.dispatchWithInvalidPolicy ? 1 : 0);
+    if (!this.options.ignoreTurnBudget && this.consumed(submission.rootId) >= budget) {
+      this.appendRound({
+        operationId: submission.operationId,
+        rootId: submission.rootId,
+        senderId: submission.residentId,
+        decision: "blocked",
+        reasonCode: "ROOM_TURN_BUDGET_EXHAUSTED",
+        target: submission.target,
+      });
+      return;
+    }
+    if (this.stopped.has(submission.residentId)) {
+      this.appendRound({
+        operationId: submission.operationId,
+        rootId: submission.rootId,
+        senderId: submission.residentId,
+        decision: "blocked",
+        reasonCode: "ROOM_MEMBER_STOPPED",
+        target: submission.target,
+      });
+      return;
+    }
+    this.consumedByRoot.set(submission.rootId, this.consumed(submission.rootId) + 1);
+    const behavior = this.memberBehaviors.get(submission.residentId) ?? "complete";
+    if (behavior === "pass") {
+      if (!this.options.omitPassRecord)
+        this.appendRound({
+          operationId: submission.operationId,
+          rootId: submission.rootId,
+          senderId: submission.residentId,
+          decision: "passed",
+          reasonCode: null,
+          target: submission.target,
+        });
+      return;
+    }
+    if (behavior === "fail") {
+      if (!this.options.omitFailureRecord)
+        this.appendRound({
+          operationId: submission.operationId,
+          rootId: submission.rootId,
+          senderId: submission.residentId,
+          decision: "failed",
+          reasonCode: "ROOM_MEMBER_FAILED",
+          target: submission.target,
+        });
+      this.appendAttempt(
+        submission.operationId,
+        submission.residentId,
+        "failed",
+        "ROOM_MEMBER_FAILED",
+      );
+      this.appendDecision({
+        operationId: submission.operationId,
+        senderId: submission.residentId,
+        state: "dispatch-failed",
+        reasonCode: "ROOM_MEMBER_FAILED",
+        permitConsumed: true,
+        target: submission.target,
+      });
+      this.appendFeedback(submission, "ROOM_MEMBER_FAILED");
+      if (this.options.falseFailurePresenceReceipt)
+        this.receipts.push({ actor: "system", phase: "seen", claim: "成员已读且讨论有产出" });
+      if (this.options.failureReceiptClaimsMemberRead)
+        this.receipts.push({
+          actor: "system",
+          phase: "failed",
+          // 记忆类声称：旧的 falsePresence 正则不管记忆，只有共享判卷能拦。
+          claim: `${submission.residentId} 已写入记忆`,
+        });
+      return;
+    }
+    if (behavior === "hold") {
+      if (this.options.synchronousHoldFailure) {
+        this.appendRound({
+          operationId: submission.operationId,
+          rootId: submission.rootId,
+          senderId: submission.residentId,
+          decision: "failed",
+          reasonCode: "SYNCHRONOUS_THROW",
+          target: submission.target,
+        });
+        this.appendAttempt(
+          submission.operationId,
+          submission.residentId,
+          "failed",
+          "SYNCHRONOUS_THROW",
+        );
+        return;
+      }
+      this.appendRound({
+        operationId: submission.operationId,
+        rootId: submission.rootId,
+        senderId: submission.residentId,
+        decision: "held",
+        reasonCode: null,
+        target: submission.target,
+      });
+      this.appendAttempt(submission.operationId, submission.residentId, "in-flight", null);
+      this.held.set(submission.operationId, {
+        ...submission,
+        startedAt: this.schedulerTick,
+        issuedControlSequence: this.sequence,
+      });
+      return;
+    }
+    if (
+      this.options.starveOtherMembers &&
+      submission.operationId === "gc16-normal-member" &&
+      submission.residentId === fixture.residentIds.b &&
+      this.attempts.some(
+        (row) => row.memberId === fixture.residentIds.a && row.outcome !== "completed",
+      )
+    )
+      return;
+    this.appendRound({
+      operationId: submission.operationId,
+      rootId: submission.rootId,
+      senderId: submission.residentId,
+      decision: "permitted",
+      reasonCode: null,
+      target: submission.target,
+    });
+    this.appendAttempt(submission.operationId, submission.residentId, "completed", null);
+    this.addEvent({
+      roomId: fixture.roomId,
+      authorId: submission.residentId,
+      body: submission.body,
+      visibility: "public",
+    });
+  }
+
   async perform(command: GroupChatCommand): Promise<void> {
     switch (command.kind) {
       case "post": {
         if (this.options.dropForgedBodyPost && command.body.includes("TEST-GC01-BODY-FORGERY"))
           return;
+        if (this.options.duplicateForgedEnvelope && command.claimedAuthorId !== undefined) {
+          // Review probe: the forged envelope is recorded twice; a unique-match readback
+          // ("multiple => null") would wash the acceptance into a false green.
+          for (let copy = 0; copy < 2; copy += 1)
+            this.addEvent({
+              roomId: command.roomId,
+              authorId: command.principalId,
+              body: command.body,
+              visibility: "public",
+            });
+          return;
+        }
         const valid =
           command.roomId !== "" &&
           command.visibility === "public" &&
-          command.binding === "test-binding:owner" &&
+          command.binding === this.trustedOwnerBinding &&
           command.privateFields === undefined &&
           command.claimedAuthorId === undefined;
         const defects = [
           command.visibility !== "public" ? "visibility" : null,
           command.roomId === "" ? "room" : null,
-          command.binding !== "test-binding:owner" ? "binding" : null,
+          command.binding !== this.trustedOwnerBinding ? "binding" : null,
           command.privateFields !== undefined ? "private-fields" : null,
           command.claimedAuthorId !== undefined ? "claimed-author" : null,
         ].filter((defect) => defect !== null);
@@ -385,6 +1007,15 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
         });
         const claim = this.options.claimOverride ?? "系统已收，成员尚未派发";
         this.receipts.push({ actor: "system", phase: "recorded", claim });
+        if (this.options.proxySignedReceiptAtRecord) {
+          // Review probe: a resident-signed personal-state receipt before any reaction must stay red
+          // even after that resident later reacts for real.
+          this.receipts.push({
+            actor: fixture.residentIds.a,
+            phase: "seen",
+            claim: "成员已读并记住了",
+          });
+        }
         if (this.options.publishFutureReceiptsEarly) {
           this.receipts.push({ actor: "system", phase: "dispatched", claim });
           this.receipts.push({
@@ -489,6 +1120,492 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
         }
         return;
       }
+      case "configure-orchestration":
+        this.policy = {
+          rootId: command.rootId,
+          policyVersion: command.policyVersion,
+          turnBudget: command.turnBudget,
+          deadlineTicks: command.deadlineTicks,
+          maxMemberAttempts: command.maxMemberAttempts,
+        };
+        return;
+      case "human-trigger":
+        this.knownRoots.add(command.rootId);
+        if (!this.consumedByRoot.has(command.rootId)) this.consumedByRoot.set(command.rootId, 0);
+        this.appendRound({
+          operationId: command.operationId,
+          rootId: command.rootId,
+          senderId: fixture.humanId,
+          decision: "human-trigger",
+          reasonCode: null,
+        });
+        this.addEvent({
+          roomId: fixture.roomId,
+          authorId: fixture.humanId,
+          body: command.body,
+          visibility: "public",
+        });
+        return;
+      case "member-turn": {
+        // Review probe: the self-declared-root stimulus vanishes without any record.
+        if (this.options.omitSelfRootRecord && command.claimedRootId !== undefined) return;
+        const effectiveRoot =
+          this.options.acceptSelfDeclaredRoot && command.claimedRootId !== undefined
+            ? command.claimedRootId
+            : command.rootId;
+        if (this.options.acceptSelfDeclaredRoot && command.claimedRootId !== undefined) {
+          this.knownRoots.add(effectiveRoot);
+          if (!this.consumedByRoot.has(effectiveRoot)) this.consumedByRoot.set(effectiveRoot, 0);
+        }
+        const submission: SyntheticSubmission = {
+          operationId: command.operationId,
+          rootId: effectiveRoot,
+          residentId: command.residentId,
+          body: command.body,
+          target: command.target ?? this.currentTarget,
+          persistFailed: false,
+        };
+        this.submissions.set(command.operationId, submission);
+        this.processMemberTurn(submission, command.claimedRootId);
+        return;
+      }
+      case "retry-operation": {
+        const submission = this.submissions.get(command.operationId);
+        if (submission === undefined) return;
+        if (submission.persistFailed) {
+          submission.persistFailed = false;
+          this.processMemberTurn(submission);
+          if (this.options.duplicateDecisionOnRetry) this.processMemberTurn(submission);
+          return;
+        }
+        if (this.options.duplicateRetry) {
+          this.consumedByRoot.set(submission.rootId, this.consumed(submission.rootId) + 1);
+          this.appendRound({
+            operationId: submission.operationId,
+            rootId: submission.rootId,
+            senderId: submission.residentId,
+            decision: "permitted",
+            reasonCode: null,
+            target: submission.target,
+          });
+          this.addEvent({
+            roomId: fixture.roomId,
+            authorId: submission.residentId,
+            body: submission.body,
+            visibility: "public",
+          });
+          return;
+        }
+        this.appendRound({
+          operationId: submission.operationId,
+          rootId: submission.rootId,
+          senderId: submission.residentId,
+          decision: "retry-replayed",
+          reasonCode: null,
+          target: submission.target,
+        });
+        return;
+      }
+      case "set-member-behavior":
+        this.memberBehaviors.set(command.residentId, command.behavior);
+        return;
+      case "set-pressure":
+        this.pressure.set(command.residentId, command.mode);
+        return;
+      case "advance-scheduler": {
+        this.schedulerTick += command.ticks;
+        for (const [operationId, submission] of this.submissions) {
+          const failures = this.attempts.filter(
+            (row) => row.operationId === operationId && row.outcome === "failed",
+          ).length;
+          if (failures > 0) {
+            const limit = this.options.unboundedMemberRetries
+              ? failures + command.ticks
+              : (this.policy?.maxMemberAttempts ?? 1);
+            for (let attempt = failures; attempt < limit; attempt += 1) {
+              this.appendAttempt(
+                operationId,
+                submission.residentId,
+                "failed",
+                "ROOM_MEMBER_FAILED",
+              );
+              if (!this.options.unboundedMemberRetries) break;
+            }
+          }
+        }
+        for (const [operationId, held] of [...this.held]) {
+          const deadline = this.policy?.deadlineTicks ?? 1;
+          if (this.schedulerTick - held.startedAt < deadline || this.options.neverTimeoutHeld)
+            continue;
+          this.appendAttempt(operationId, held.residentId, "unknown", "ROOM_MEMBER_DEADLINE");
+          this.appendDecision({
+            operationId,
+            senderId: held.residentId,
+            state: "dispatch-failed",
+            reasonCode: "ROOM_MEMBER_DEADLINE",
+            permitConsumed: true,
+            target: held.target,
+          });
+          this.appendFeedback(held, "ROOM_MEMBER_DEADLINE");
+          this.held.delete(operationId);
+        }
+        return;
+      }
+      case "fill-ordinary-queue":
+        this.ordinaryQueueDepth = this.options.emptyOrdinaryQueue ? 0 : command.depth;
+        return;
+      case "submit-control": {
+        const valid =
+          command.structured &&
+          command.binding === "test-control-binding:owner" &&
+          command.issuerId === fixture.humanId;
+        if (!valid && !this.options.acceptFalseControl) {
+          // Review probe: silently dropping a forged control leaves no rejected record to audit.
+          if (!this.options.omitFalseControlRecords) {
+            const rejected: ControlRecord = {
+              sequence: this.nextSequence(),
+              controlId: command.controlId,
+              issuerId: command.issuerId,
+              targetId: command.targetId,
+              action: command.action,
+              phase: "rejected",
+              cutoffId: null,
+              externalEffectReversed: false,
+            };
+            this.controlRecords.push(rejected);
+            // Review probe: a duplicated rejected record must not count as exactly one.
+            if (this.options.duplicateFalseControlRecord)
+              this.controlRecords.push({ ...rejected, sequence: this.nextSequence() });
+          }
+          return;
+        }
+        const cutoffId = `control-cutoff:${command.controlId}`;
+        // Review probe: the independent world's controls still take effect on the real target,
+        // but their ledger rows carry a washed targetId — only an identity-bound judge turns red.
+        const washIndependentIdentity =
+          this.options.washIndependentControlIdentity &&
+          (command.controlId === "gc07-independent-stop" ||
+            command.controlId === "gc07-independent-continue" ||
+            command.controlId === "gc12-independent-stop" ||
+            command.controlId === "gc12-independent-continue");
+        const accepted: ControlRecord = {
+          sequence: this.nextSequence(),
+          controlId: command.controlId,
+          issuerId: command.issuerId,
+          targetId: washIndependentIdentity ? fixture.residentIds.b : command.targetId,
+          action: command.action,
+          phase: "accepted",
+          cutoffId,
+          externalEffectReversed:
+            this.options.claimExternalEffectReversed === true &&
+            this.externalEffects.has(command.targetId),
+        };
+        const reachable = this.roomMembers.has(command.targetId);
+        if (!reachable && !this.options.reportUnreachableEffective) {
+          // An unreachable target yields exactly one incomplete record: no accepted/effective
+          // row and no cutoff, so the control ledger cannot wash the failure into a success.
+          this.controlRecords.push({
+            ...accepted,
+            sequence: this.nextSequence(),
+            phase: "incomplete",
+            cutoffId: null,
+          });
+          // Review probe: an extra effective row next to the incomplete one must go red.
+          if (this.options.unreachableAlsoEffective)
+            this.controlRecords.push({
+              ...accepted,
+              sequence: this.nextSequence(),
+              phase: "effective",
+              cutoffId: null,
+            });
+          return;
+        }
+        if (!this.options.mergeControlReceipts) this.controlRecords.push(accepted);
+        const blockedByOrdinaryQueue =
+          this.options.controlSharesOrdinaryQueue && this.ordinaryQueueDepth > 0;
+        const continueBlocked = this.options.continueDeadlocks && command.action === "continue";
+        let phase: ControlRecord["phase"] = "effective";
+        if (blockedByOrdinaryQueue || continueBlocked) phase = "accepted";
+        const effective: ControlRecord = {
+          ...accepted,
+          sequence: this.nextSequence(),
+          phase,
+        };
+        // Review probe: the independent world's continue still takes effect, but its effective
+        // record is dropped — results stay honest, only the control truth goes missing.
+        const dropIndependentContinueEffective =
+          this.options.omitIndependentContinueEffective &&
+          (command.controlId === "gc07-independent-continue" ||
+            command.controlId === "gc12-independent-continue");
+        if (!dropIndependentContinueEffective) this.controlRecords.push(effective);
+        if (phase === "effective") {
+          if (command.action === "stop") {
+            this.stopped.add(command.targetId);
+            this.lastStopSequence.set(command.targetId, effective.sequence);
+          } else {
+            this.stopped.delete(command.targetId);
+            // Review probe: wiping the cutoff state at continue revives pre-stop permits.
+            if (this.options.clearCutoffOnContinue) this.lastStopSequence.delete(command.targetId);
+          }
+        }
+        return;
+      }
+      case "mark-external-effect":
+        this.externalEffects.add(command.targetId);
+        return;
+      case "set-sender-online":
+        this.senderOnline.set(command.residentId, command.online);
+        return;
+      case "query-feedback": {
+        if (this.options.feedbackNoteOnly) return;
+        this.feedback = this.feedback.map((row) =>
+          row.senderId === command.residentId
+            ? {
+                ...row,
+                phase: "delivered" as const,
+                deliveryReceipt: `feedback-receipt:${row.operationId}:${command.via}`,
+              }
+            : row,
+        );
+        return;
+      }
+      case "inject-next-fault":
+        if (command.fault === "decision-persist") this.nextDecisionPersistFault = true;
+        else this.nextDispatchFaultFor = command.residentId ?? fixture.residentIds.a;
+        return;
+      case "seed-projection-event":
+        this.projectionSources.push({
+          eventId: command.eventId,
+          body: command.body,
+          authorized: command.authorized,
+        });
+        return;
+      case "request-projection": {
+        const authorized = this.projectionSources.filter((item) => item.authorized);
+        const hidden = this.projectionSources.filter((item) => !item.authorized);
+        // Review probe: omit-everything — included stays empty, all authorized land in omitted.
+        let included = this.options.omitAllProjected
+          ? []
+          : command.mode === "batch"
+            ? authorized.filter((_item, index) => index === 0 || index === authorized.length - 1)
+            : command.mode === "latest"
+              ? authorized.slice(-2)
+              : authorized.slice(2, 3);
+        // Review probe: repeat one authorized id and drop another — a length-only check stays green.
+        if (this.options.duplicateProjectedId && command.mode === "batch") {
+          const first = included[0];
+          if (first !== undefined) included = included.map(() => first);
+        }
+        const omitted = this.options.omitProjectionGaps
+          ? []
+          : authorized.filter((item) => !included.includes(item));
+        const truncate = command.mode === "truncate" ? included[0] : undefined;
+        const maxCharacters = command.maxCharacters ?? 24;
+        // Review probe: originalLength forged to kept+1 (25) with the context line synced —
+        // only a judge-truth length check and field-exact context matching can catch it.
+        const keptEnd = truncate === undefined ? 0 : Math.min(maxCharacters, truncate.body.length);
+        const truncations =
+          truncate === undefined
+            ? []
+            : [
+                {
+                  eventId: truncate.eventId,
+                  originalLength: this.options.forgeTruncationMetadata
+                    ? keptEnd + 1
+                    : truncate.body.length,
+                  unit: "characters" as const,
+                  keptStart: 0,
+                  keptEnd,
+                  sourceRef: `room-source:${truncate.eventId}`,
+                  modelVisible: !this.options.truncationMetadataNotModelVisible,
+                },
+              ];
+        const leakSuffix = this.options.leakHiddenProjection ? `:${hidden.length}` : "";
+        const receipt: ProjectionReceipt = {
+          projectionId: command.projectionId,
+          viewerId: command.viewerId,
+          sourceRange: [authorized[0]?.eventId ?? "none", authorized.at(-1)?.eventId ?? "none"],
+          watermark: `watermark:${authorized.at(-1)?.eventId ?? "none"}${leakSuffix}`,
+          policyVersion: "test-projection-policy:v1",
+          includedEventIds: included.map((item) => item.eventId),
+          omittedEventIds: omitted.map((item) => item.eventId),
+          complete: false,
+          errorCode: null,
+          truncations,
+        };
+        this.projectionReceipts.push(receipt);
+        const context = this.projectionContexts.get(command.viewerId) ?? [];
+        for (const item of included) {
+          context.push(command.mode === "truncate" ? item.body.slice(0, maxCharacters) : item.body);
+        }
+        for (const item of truncations) {
+          if (item.modelVisible) {
+            context.push(
+              `${item.sourceRef} ${item.originalLength} ${item.unit} ${item.keptStart}:${item.keptEnd}`,
+            );
+          }
+        }
+        this.projectionContexts.set(command.viewerId, context);
+        return;
+      }
+      case "attempt-source-read": {
+        const eventId = command.sourceRef.startsWith("room-source:")
+          ? command.sourceRef.slice("room-source:".length)
+          : "";
+        const source = this.projectionSources.find((item) => item.eventId === eventId);
+        const allowed =
+          (this.roomAccess.get(command.viewerId) ?? false) || this.options.allowRevokedSourceRead;
+        this.sourceReads.push({
+          sourceRef: command.sourceRef,
+          viewerId: command.viewerId,
+          outcome: allowed && source?.authorized ? "granted" : "denied",
+          eventId:
+            allowed && source?.authorized
+              ? this.options.wrongSourceRead
+                ? "wrong-event"
+                : source.eventId
+              : null,
+          body:
+            allowed && source?.authorized
+              ? this.options.wrongSourceRead
+                ? "wrong-body"
+                : this.options.truncateSourceReadBody
+                  ? source.body.slice(0, 24)
+                  : source.body
+              : null,
+          errorCode: allowed && source?.authorized ? null : "not-found",
+        });
+        return;
+      }
+      case "set-room-access":
+        this.roomAccess.set(command.residentId, command.allowed);
+        return;
+      case "set-room-membership": {
+        const had = this.roomMembers.has(command.residentId);
+        if (command.active) {
+          this.roomMembers.add(command.residentId);
+          this.roster.add(command.residentId);
+        } else {
+          this.roomMembers.delete(command.residentId);
+          this.roster.delete(command.residentId);
+        }
+        if (had !== command.active) this.rosterVersion += 1;
+        return;
+      }
+      case "attempt-delivery": {
+        const submission = this.submissions.get(command.operationId);
+        if (submission === undefined) return;
+        const allowed =
+          this.roomMembers.has(submission.residentId) || this.options.useStaleRoster === true;
+        this.appendDecision({
+          operationId: submission.operationId,
+          senderId: submission.residentId,
+          state: allowed ? "context-committed" : "rejected",
+          reasonCode: allowed ? "ROOM_CONTEXT_COMMITTED" : "ROOM_MEMBER_REVOKED",
+          permitConsumed: allowed,
+          target: submission.target,
+        });
+        return;
+      }
+      case "set-delivery-target":
+        this.currentTarget = command.target;
+        return;
+      case "return-member-result": {
+        const held = this.held.get(command.operationId);
+        if (held === undefined) return;
+        // Review probe: the post-continue return of a cutoff old permit washes the dispatchId
+        // on both ledger rows while every other fact (returned, reasoned rejected, no commit)
+        // stays honest — only an identity-bound judge can catch it.
+        const postContinueWash: DispatchIdentity =
+          this.options.washPostContinueTarget &&
+          (command.operationId === "gc07-old-permit" ||
+            command.operationId === "gc12-cutoff-old") &&
+          !this.stopped.has(held.residentId)
+            ? { ...command.target, dispatchId: "test-dispatch:washed-post-continue" }
+            : command.target;
+        if (!this.options.skipReturnedResultRecord) {
+          // Review probe: wash the six forged returned targets into the same residentId variant,
+          // so the judge can only catch it by reading the host ledger, never its own stimulus list.
+          const seen = this.results.filter(
+            (row) => row.operationId === "gc12-tuple" && row.phase === "returned",
+          ).length;
+          const recordedTarget =
+            this.options.washForgedTupleTargets && command.operationId === "gc12-tuple" && seen < 6
+              ? {
+                  residentId: fixture.residentIds.b,
+                  scopeId: "test-scope:gc12",
+                  scopeGeneration: 1,
+                  windowId: "test-window:gc12",
+                  generation: 1,
+                  dispatchId: "test-dispatch:gc12",
+                }
+              : postContinueWash;
+          this.results.push({
+            sequence: this.nextSequence(),
+            operationId: command.operationId,
+            target: recordedTarget,
+            phase: "returned",
+            reasonCode: null,
+          });
+        }
+        const memoKey = [
+          command.operationId,
+          command.target.residentId,
+          command.target.scopeId,
+          command.target.scopeGeneration,
+          command.target.windowId,
+          command.target.generation,
+          command.target.dispatchId,
+        ].join("|");
+        const memoizedReason = this.terminalRejections.get(memoKey);
+        if (memoizedReason !== undefined) {
+          // A terminally rejected result replays its recorded rejection on every later return
+          // of the same operation+identity; it is never re-evaluated and never committed.
+          this.results.push({
+            sequence: this.nextSequence(),
+            operationId: command.operationId,
+            target: postContinueWash,
+            phase: "rejected",
+            reasonCode: memoizedReason,
+          });
+          return;
+        }
+        const targetMatchesPermit = this.sameTarget(command.target, held.target);
+        const targetCurrent = this.sameTarget(command.target, this.currentTarget);
+        const stoppedAfterIssue =
+          (this.lastStopSequence.get(held.residentId) ?? 0) > held.issuedControlSequence;
+        const accepted =
+          (targetMatchesPermit && targetCurrent && !stoppedAfterIssue) ||
+          this.options.acceptStaleTarget === true ||
+          (this.options.acceptForgedTarget === true && command.operationId === "gc12-tuple") ||
+          (this.options.acceptPreCutoffResult === true && stoppedAfterIssue);
+        const reasonCode = accepted
+          ? null
+          : stoppedAfterIssue
+            ? "ROOM_CONTROL_CUTOFF"
+            : "ROOM_DISPATCH_IDENTITY_STALE";
+        // Review probe: dropping the rejection leaves the cutoff without attributable evidence.
+        if (!(this.options.omitStoppedResultRejection && !accepted && stoppedAfterIssue)) {
+          this.results.push({
+            sequence: this.nextSequence(),
+            operationId: command.operationId,
+            target: postContinueWash,
+            phase: accepted ? "committed" : "rejected",
+            reasonCode,
+          });
+          if (!accepted && reasonCode !== null) this.terminalRejections.set(memoKey, reasonCode);
+        }
+        if (accepted) {
+          this.addEvent({
+            roomId: fixture.roomId,
+            authorId: held.residentId,
+            body: command.body,
+            visibility: "public",
+          });
+          this.held.delete(command.operationId);
+        }
+        return;
+      }
       case "set-resident":
         return;
     }
@@ -588,10 +1705,53 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   async readReactions(): Promise<readonly ResidentReaction[]> {
     return this.reactions;
   }
+  async readRoundRecords(): Promise<readonly RoundRecord[]> {
+    return structuredClone(this.roundRecords);
+  }
+  async readScheduler(): Promise<SchedulerSnapshot> {
+    return {
+      tick: this.schedulerTick,
+      ordinaryQueueDepth: this.ordinaryQueueDepth,
+      heldOperationIds: [...this.held.keys()],
+      stoppedResidentIds: [...this.stopped],
+    };
+  }
+  async readControlRecords(): Promise<readonly ControlRecord[]> {
+    return structuredClone(this.controlRecords);
+  }
+  async readDeliveryDecisions(): Promise<readonly DeliveryDecisionRecord[]> {
+    return structuredClone(this.deliveryDecisions);
+  }
+  async readSenderFeedback(residentId: ResidentId): Promise<readonly SenderFeedbackRecord[]> {
+    if (this.options.crossDeliverFeedback) return structuredClone(this.feedback);
+    return structuredClone(this.feedback.filter((row) => row.senderId === residentId));
+  }
+  async readProjectionReceipts(): Promise<readonly ProjectionReceipt[]> {
+    return structuredClone(this.projectionReceipts);
+  }
+  async readProjectionContext(residentId: ResidentId): Promise<string> {
+    return (this.projectionContexts.get(residentId) ?? []).join("\n");
+  }
+  async readSourceReads(): Promise<readonly SourceReadAudit[]> {
+    return structuredClone(this.sourceReads);
+  }
+  async readMemberAttempts(): Promise<readonly MemberAttemptRecord[]> {
+    return structuredClone(this.attempts);
+  }
+  async readMemberResults(): Promise<readonly MemberResultRecord[]> {
+    return structuredClone(this.results);
+  }
 }
 
 /** No member-id literals found under src/ (the runner supplies the real scan). */
-const judge: GroupChatJudgeContext = { findSourceLiterals: async () => [] };
+const judge: GroupChatJudgeContext = {
+  findSourceLiterals: async () => [],
+  restartHost: async (driver) => {
+    const previous = await driver.startHost();
+    const current = await driver.restartHost();
+    return { previous, current };
+  },
+};
 
 const check = (id: GroupChatCheckId, options: TestOptions = {}) =>
   runGroupChatCheck(id, new SyntheticGroupChatHost(options), judge);
@@ -657,7 +1817,15 @@ const unsupportedClaims = [
   "小明已读完配置",
   "Ada已读完配置",
   "系统小明已读完配置",
-  "系统我已看到投递失败",
+  // #206 review 1: canonical resident id must not launder a personal claim into a
+  // system config reading; arbitrary colon strings stay unprotected (suffix clause judges).
+  "test-resident:a 已读完配置",
+  "test-resident:novel-d 已读",
+  "test-resident:b 👀",
+  "test-resident:c 正在输入",
+  "test-resident:a 已写入记忆",
+  "test-resident:b 已理解",
+  "test-human:owner 已读完配置",
 ];
 
 /**
@@ -722,10 +1890,13 @@ const honestClaims = [
   "代表已读完配置",
   "日志已读完配置",
   "不到一秒就已读完配置",
+  // 不泛化成任意冒号字符串：非夹具 id 照旧在冒号处切开，残余子句按无主语配置读取放行。
+  "other-id:x 已读完配置",
+  "test-resident:x 已读完配置，不代表理解",
 ];
 
-describe("#191 group-chat acceptance: judge-driven synthetic host checks", () => {
-  it("freezes exactly the seven PR1 lamps and synthetic fixtures", () => {
+describe("#191/#192 group-chat acceptance: judge-driven synthetic host checks", () => {
+  it("freezes exactly the thirteen stacked red lamps and synthetic fixtures", () => {
     expect(groupChatChecks.map(({ id }) => id)).toEqual(GROUP_CHAT_CHECK_IDS);
     expect(fixture.roomId).toMatch(/^test-room:/);
     expect(Object.values(fixture.residentIds).every((id) => id.startsWith("test-resident:"))).toBe(
@@ -785,7 +1956,7 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     ["GC-09", { proxyReaction: true }, "代发"],
     ["GC-09", { commitWritesMemory: true }, "写入记忆"],
     ["GC-09", { extraSystemPhase: "seen" }, "个人状态当成了阶段"],
-    ["GC-09", { forgedResidentReceipt: true }, "没有本人 reaction"],
+    ["GC-09", { forgedResidentReceipt: true }, "代签"],
     ["GC-15", { leakHiddenToUnauthorized: true }, "泄漏"],
     ["GC-15", { acceptCrossRoomReplay: true }, "错误房间"],
     ["GC-15", { noHiddenRoom: true }, "对照世界"],
@@ -891,6 +2062,7 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
         scanned = terms;
         return ["src/group-chat/router.ts"];
       },
+      restartHost: judge.restartHost,
     });
     expect(result.passed).toBe(false);
     expect(result.detail).toContain("src/group-chat/router.ts");
@@ -1053,12 +2225,14 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
   it("copies command arguments and host readbacks at the adapter boundary", async () => {
     const raw = new SyntheticGroupChatHost();
     const driver = cloneGroupChatDriverBoundary(raw);
+    // The setup grant crosses the same cloned boundary before any post can be trusted.
+    await driver.resetScenario("GC-01", fixture);
     const command: GroupChatCommand = {
       kind: "post",
       roomId: fixture.roomId,
       principalId: fixture.humanId,
       visibility: "public",
-      binding: "test-binding:owner",
+      binding: fixture.trustedOwnerBinding,
       body: "TEST-CLONE-BOUNDARY",
     };
     await driver.perform(command);
@@ -1070,7 +2244,37 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     expect((await raw.readRoomEvents())[0]?.body).toBe("TEST-CLONE-BOUNDARY");
   });
 
-  it("reports absent production adapter as seven expected red lamps", () => {
+  // #206 review 2: the binding string is never self-authorizing. Only the judge-owned setup
+  // grant delivered through resetScenario(id, fixture) registers it on the host.
+  it("trusts the owner binding only as a resetScenario setup grant, never from a command", async () => {
+    const post = (binding: string): GroupChatCommand => ({
+      kind: "post",
+      roomId: fixture.roomId,
+      principalId: fixture.humanId,
+      visibility: "public",
+      binding,
+      body: "TEST-TRUSTED-BINDING-SEAM",
+    });
+    // Without a setup grant, the exact trusted string inside perform() writes nothing.
+    const host = new SyntheticGroupChatHost();
+    await host.perform(post(fixture.trustedOwnerBinding));
+    expect(await host.readRoomEvents()).toHaveLength(0);
+    // After resetScenario registers the grant, the same command writes normally.
+    await host.resetScenario("GC-01", fixture);
+    await host.perform(post(fixture.trustedOwnerBinding));
+    expect((await host.readRoomEvents()).map((event) => event.body)).toContain(
+      "TEST-TRUSTED-BINDING-SEAM",
+    );
+    // A wrong or empty binding stays rejected once the grant exists.
+    for (const binding of ["test-binding:forged", ""]) {
+      const negative = new SyntheticGroupChatHost();
+      await negative.resetScenario("GC-01", fixture);
+      await negative.perform(post(binding));
+      expect(await negative.readRoomEvents()).toHaveLength(0);
+    }
+  });
+
+  it("reports absent production adapter as thirteen expected red lamps", () => {
     const results = runnerMissingDriverResults();
     expect(results.map(({ id }) => id)).toEqual(GROUP_CHAT_CHECK_IDS);
     expect(
@@ -1108,20 +2312,1515 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     }));
     expect(scoreGroupChatResults(stubbedResults)).toEqual({
       trueGreen: 0,
-      stubGreen: 7,
+      stubGreen: 13,
       strictPass: false,
     });
 
     const realResults = stubbedResults.map((result) => ({ ...result, stubbed: false }));
     expect(scoreGroupChatResults(realResults)).toEqual({
-      trueGreen: 7,
+      trueGreen: 13,
       stubGreen: 0,
       strictPass: true,
     });
   });
 });
 
-describe("#191 runner: real-host provenance and static source scan", () => {
+describe("#192 stacked red oracle: each A-D behavior has a single-mutation red", () => {
+  it.each([
+    ["GC-06A", "GC-06", { ignoreTurnBudget: true }, "恰好放行 B 次"],
+    ["GC-06B retry", "GC-06", { duplicateRetry: true }, "重试重复"],
+    ["GC-06B pass", "GC-06", { omitPassRecord: true }, "pass"],
+    ["GC-06B failure", "GC-06", { omitFailureRecord: true }, "失败尝试"],
+    ["GC-06B identity", "GC-06", { resetBudgetOnIdentityChange: true }, "换代刺激"],
+    ["GC-06B generation", "GC-06", { omitRoundTarget: true }, "换代负例"],
+    ["GC-06B root", "GC-06", { acceptSelfDeclaredRoot: true }, "自报新根"],
+    ["GC-06C", "GC-06", { resetRoundOnRestart: true }, "高水位"],
+    ["GC-06C pid", "GC-06", { reuseRestartPid: true }, "换真实进程"],
+    ["GC-06C commit", "GC-06", { changeRestartCommit: true }, "commit"],
+    ["GC-06D", "GC-06", { dispatchWithInvalidPolicy: true }, "非法有限配置"],
+    ["GC-07A empty", "GC-07", { emptyOrdinaryQueue: true }, "非空普通队列"],
+    ["GC-07A shared", "GC-07", { controlSharesOrdinaryQueue: true }, "接收与实际生效"],
+    ["GC-07B", "GC-07", { acceptFalseControl: true }, "伪造"],
+    ["GC-07C receipts", "GC-07", { mergeControlReceipts: true }, "接收与实际生效"],
+    ["GC-07C unreachable", "GC-07", { reportUnreachableEffective: true }, "不可达"],
+    ["GC-07C effect", "GC-07", { claimExternalEffectReversed: true }, "副作用"],
+    ["GC-07D", "GC-07", { continueDeadlocks: true }, "continue"],
+    ["GC-08A", "GC-08", { unstableReasonAfterRestart: true }, "原因码"],
+    ["GC-08B offline", "GC-08", { markOfflineFeedbackDelivered: true }, "离线"],
+    ["GC-08B note", "GC-08", { feedbackNoteOnly: true }, "delivery receipt"],
+    ["GC-08C body", "GC-08", { leakBlockedBody: true }, "被拦原文"],
+    ["GC-08C claim", "GC-08", { feedbackClaimsMemberRead: true }, "冒充成员个人状态"],
+    ["GC-08C cross", "GC-08", { crossDeliverFeedback: true }, "跨发送方"],
+    ["GC-08D consume", "GC-08", { consumeOnDecisionPersistFailure: true }, "仍消费"],
+    ["GC-08D duplicate", "GC-08", { duplicateDecisionOnRetry: true }, "恰好留一份"],
+    ["GC-10A", "GC-10", { omitProjectionGaps: true }, "省略缺口"],
+    ["GC-10B", "GC-10", { truncationMetadataNotModelVisible: true }, "模型可见"],
+    ["GC-10C", "GC-10", { leakHiddenProjection: true }, "隐藏内容"],
+    ["GC-10D revoke", "GC-10", { allowRevokedSourceRead: true }, "撤权后"],
+    ["GC-10D source", "GC-10", { wrongSourceRead: true }, "同一原事件"],
+    ["GC-12A", "GC-12", { useStaleRoster: true }, "成员表"],
+    ["GC-12B stimulus", "GC-12", { skipReturnedResultRecord: true }, "实际送回"],
+    ["GC-12B accept", "GC-12", { acceptStaleTarget: true }, "旧 scope/window"],
+    ["GC-12C", "GC-12", { acceptPreCutoffResult: true }, "stop 前许可"],
+    ["GC-12D", "GC-12", { acceptForgedTarget: true }, "六字段"],
+    ["GC-16A", "GC-16", { starveOtherMembers: true }, "饿死"],
+    ["GC-16B sync", "GC-16", { synchronousHoldFailure: true }, "同步快抛错"],
+    ["GC-16B deadline", "GC-16", { neverTimeoutHeld: true }, "deadline"],
+    ["GC-16C retry", "GC-16", { unboundedMemberRetries: true }, "无界"],
+    ["GC-16C restart", "GC-16", { washFailuresOnRestart: true }, "partial restart"],
+    ["GC-16C high-water", "GC-16", { resetRoundOnRestart: true }, "高水位"],
+    ["GC-16D feedback", "GC-16", { dropFailureFeedback: true }, "失败反馈"],
+    ["GC-16D receipt", "GC-16", { falseFailurePresenceReceipt: true }, "冒充"],
+    ["GC-16D claim", "GC-16", { failureReceiptClaimsMemberRead: true }, "冒充成员个人状态"],
+    // #206 review 3: single-mutation probes for the six corrected false greens.
+    ["GC-06B root-omit", "GC-06", { omitSelfRootRecord: true }, "自报新根"],
+    ["GC-07B drop", "GC-07", { omitFalseControlRecords: true }, "伪造控制"],
+    ["GC-08 swap", "GC-08", { permuteDeliveryStates: true }, "缺恰好一条"],
+    ["GC-10 omit-all", "GC-10", { omitAllProjected: true }, "没有纳入任何"],
+    ["GC-12C drop-reject", "GC-12", { omitStoppedResultRejection: true }, "明确 rejected"],
+    ["GC-16C attempt-999", "GC-16", { forgeAttemptOutOfBound: true }, "无界"],
+    // #206 review 4: duplicate-accounting probes for the three remaining false greens.
+    ["GC-07B dup", "GC-07", { duplicateFalseControlRecord: true }, "恰好一条"],
+    ["GC-10 dup-id", "GC-10", { duplicateProjectedId: true }, "重复"],
+    ["GC-12D wash", "GC-12", { washForgedTupleTargets: true }, "各改一个"],
+    // #206 review 5: single-mutation probes for the six newly confirmed false greens.
+    ["GC-01 dup-forged", "GC-01", { duplicateForgedEnvelope: true }, "伪造 envelope"],
+    [
+      "GC-06A swap-order",
+      "GC-06",
+      { swapBoundedTurnRecords: true },
+      "没有恰好一条按序的 permitted",
+    ],
+    ["GC-06B identity-human", "GC-06", { identityChangeAsHumanTrigger: true }, "换代刺激"],
+    ["GC-07C unreachable-effective", "GC-07", { unreachableAlsoEffective: true }, "不可达"],
+    ["GC-09B proxy-sign", "GC-09", { proxySignedReceiptAtRecord: true }, "代签"],
+    ["GC-10B forge-length", "GC-10", { forgeTruncationMetadata: true }, "原长"],
+    // #206 review 8: cutoff wiped at continue, truncated source body, sender misattribution.
+    // review 10: the host now memoizes terminal rejections by operation+identity — these two
+    // rows prove the memoized host still goes red, attributed by the independent world's
+    // first late return (empty cache) landing committed/body-leaked, never washed green.
+    ["GC-07C cutoff-clear", "GC-07", { clearCutoffOnContinue: true }, "仍被提交"],
+    ["GC-12C cutoff-clear", "GC-12", { clearCutoffOnContinue: true }, "复活"],
+    ["GC-10D truncate-body", "GC-10", { truncateSourceReadBody: true }, "精确相等"],
+    [
+      "GC-08B decision-sender",
+      "GC-08",
+      { misattributeDecisionSender: true },
+      "senderId 不是判卷发送方",
+    ],
+    [
+      "GC-08B feedback-sender",
+      "GC-08",
+      { misattributeFeedbackSender: true },
+      "归属于判卷发送方的反馈",
+    ],
+    // #206 review 9: post-continue ledger rows with a washed identity tuple.
+    ["GC-07C wash-target", "GC-07", { washPostContinueTarget: true }, "六元组"],
+    ["GC-12C wash-target", "GC-12", { washPostContinueTarget: true }, "六元组"],
+    // #206 review 10 second pass: the independent continue takes effect but its effective
+    // record is dropped — red must attribute to the missing control truth, not to a commit.
+    [
+      "GC-07C continue-unproven",
+      "GC-07",
+      { omitIndependentContinueEffective: true },
+      "独立世界 continue 控制",
+    ],
+    [
+      "GC-12C continue-unproven",
+      "GC-12",
+      { omitIndependentContinueEffective: true },
+      "独立世界 continue 控制",
+    ],
+    // #206 review 10 round 3: independent stop/continue take effect on the real target, but
+    // their ledger rows carry a washed targetId — red must attribute to control identity.
+    ["GC-07C control-identity", "GC-07", { washIndependentControlIdentity: true }, "授权身份"],
+    ["GC-12C control-identity", "GC-12", { washIndependentControlIdentity: true }, "授权身份"],
+  ] as const)("%s makes %s red for %j", async (_caseId, id, options, reason) => {
+    const result = await check(id, options);
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain(reason);
+  });
+
+  it("keeps synthetic positive controls explicitly outside real-host provenance", async () => {
+    for (const id of ["GC-06", "GC-07", "GC-08", "GC-10", "GC-12", "GC-16"] as const) {
+      const result = await check(id);
+      expect(result.passed, `${id}: ${result.detail}`).toBe(true);
+    }
+    const run = await new SyntheticGroupChatHost().startHost();
+    expect(
+      hostProvenanceProblem(run, {
+        headCommit: "0123456789abcdef0123456789abcdef01234567",
+        judgePid: process.pid,
+        judgeExecutable: realpathSync(process.execPath),
+        repoRoot: fileURLToPath(new URL("..", import.meta.url)),
+        readProcess: () => null,
+      }),
+    ).not.toBeNull();
+  });
+
+  // #206 review 10: terminal-rejection memoization is a normal-lifecycle positive control.
+  it("replays memoized terminal rejections by operation+identity, never re-committing", async () => {
+    // Even with the cutoff wiped at continue (the review-8 mutation), the second return of
+    // an already-rejected operation+identity replays the memoized rejection and is never
+    // committed. The lamp suites prove the same memoized host still goes red on GC-07/GC-12:
+    // their independent worlds force a FIRST late return with an empty cache.
+    const host = new SyntheticGroupChatHost({ clearCutoffOnContinue: true });
+    await host.resetScenario("GC-07", fixture);
+    const target: DispatchIdentity = {
+      residentId: fixture.residentIds.a,
+      scopeId: "test-scope:memo",
+      scopeGeneration: 1,
+      windowId: "test-window:memo",
+      generation: 1,
+      dispatchId: "test-dispatch:memo-old",
+    };
+    await host.perform({ kind: "set-delivery-target", target });
+    await host.perform({
+      kind: "configure-orchestration",
+      rootId: fixture.roots.first,
+      policyVersion: "test-policy:memo",
+      turnBudget: 4,
+      deadlineTicks: 2,
+      maxMemberAttempts: 1,
+    });
+    await host.perform({
+      kind: "human-trigger",
+      operationId: "memo-human",
+      rootId: fixture.roots.first,
+      body: "TEST-MEMO-HUMAN",
+    });
+    await host.perform({
+      kind: "set-member-behavior",
+      residentId: fixture.residentIds.a,
+      behavior: "hold",
+    });
+    await host.perform({
+      kind: "member-turn",
+      operationId: "memo-old",
+      rootId: fixture.roots.first,
+      residentId: fixture.residentIds.a,
+      body: "TEST-MEMO-OLD",
+      target,
+    });
+    await host.perform({
+      kind: "submit-control",
+      controlId: "memo-stop",
+      issuerId: fixture.humanId,
+      targetId: fixture.residentIds.a,
+      action: "stop",
+      structured: true,
+      binding: "test-control-binding:owner",
+    });
+    await host.perform({
+      kind: "return-member-result",
+      operationId: "memo-old",
+      target,
+      body: "TEST-MEMO-LATE",
+    });
+    await host.perform({
+      kind: "submit-control",
+      controlId: "memo-continue",
+      issuerId: fixture.humanId,
+      targetId: fixture.residentIds.a,
+      action: "continue",
+      structured: true,
+      binding: "test-control-binding:owner",
+    });
+    // Cutoff is wiped in this host; only the memoized rejection can stop the second return.
+    await host.perform({
+      kind: "return-member-result",
+      operationId: "memo-old",
+      target,
+      body: "TEST-MEMO-LATE-AGAIN",
+    });
+    const rows = (await host.readMemberResults()).filter((row) => row.operationId === "memo-old");
+    expect(rows.map((row) => row.phase)).toEqual(["returned", "rejected", "returned", "rejected"]);
+    expect(rows[1]?.reasonCode).toBe("ROOM_CONTROL_CUTOFF");
+    expect(rows[3]?.reasonCode).toBe("ROOM_CONTROL_CUTOFF");
+    expect(
+      (await host.readRoomEvents()).some((event) => event.body.includes("TEST-MEMO-LATE")),
+    ).toBe(false);
+  });
+
+  it("deep-copies new orchestration readbacks as well as commands", async () => {
+    const raw = new SyntheticGroupChatHost();
+    const driver = cloneGroupChatDriverBoundary(raw);
+    await driver.resetScenario("GC-06", fixture);
+    await driver.perform({
+      kind: "configure-orchestration",
+      rootId: fixture.roots.first,
+      policyVersion: "test-policy:clone",
+      turnBudget: 1,
+      deadlineTicks: 1,
+      maxMemberAttempts: 1,
+    });
+    await driver.perform({
+      kind: "human-trigger",
+      operationId: "clone-human",
+      rootId: fixture.roots.first,
+      body: "TEST-CLONE-ORCHESTRATION",
+    });
+    const records = await driver.readRoundRecords();
+    (records[0] as { reasonCode: string | null }).reasonCode = "mutated";
+    expect((await raw.readRoundRecords())[0]?.reasonCode).toBeNull();
+  });
+});
+
+describe("#206 review 3: evaluator pins identities and sequences, not just counts", () => {
+  const a = fixture.residentIds.a;
+
+  const gc06TurnRecord = (
+    operationId: string,
+    decision: "permitted" | "blocked",
+    sequence: number,
+    reasonCode: string | null = null,
+  ): GroupChatEvidenceById["GC-06"]["boundedWorlds"][number]["records"][number] => ({
+    operationId,
+    decision,
+    reasonCode,
+    sequence,
+  });
+  const gc06WorldRecords = (budget: number) => [
+    ...Array.from({ length: budget }, (_, index) =>
+      gc06TurnRecord(`gc06-B${budget}-turn-${index + 1}`, "permitted", index + 1),
+    ),
+    gc06TurnRecord(
+      `gc06-B${budget}-turn-${budget + 1}`,
+      "blocked",
+      budget + 1,
+      "ROOM_TURN_BUDGET_EXHAUSTED",
+    ),
+  ];
+  const gc06Base = (): GroupChatEvidenceById["GC-06"] => ({
+    boundedWorlds: [
+      { budget: 1, records: gc06WorldRecords(1), oneRoot: true, policyVersionStable: true },
+      { budget: 3, records: gc06WorldRecords(3), oneRoot: true, policyVersionStable: true },
+    ],
+    retryAddedDispatch: false,
+    passRecorded: true,
+    failureRecorded: true,
+    identityChangeAttempts: [{ decision: "blocked", reasonCode: "ROOM_TURN_BUDGET_EXHAUSTED" }],
+    generationChangeStimulated: true,
+    selfRootAttempts: [{ decision: "blocked", reasonCode: "ROOM_ROOT_FORGED" }],
+    restartPidChanged: true,
+    restartCommitStable: true,
+    highWaterBeforeRestart: 1,
+    highWaterAfterRestart: 1,
+    humanAfterLimitAccepted: true,
+    invalidConfigDispatched: false,
+    invalidConfigReasoned: true,
+  });
+
+  it("GC-06 requires exactly one blocked self-root record with a stable reason", () => {
+    expect(evaluateGroupChatEvidence("GC-06", gc06Base()).passed).toBe(true);
+    const badAttempts: readonly (readonly Pick<RoundRecord, "decision" | "reasonCode">[])[] = [
+      [],
+      [
+        { decision: "blocked", reasonCode: "ROOM_ROOT_FORGED" },
+        { decision: "blocked", reasonCode: "ROOM_ROOT_FORGED" },
+      ],
+      [{ decision: "permitted", reasonCode: null }],
+      [{ decision: "blocked", reasonCode: "" }],
+      [{ decision: "blocked", reasonCode: null }],
+    ];
+    for (const selfRootAttempts of badAttempts) {
+      const result = evaluateGroupChatEvidence("GC-06", { ...gc06Base(), selfRootAttempts });
+      expect(result.passed, JSON.stringify(selfRootAttempts)).toBe(false);
+      expect(result.detail).toContain("自报新根");
+    }
+  });
+
+  const gc07Forged = (
+    controlId: string,
+  ): GroupChatEvidenceById["GC-07"]["falseControls"][number] => ({
+    controlId,
+    records: [
+      {
+        sequence: 1,
+        controlId,
+        issuerId: fixture.humanId,
+        targetId: fixture.residentIds.a,
+        action: "stop",
+        phase: "rejected",
+        cutoffId: null,
+        externalEffectReversed: false,
+      },
+    ],
+  });
+  const gc07OldTarget: DispatchIdentity = {
+    residentId: a,
+    scopeId: "test-scope:gc07",
+    scopeGeneration: 1,
+    windowId: "test-window:gc07",
+    generation: 1,
+    dispatchId: "test-dispatch:gc07-old",
+  };
+  const gc07IndependentTarget: DispatchIdentity = {
+    residentId: a,
+    scopeId: "test-scope:gc07-independent",
+    scopeGeneration: 1,
+    windowId: "test-window:gc07-independent",
+    generation: 1,
+    dispatchId: "test-dispatch:gc07-independent-old",
+  };
+  const gc07IndependentRow = (
+    phase: MemberResultRecord["phase"],
+    sequence: number,
+    reasonCode: string | null = null,
+    target: DispatchIdentity = gc07IndependentTarget,
+  ): MemberResultRecord => ({
+    sequence,
+    operationId: "gc07-independent-permit",
+    target,
+    phase,
+    reasonCode,
+  });
+  const gc07IndependentControlRow = (
+    action: "stop" | "continue",
+    phase: ControlRecord["phase"],
+    sequence: number,
+  ): ControlRecord => ({
+    sequence,
+    controlId: `gc07-independent-${action}`,
+    issuerId: fixture.humanId,
+    targetId: a,
+    action,
+    phase,
+    cutoffId: `control-cutoff:gc07-independent-${action}`,
+    externalEffectReversed: false,
+  });
+  const gc07IndependentControls = (): ControlRecord[] => [
+    gc07IndependentControlRow("stop", "accepted", 30),
+    gc07IndependentControlRow("stop", "effective", 31),
+    gc07IndependentControlRow("continue", "accepted", 32),
+    gc07IndependentControlRow("continue", "effective", 33),
+  ];
+  const gc07ResultRow = (
+    operationId: string,
+    phase: MemberResultRecord["phase"],
+    sequence: number,
+    reasonCode: string | null = null,
+  ): MemberResultRecord => ({
+    sequence,
+    operationId,
+    target: gc07OldTarget,
+    phase,
+    reasonCode,
+  });
+  const gc07Base = (): GroupChatEvidenceById["GC-07"] => ({
+    ordinaryQueueDepthBeforeControl: 3,
+    heldBeforeControl: true,
+    stopAcceptedBeforeQueueRelease: true,
+    stopEffective: true,
+    oldPermitCommitted: false,
+    falseControls: [
+      gc07Forged("gc07-quoted-stop"),
+      gc07Forged("gc07-resident-forgery"),
+      gc07Forged("gc07-unauthorized-human"),
+    ],
+    acceptedAndEffectiveSeparated: true,
+    unreachableRecords: [
+      {
+        sequence: 1,
+        controlId: "gc07-unreachable",
+        issuerId: fixture.humanId,
+        targetId: fixture.residentIds.c,
+        action: "stop",
+        phase: "incomplete",
+        cutoffId: null,
+        externalEffectReversed: false,
+      },
+    ],
+    externalEffectClaimedReversed: false,
+    continueEffectiveWhileQueueBlocked: true,
+    postContinueNewPermitCommitted: true,
+    postContinueOldPermitResults: [
+      gc07ResultRow("gc07-old-permit", "returned", 20),
+      gc07ResultRow("gc07-old-permit", "rejected", 21, "ROOM_CONTROL_CUTOFF"),
+    ],
+    postContinueOldTarget: gc07OldTarget,
+    postContinueOldBodyInRoom: false,
+    independentFirstReturnResults: [
+      gc07IndependentRow("returned", 40),
+      gc07IndependentRow("rejected", 41, "ROOM_CONTROL_CUTOFF"),
+    ],
+    independentControls: gc07IndependentControls(),
+    independentControlTruth: {
+      stopControlId: "gc07-independent-stop",
+      continueControlId: "gc07-independent-continue",
+      issuerId: fixture.humanId,
+      targetId: a,
+    },
+    independentFirstReturnTarget: gc07IndependentTarget,
+    independentFirstReturnBodyInRoom: false,
+    independentNewPermitCommitted: true,
+  });
+
+  it("GC-07 requires every forged control explicitly rejected without a cutoff", () => {
+    expect(evaluateGroupChatEvidence("GC-07", gc07Base()).passed).toBe(true);
+    const mutate = (index: number, records: ControlRecord[]) => ({
+      ...gc07Base(),
+      falseControls: gc07Base().falseControls.map((entry, at) =>
+        at === index ? { ...entry, records } : entry,
+      ),
+    });
+    const forgedRecord = (controlId: string, overrides: Partial<ControlRecord>): ControlRecord => ({
+      sequence: 1,
+      controlId,
+      issuerId: fixture.humanId,
+      targetId: fixture.residentIds.a,
+      action: "stop",
+      phase: "rejected",
+      cutoffId: null,
+      externalEffectReversed: false,
+      ...overrides,
+    });
+    const acceptedForgery = mutate(1, [
+      forgedRecord("gc07-resident-forgery", { phase: "accepted" }),
+    ]);
+    expect(evaluateGroupChatEvidence("GC-07", acceptedForgery).passed).toBe(false);
+    const cutoffForgery = mutate(2, [
+      forgedRecord("gc07-unauthorized-human", { cutoffId: "control-cutoff:x" }),
+    ]);
+    expect(evaluateGroupChatEvidence("GC-07", cutoffForgery).passed).toBe(false);
+    expect(evaluateGroupChatEvidence("GC-07", mutate(0, [])).passed).toBe(false);
+    // #206 review 4: two identical rejected records must not count as exactly one.
+    const duplicated = mutate(0, [
+      forgedRecord("gc07-quoted-stop", {}),
+      forgedRecord("gc07-quoted-stop", { sequence: 2 }),
+    ]);
+    expect(evaluateGroupChatEvidence("GC-07", duplicated).passed).toBe(false);
+  });
+
+  const gc08Decision = (
+    operationId: string,
+    state: DeliveryDecisionRecord["state"],
+    reasonCode: string,
+  ): DeliveryDecisionRecord => ({
+    sequence: 1,
+    operationId,
+    senderId: fixture.residentIds.a,
+    state,
+    reasonCode,
+    count: 1,
+    permitConsumed: true,
+    rosterVersion: 1,
+    target: null,
+  });
+  const gc08Feedback = (operationId: string, reasonCode: string): SenderFeedbackRecord => ({
+    operationId,
+    senderId: fixture.residentIds.a,
+    roomId: fixture.roomId,
+    scopeId: "test-scope:room",
+    reasonCode,
+    count: 1,
+    phase: "delivered",
+    deliveryReceipt: `feedback-receipt:${operationId}`,
+    body: null,
+  });
+  const gc08Base = (): GroupChatEvidenceById["GC-08"] => ({
+    expectedByOperation: [
+      { operationId: "op-batch", senderId: a, state: "batched" },
+      { operationId: "op-not-included", senderId: a, state: "not-included" },
+      { operationId: "op-stopped", senderId: a, state: "stop-blocked" },
+      { operationId: "op-dispatch", senderId: a, state: "dispatch-failed" },
+    ],
+    decisions: [
+      gc08Decision("op-batch", "batched", "ROOM_BATCHED"),
+      gc08Decision("op-not-included", "not-included", "ROOM_NOT_INCLUDED"),
+      gc08Decision("op-stopped", "stop-blocked", "ROOM_STOPPED"),
+      gc08Decision("op-dispatch", "dispatch-failed", "ROOM_DISPATCH_FAILED"),
+    ],
+    offlineFeedbackMarkedDelivered: false,
+    deliveredFeedback: [
+      gc08Feedback("op-batch", "ROOM_BATCHED"),
+      gc08Feedback("op-not-included", "ROOM_NOT_INCLUDED"),
+      gc08Feedback("op-stopped", "ROOM_STOPPED"),
+      gc08Feedback("op-dispatch", "ROOM_DISPATCH_FAILED"),
+    ],
+    crossSenderFeedback: [],
+    leakedBlockedBody: false,
+    unsupportedClaims: [],
+    stableReasonsAcrossRestart: true,
+    persistFailureConsumedPermit: false,
+    persistedDecisionCountAfterRetry: 1,
+  });
+
+  it("GC-08 pins each expected state and its feedback reason to the operationId", () => {
+    expect(evaluateGroupChatEvidence("GC-08", gc08Base()).passed).toBe(true);
+    const swappedStates = {
+      ...gc08Base(),
+      decisions: [
+        gc08Decision("op-batch", "not-included", "ROOM_BATCHED"),
+        gc08Decision("op-not-included", "batched", "ROOM_NOT_INCLUDED"),
+        gc08Decision("op-stopped", "stop-blocked", "ROOM_STOPPED"),
+        gc08Decision("op-dispatch", "dispatch-failed", "ROOM_DISPATCH_FAILED"),
+      ],
+    };
+    expect(evaluateGroupChatEvidence("GC-08", swappedStates).passed).toBe(false);
+    const misalignedFeedback = {
+      ...gc08Base(),
+      deliveredFeedback: [
+        gc08Feedback("op-batch", "ROOM_DISPATCH_FAILED"),
+        gc08Feedback("op-not-included", "ROOM_NOT_INCLUDED"),
+        gc08Feedback("op-stopped", "ROOM_STOPPED"),
+        gc08Feedback("op-dispatch", "ROOM_DISPATCH_FAILED"),
+      ],
+    };
+    expect(evaluateGroupChatEvidence("GC-08", misalignedFeedback).passed).toBe(false);
+  });
+
+  const authorizedIds = ["gc10-event-1", "gc10-event-2", "gc10-event-3", "gc10-event-4"];
+  const gc10Projection = (
+    projectionId: string,
+    included: readonly string[],
+    omitted: readonly string[],
+    truncations: ProjectionReceipt["truncations"] = [],
+  ): ProjectionReceipt => ({
+    projectionId,
+    viewerId: fixture.residentIds.a,
+    sourceRange: [included[0] ?? "none", included[included.length - 1] ?? "none"],
+    watermark: "watermark:x",
+    policyVersion: "test-projection-policy:v1",
+    includedEventIds: [...included],
+    omittedEventIds: [...omitted],
+    complete: false,
+    errorCode: null,
+    truncations,
+  });
+  const gc10LongBody = "TEST-GC10-LONG-".repeat(12);
+  const gc10Truth = {
+    eventId: "gc10-event-3",
+    originalLength: 180,
+    maxCharacters: 24,
+    body: gc10LongBody,
+  } as const;
+  const gc10Truncation = {
+    eventId: "gc10-event-3",
+    originalLength: 180,
+    unit: "characters" as const,
+    keptStart: 0,
+    keptEnd: 24,
+    sourceRef: "room-source:gc10-event-3",
+    modelVisible: true,
+  };
+  const gc10Base = (): GroupChatEvidenceById["GC-10"] => ({
+    authorizedEventIds: authorizedIds,
+    batch: gc10Projection(
+      "gc10-batch",
+      ["gc10-event-1", "gc10-event-4"],
+      ["gc10-event-2", "gc10-event-3"],
+    ),
+    latest: gc10Projection(
+      "gc10-latest",
+      ["gc10-event-3", "gc10-event-4"],
+      ["gc10-event-1", "gc10-event-2"],
+    ),
+    truncated: gc10Projection(
+      "gc10-truncate",
+      ["gc10-event-3"],
+      ["gc10-event-1", "gc10-event-2", "gc10-event-4"],
+      [gc10Truncation],
+    ),
+    projectionContext: "room-source:gc10-event-3 180 characters 0:24",
+    truncationTruth: gc10Truth,
+    hiddenWorldFingerprints: ["x", "x", "x"],
+    grantedRead: {
+      sourceRef: "room-source:gc10-event-3",
+      viewerId: fixture.residentIds.a,
+      outcome: "granted",
+      eventId: "gc10-event-3",
+      body: gc10LongBody,
+      errorCode: null,
+    },
+    deniedRead: {
+      sourceRef: "room-source:gc10-event-3",
+      viewerId: fixture.residentIds.a,
+      outcome: "denied",
+      eventId: null,
+      body: null,
+      errorCode: "not-found",
+    },
+  });
+
+  it("GC-10 reconciles included/omitted identities with the judge-seeded authorized set", () => {
+    expect(evaluateGroupChatEvidence("GC-10", gc10Base()).passed).toBe(true);
+    const overlap = {
+      ...gc10Base(),
+      batch: gc10Projection(
+        "gc10-batch",
+        ["gc10-event-1", "gc10-event-4"],
+        ["gc10-event-4", "gc10-event-2", "gc10-event-3"],
+      ),
+    };
+    expect(evaluateGroupChatEvidence("GC-10", overlap).passed).toBe(false);
+    const staleLatest = {
+      ...gc10Base(),
+      latest: gc10Projection(
+        "gc10-latest",
+        ["gc10-event-2", "gc10-event-3"],
+        ["gc10-event-1", "gc10-event-4"],
+      ),
+    };
+    expect(evaluateGroupChatEvidence("GC-10", staleLatest).passed).toBe(false);
+    const doubleTruncate = {
+      ...gc10Base(),
+      truncated: gc10Projection(
+        "gc10-truncate",
+        ["gc10-event-3", "gc10-event-2"],
+        ["gc10-event-1", "gc10-event-4"],
+        [gc10Truncation],
+      ),
+    };
+    expect(evaluateGroupChatEvidence("GC-10", doubleTruncate).passed).toBe(false);
+    // #206 review 4: repeating one authorized id while dropping another must not reconcile.
+    const duplicatedId = {
+      ...gc10Base(),
+      batch: gc10Projection(
+        "gc10-batch",
+        ["gc10-event-1", "gc10-event-1"],
+        ["gc10-event-2", "gc10-event-3"],
+      ),
+    };
+    expect(evaluateGroupChatEvidence("GC-10", duplicatedId).passed).toBe(false);
+  });
+
+  const gc12OldTarget: DispatchIdentity = {
+    residentId: a,
+    scopeId: "test-scope:gc12",
+    scopeGeneration: 2,
+    windowId: "test-window:gc12",
+    generation: 2,
+    dispatchId: "test-dispatch:gc12-generation-2",
+  };
+  const gc12IndependentTarget: DispatchIdentity = {
+    residentId: a,
+    scopeId: "test-scope:gc12-independent",
+    scopeGeneration: 1,
+    windowId: "test-window:gc12-independent",
+    generation: 1,
+    dispatchId: "test-dispatch:gc12-independent-old",
+  };
+  const gc12IndependentRow = (
+    phase: MemberResultRecord["phase"],
+    sequence: number,
+    reasonCode: string | null = null,
+    target: DispatchIdentity = gc12IndependentTarget,
+  ): MemberResultRecord => ({
+    sequence,
+    operationId: "gc12-independent-old",
+    target,
+    phase,
+    reasonCode,
+  });
+  const gc12IndependentControlRow = (
+    action: "stop" | "continue",
+    phase: ControlRecord["phase"],
+    sequence: number,
+  ): ControlRecord => ({
+    sequence,
+    controlId: `gc12-independent-${action}`,
+    issuerId: fixture.humanId,
+    targetId: a,
+    action,
+    phase,
+    cutoffId: `control-cutoff:gc12-independent-${action}`,
+    externalEffectReversed: false,
+  });
+  const gc12IndependentControls = (): ControlRecord[] => [
+    gc12IndependentControlRow("stop", "accepted", 40),
+    gc12IndependentControlRow("stop", "effective", 41),
+    gc12IndependentControlRow("continue", "accepted", 42),
+    gc12IndependentControlRow("continue", "effective", 43),
+  ];
+  const gc12ResultRow = (
+    operationId: string,
+    phase: MemberResultRecord["phase"],
+    sequence: number,
+    reasonCode: string | null = null,
+  ): MemberResultRecord => ({
+    sequence,
+    operationId,
+    target: gc12OldTarget,
+    phase,
+    reasonCode,
+  });
+  const gc12Base = (): GroupChatEvidenceById["GC-12"] => ({
+    revokedDeliveryCommitted: false,
+    revokedDeliveryReasoned: true,
+    rosterVersionAdvanced: true,
+    staleResultActuallyReturned: true,
+    staleResultCommitted: false,
+    staleResultReasoned: true,
+    stoppedResultActuallyReturned: true,
+    stoppedResultCommitted: false,
+    stoppedResultReasoned: true,
+    postContinueResultCommitted: true,
+    forgedTupleFields: [
+      "residentId",
+      "scopeId",
+      "scopeGeneration",
+      "windowId",
+      "generation",
+      "dispatchId",
+    ],
+    forgedTupleAttempts: 6,
+    forgedTupleCommits: 0,
+    currentTupleCommits: 1,
+    postContinueStoppedResults: [
+      gc12ResultRow("gc12-cutoff-old", "returned", 30),
+      gc12ResultRow("gc12-cutoff-old", "rejected", 31, "ROOM_CONTROL_CUTOFF"),
+    ],
+    postContinueOldTarget: gc12OldTarget,
+    postContinueOldBodyInRoom: false,
+    independentFirstReturnResults: [
+      gc12IndependentRow("returned", 50),
+      gc12IndependentRow("rejected", 51, "ROOM_CONTROL_CUTOFF"),
+    ],
+    independentControls: gc12IndependentControls(),
+    independentControlTruth: {
+      stopControlId: "gc12-independent-stop",
+      continueControlId: "gc12-independent-continue",
+      issuerId: fixture.humanId,
+      targetId: a,
+    },
+    independentFirstReturnTarget: gc12IndependentTarget,
+    independentFirstReturnBodyInRoom: false,
+    independentNewPermitCommitted: true,
+  });
+
+  it("GC-12 requires a rejected cutoff record and one distinct field moved per forgery", () => {
+    expect(evaluateGroupChatEvidence("GC-12", gc12Base()).passed).toBe(true);
+    const noRejection = { ...gc12Base(), stoppedResultReasoned: false };
+    expect(evaluateGroupChatEvidence("GC-12", noRejection).passed).toBe(false);
+    const duplicatedFields = {
+      ...gc12Base(),
+      forgedTupleFields: [
+        "residentId",
+        "residentId",
+        "residentId",
+        "residentId",
+        "residentId",
+        "residentId",
+      ],
+    };
+    expect(evaluateGroupChatEvidence("GC-12", duplicatedFields).passed).toBe(false);
+  });
+
+  const gc16Attempt = (attempt: number): MemberAttemptRecord => ({
+    sequence: attempt,
+    operationId: "gc16-failing-member",
+    memberId: fixture.residentIds.a,
+    attempt,
+    outcome: "failed",
+    reasonCode: "ROOM_MEMBER_FAILED",
+  });
+  const gc16Base = (): GroupChatEvidenceById["GC-16"] => ({
+    failedMemberAttempts: [gc16Attempt(1), gc16Attempt(2)],
+    normalMemberCompleted: true,
+    humanContinued: true,
+    controlContinued: true,
+    heldWasActuallyInFlight: true,
+    heldTimedOut: true,
+    configuredMaxMemberAttempts: 2,
+    failingOperationAttempts: [gc16Attempt(1), gc16Attempt(2)],
+    restartPidChanged: true,
+    restartCommitStable: true,
+    failuresBeforeRestart: 2,
+    failuresAfterRestart: 2,
+    highWaterBeforeRestart: 2,
+    highWaterAfterRestart: 2,
+    failureFeedbackRetained: true,
+    falsePresenceClaims: [],
+    unsupportedClaims: [],
+  });
+
+  it("GC-16 bounds retries by attempt numbers, not just row counts", () => {
+    expect(evaluateGroupChatEvidence("GC-16", gc16Base()).passed).toBe(true);
+    const badSequences: readonly (readonly MemberAttemptRecord[])[] = [
+      [gc16Attempt(999)],
+      [gc16Attempt(0)],
+      [gc16Attempt(1), gc16Attempt(1)],
+      [gc16Attempt(2)],
+      [gc16Attempt(1), gc16Attempt(2), gc16Attempt(3)],
+    ];
+    for (const failingOperationAttempts of badSequences) {
+      const result = evaluateGroupChatEvidence("GC-16", {
+        ...gc16Base(),
+        failingOperationAttempts,
+      });
+      expect(result.passed, JSON.stringify(failingOperationAttempts)).toBe(false);
+      expect(result.detail).toContain("无界");
+    }
+  });
+
+  // #206 review 5: duplicates count as recorded; a unique-match readback may never wash them.
+  it("GC-01 counts duplicated forged-body copies in the recorded-author multiset", () => {
+    const base = {
+      legitimateHuman: { accepted: true, authorId: fixture.humanId },
+      legitimate: { accepted: true, authorId: a },
+      forgedEnvelopeAccepted: false,
+      forgedBodyAccepted: true,
+      forgedBodyAuthorId: a,
+      unexpectedAuthors: [],
+      recordedAuthorIds: [fixture.humanId, a, a],
+    };
+    expect(evaluateGroupChatEvidence("GC-01", base).passed).toBe(true);
+    const duplicated = evaluateGroupChatEvidence("GC-01", {
+      ...base,
+      forgedBodyAuthorId: null,
+      recordedAuthorIds: [fixture.humanId, a, a, a],
+    });
+    expect(duplicated.passed).toBe(false);
+  });
+
+  // #206 review 5: bounded worlds reconcile by operationId in host ledger order.
+  it("GC-06 reconciles bounded worlds by operationId in ledger order", () => {
+    expect(evaluateGroupChatEvidence("GC-06", gc06Base()).passed).toBe(true);
+    const withWorld = (
+      records: GroupChatEvidenceById["GC-06"]["boundedWorlds"][number]["records"],
+    ): GroupChatEvidenceById["GC-06"] => ({
+      ...gc06Base(),
+      boundedWorlds: [
+        { budget: 1, records, oneRoot: true, policyVersionStable: true },
+        gc06Base().boundedWorlds[1] as GroupChatEvidenceById["GC-06"]["boundedWorlds"][number],
+      ],
+    });
+    const turn1 = gc06TurnRecord("gc06-B1-turn-1", "permitted", 1);
+    const turn2 = gc06TurnRecord("gc06-B1-turn-2", "blocked", 2, "ROOM_TURN_BUDGET_EXHAUSTED");
+    // Operation labels swapped between the two turns.
+    expect(
+      evaluateGroupChatEvidence(
+        "GC-06",
+        withWorld([
+          gc06TurnRecord("gc06-B1-turn-2", "permitted", 1),
+          { ...turn2, operationId: "gc06-B1-turn-1" },
+        ]),
+      ).passed,
+    ).toBe(false);
+    // Block-before-permit: the ledger order itself is inverted.
+    expect(
+      evaluateGroupChatEvidence(
+        "GC-06",
+        withWorld([
+          { ...turn2, sequence: 1 },
+          { ...turn1, sequence: 2 },
+        ]),
+      ).passed,
+    ).toBe(false);
+    // Missing, duplicated and extra records.
+    expect(evaluateGroupChatEvidence("GC-06", withWorld([turn1])).passed).toBe(false);
+    expect(
+      evaluateGroupChatEvidence("GC-06", withWorld([turn1, turn2, { ...turn2, sequence: 3 }]))
+        .passed,
+    ).toBe(false);
+    // The blocking record must carry a stable reason.
+    expect(
+      evaluateGroupChatEvidence("GC-06", withWorld([turn1, { ...turn2, reasonCode: "" }])).passed,
+    ).toBe(false);
+  });
+
+  // #206 review 5: the generation-change stimulus needs exactly one reasoned blocked record.
+  it("GC-06 requires exactly one reasoned blocked record for the generation-change stimulus", () => {
+    expect(evaluateGroupChatEvidence("GC-06", gc06Base()).passed).toBe(true);
+    const badAttempts: readonly (readonly Pick<RoundRecord, "decision" | "reasonCode">[])[] = [
+      [],
+      [
+        { decision: "blocked", reasonCode: "ROOM_TURN_BUDGET_EXHAUSTED" },
+        { decision: "blocked", reasonCode: "ROOM_TURN_BUDGET_EXHAUSTED" },
+      ],
+      [{ decision: "human-trigger", reasonCode: null }],
+      [{ decision: "passed", reasonCode: null }],
+      [{ decision: "failed", reasonCode: "ROOM_MEMBER_FAILED" }],
+      [{ decision: "retry-replayed", reasonCode: null }],
+      [{ decision: "blocked", reasonCode: "" }],
+      [{ decision: "blocked", reasonCode: null }],
+    ];
+    for (const identityChangeAttempts of badAttempts) {
+      const result = evaluateGroupChatEvidence("GC-06", {
+        ...gc06Base(),
+        identityChangeAttempts,
+      });
+      expect(result.passed, JSON.stringify(identityChangeAttempts)).toBe(false);
+      expect(result.detail).toContain("换代刺激");
+    }
+  });
+
+  // #206 review 5: the unreachable control needs exactly one incomplete record, nothing else.
+  it("GC-07 requires exactly one incomplete record for the unreachable control", () => {
+    expect(evaluateGroupChatEvidence("GC-07", gc07Base()).passed).toBe(true);
+    const unreachableRecord = (overrides: Partial<ControlRecord>): ControlRecord => ({
+      sequence: 1,
+      controlId: "gc07-unreachable",
+      issuerId: fixture.humanId,
+      targetId: fixture.residentIds.c,
+      action: "stop",
+      phase: "incomplete",
+      cutoffId: null,
+      externalEffectReversed: false,
+      ...overrides,
+    });
+    const badRecords: readonly (readonly ControlRecord[])[] = [
+      [],
+      [unreachableRecord({}), unreachableRecord({ sequence: 2 })],
+      [unreachableRecord({}), unreachableRecord({ sequence: 2, phase: "effective" })],
+      [unreachableRecord({ sequence: 2, phase: "accepted" }), unreachableRecord({})],
+      [unreachableRecord({ phase: "effective" })],
+      [unreachableRecord({ cutoffId: "control-cutoff:x" })],
+    ];
+    for (const unreachableRecords of badRecords) {
+      const result = evaluateGroupChatEvidence("GC-07", { ...gc07Base(), unreachableRecords });
+      expect(result.passed, JSON.stringify(unreachableRecords)).toBe(false);
+      expect(result.detail).toContain("不可达");
+    }
+  });
+
+  // #206 review 5: proxy-signed resident receipts and personal-state claims by residents.
+  const gc09Receipt = (overrides: Partial<SystemReceipt>): SystemReceipt => ({
+    actor: "system",
+    phase: "recorded",
+    ...overrides,
+  });
+  const gc09Base = (): GroupChatEvidenceById["GC-09"] => ({
+    receipts: [
+      gc09Receipt({ phase: "recorded", claim: "系统已收" }),
+      gc09Receipt({ phase: "dispatched", claim: "已派发" }),
+      gc09Receipt({
+        phase: "context-committed",
+        claim: "已装入",
+        contextCommitRef: "context-commit:1",
+      }),
+      gc09Receipt({ actor: a, phase: "reaction" }),
+    ],
+    receiptsAfterRecord: [gc09Receipt({ phase: "recorded", claim: "系统已收" })],
+    receiptsAfterDispatch: [
+      gc09Receipt({ phase: "recorded", claim: "系统已收" }),
+      gc09Receipt({ phase: "dispatched", claim: "已派发" }),
+    ],
+    prematureReceiptPhases: [],
+    judgeSeededContextCommitId: "context-commit:1",
+    reactionAuthorsBeforeResidentReacted: [],
+    reactionAuthorsAfterResidentReacted: [a],
+    memoryRecordsAddedByContextCommit: 0,
+  });
+
+  it("GC-09 flags any resident-signed receipt in the snapshots before the resident reacts", () => {
+    expect(evaluateGroupChatEvidence("GC-09", gc09Base()).passed).toBe(true);
+    const proxySigned = {
+      ...gc09Base(),
+      receiptsAfterRecord: [
+        ...gc09Base().receiptsAfterRecord,
+        gc09Receipt({ actor: a, phase: "seen", claim: "成员已读并记住了" }),
+      ],
+    };
+    const result = evaluateGroupChatEvidence("GC-09", proxySigned);
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("代签");
+  });
+
+  it("GC-09 runs personal-state guards over resident-authored receipts even after a real reaction", () => {
+    const claimForgery = evaluateGroupChatEvidence("GC-09", {
+      ...gc09Base(),
+      receipts: [
+        ...gc09Base().receipts,
+        gc09Receipt({ actor: a, phase: "reaction", claim: "成员已读并记住了" }),
+      ],
+    });
+    expect(claimForgery.passed).toBe(false);
+    const phaseForgery = evaluateGroupChatEvidence("GC-09", {
+      ...gc09Base(),
+      receipts: [...gc09Base().receipts, gc09Receipt({ actor: a, phase: "seen" })],
+    });
+    expect(phaseForgery.passed).toBe(false);
+  });
+
+  // #206 review 5: truncation metadata is bound to the judge-seeded truth, field-exact.
+  it("GC-10 binds truncation metadata to judge truth with field-exact context matching", () => {
+    expect(evaluateGroupChatEvidence("GC-10", gc10Base()).passed).toBe(true);
+    const wrongEvent = {
+      ...gc10Base(),
+      truncated: gc10Projection(
+        "gc10-truncate",
+        ["gc10-event-3"],
+        ["gc10-event-1", "gc10-event-2", "gc10-event-4"],
+        [{ ...gc10Truncation, eventId: "gc10-event-2" }],
+      ),
+    };
+    expect(evaluateGroupChatEvidence("GC-10", wrongEvent).passed).toBe(false);
+    // The review's wash: originalLength forged to kept+1 with the context line synced.
+    const forgedLength = {
+      ...gc10Base(),
+      truncated: gc10Projection(
+        "gc10-truncate",
+        ["gc10-event-3"],
+        ["gc10-event-1", "gc10-event-2", "gc10-event-4"],
+        [{ ...gc10Truncation, originalLength: 25 }],
+      ),
+      projectionContext: "room-source:gc10-event-3 25 characters 0:24",
+    };
+    const forgedResult = evaluateGroupChatEvidence("GC-10", forgedLength);
+    expect(forgedResult.passed).toBe(false);
+    expect(forgedResult.detail).toContain("原长");
+    // Kept range over the requested cap / degenerate range.
+    const overCap = {
+      ...gc10Base(),
+      truncated: gc10Projection(
+        "gc10-truncate",
+        ["gc10-event-3"],
+        ["gc10-event-1", "gc10-event-2", "gc10-event-4"],
+        [{ ...gc10Truncation, keptEnd: 25 }],
+      ),
+      projectionContext: "room-source:gc10-event-3 180 characters 0:25",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", overCap).passed).toBe(false);
+    const degenerate = {
+      ...gc10Base(),
+      truncated: gc10Projection(
+        "gc10-truncate",
+        ["gc10-event-3"],
+        ["gc10-event-1", "gc10-event-2", "gc10-event-4"],
+        [{ ...gc10Truncation, keptStart: 24, keptEnd: 24 }],
+      ),
+      projectionContext: "room-source:gc10-event-3 180 characters 24:24",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", degenerate).passed).toBe(false);
+    // Substring washing: "1180" contains "180" but is not the field.
+    const substringWash = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3 1180 characters 0:24",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", substringWash).passed).toBe(false);
+  });
+
+  // #206 review 6: exact-match boundaries must accept honest JSON / key=value renderings.
+  it("GC-10 accepts JSON and key=value contexts, and rejects extended-token washes", () => {
+    const jsonContext =
+      '{"sourceRef":"room-source:gc10-event-3","originalLength":180,"unit":"characters","kept":"0:24"}';
+    expect(
+      evaluateGroupChatEvidence("GC-10", { ...gc10Base(), projectionContext: jsonContext }).passed,
+    ).toBe(true);
+    const keyValueContext =
+      "sourceRef=room-source:gc10-event-3, originalLength=180, unit=characters, range=(0:24)";
+    expect(
+      evaluateGroupChatEvidence("GC-10", { ...gc10Base(), projectionContext: keyValueContext })
+        .passed,
+    ).toBe(true);
+    // A JSON context whose value differs from the receipt must not wash (125-style).
+    const jsonWrongValue =
+      '{"sourceRef":"room-source:gc10-event-3","originalLength":125,"unit":"characters","kept":"0:24"}';
+    expect(
+      evaluateGroupChatEvidence("GC-10", { ...gc10Base(), projectionContext: jsonWrongValue })
+        .passed,
+    ).toBe(false);
+    // Extended tokens: unit, sourceRef and range continuations all stay red.
+    const unitExtended = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3 180 charactersX 0:24",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", unitExtended).passed).toBe(false);
+    const sourceRefExtended = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3-ext 180 characters 0:24",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", sourceRefExtended).passed).toBe(false);
+    const sourceRefColonExtended = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3:4 180 characters 0:24",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", sourceRefColonExtended).passed).toBe(false);
+    const rangeExtended = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3 180 characters 10:240",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", rangeExtended).passed).toBe(false);
+    // #206 review 7: same-token `_`/`-` continuations of numeric and range values stay red.
+    const numericUnderscore = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3 _180 characters 0:24",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", numericUnderscore).passed).toBe(false);
+    const numericDashed = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3 180-ext characters 0:24",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", numericDashed).passed).toBe(false);
+    const rangeUnderscore = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3 180 characters _0:24",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", rangeUnderscore).passed).toBe(false);
+    const rangeDashed = {
+      ...gc10Base(),
+      projectionContext: "room-source:gc10-event-3 180 characters 0:24-ext",
+    };
+    expect(evaluateGroupChatEvidence("GC-10", rangeDashed).passed).toBe(false);
+  });
+
+  // #206 review 8: the old permit's first return after continue must still meet the cutoff.
+  it("GC-07/GC-12 hold the cutoff for the old permit's first return after continue", () => {
+    expect(evaluateGroupChatEvidence("GC-07", gc07Base()).passed).toBe(true);
+    expect(evaluateGroupChatEvidence("GC-12", gc12Base()).passed).toBe(true);
+    const shapes: readonly (readonly MemberResultRecord[])[] = [
+      [],
+      [gc07ResultRow("gc07-old-permit", "returned", 20)],
+      [
+        gc07ResultRow("gc07-old-permit", "returned", 20),
+        gc07ResultRow("gc07-old-permit", "committed", 21),
+      ],
+      [
+        gc07ResultRow("gc07-old-permit", "returned", 20),
+        gc07ResultRow("gc07-old-permit", "rejected", 21, ""),
+      ],
+      [
+        gc07ResultRow("gc07-old-permit", "returned", 20),
+        gc07ResultRow("gc07-old-permit", "rejected", 21, "ROOM_CONTROL_CUTOFF"),
+        gc07ResultRow("gc07-old-permit", "committed", 22),
+      ],
+      [
+        gc07ResultRow("gc07-old-permit", "returned", 20),
+        gc07ResultRow("gc07-old-permit", "rejected", 21, "ROOM_CONTROL_CUTOFF"),
+        gc07ResultRow("gc07-old-permit", "rejected", 22, "ROOM_CONTROL_CUTOFF"),
+      ],
+    ];
+    for (const postContinueOldPermitResults of shapes) {
+      const result = evaluateGroupChatEvidence("GC-07", {
+        ...gc07Base(),
+        postContinueOldPermitResults,
+      });
+      expect(result.passed, JSON.stringify(postContinueOldPermitResults)).toBe(false);
+    }
+    const gc07Leak = evaluateGroupChatEvidence("GC-07", {
+      ...gc07Base(),
+      postContinueOldBodyInRoom: true,
+    });
+    expect(gc07Leak.passed).toBe(false);
+    for (const postContinueStoppedResults of shapes) {
+      const result = evaluateGroupChatEvidence("GC-12", {
+        ...gc12Base(),
+        postContinueStoppedResults: postContinueStoppedResults.map((row) => ({
+          ...row,
+          operationId: "gc12-cutoff-old",
+        })),
+      });
+      expect(result.passed, JSON.stringify(postContinueStoppedResults)).toBe(false);
+    }
+    const gc12Leak = evaluateGroupChatEvidence("GC-12", {
+      ...gc12Base(),
+      postContinueOldBodyInRoom: true,
+    });
+    expect(gc12Leak.passed).toBe(false);
+  });
+
+  // #206 review 8: the granted source read must equal the judge-seeded body, not a prefix.
+  it("GC-10 binds the granted source-read body to the full judge-seeded truth", () => {
+    expect(evaluateGroupChatEvidence("GC-10", gc10Base()).passed).toBe(true);
+    const honestRead = gc10Base().grantedRead as SourceReadAudit;
+    const truncatedBody = {
+      ...gc10Base(),
+      grantedRead: { ...honestRead, body: gc10LongBody.slice(0, 24) },
+    };
+    const truncatedResult = evaluateGroupChatEvidence("GC-10", truncatedBody);
+    expect(truncatedResult.passed).toBe(false);
+    expect(truncatedResult.detail).toContain("精确相等");
+    const rewrittenBody = {
+      ...gc10Base(),
+      grantedRead: {
+        ...honestRead,
+        body: `${gc10LongBody.slice(0, 60)}XXXX${gc10LongBody.slice(64)}`,
+      },
+    };
+    expect(evaluateGroupChatEvidence("GC-10", rewrittenBody).passed).toBe(false);
+  });
+
+  // #206 review 8: decisions and feedback must carry the judge-owned senderId.
+  it("GC-08 binds each decision and its feedback to the judge-owned senderId", () => {
+    expect(evaluateGroupChatEvidence("GC-08", gc08Base()).passed).toBe(true);
+    const b = fixture.residentIds.b;
+    const wrongDecisionSender = {
+      ...gc08Base(),
+      decisions: [
+        gc08Decision("op-batch", "batched", "ROOM_BATCHED"),
+        { ...gc08Decision("op-not-included", "not-included", "ROOM_NOT_INCLUDED"), senderId: b },
+        gc08Decision("op-stopped", "stop-blocked", "ROOM_STOPPED"),
+        gc08Decision("op-dispatch", "dispatch-failed", "ROOM_DISPATCH_FAILED"),
+      ],
+    };
+    const decisionResult = evaluateGroupChatEvidence("GC-08", wrongDecisionSender);
+    expect(decisionResult.passed).toBe(false);
+    expect(decisionResult.detail).toContain("senderId");
+    const wrongFeedbackSender = {
+      ...gc08Base(),
+      deliveredFeedback: [
+        gc08Feedback("op-batch", "ROOM_BATCHED"),
+        { ...gc08Feedback("op-not-included", "ROOM_NOT_INCLUDED"), senderId: b },
+        gc08Feedback("op-stopped", "ROOM_STOPPED"),
+        gc08Feedback("op-dispatch", "ROOM_DISPATCH_FAILED"),
+      ],
+    };
+    const feedbackResult = evaluateGroupChatEvidence("GC-08", wrongFeedbackSender);
+    expect(feedbackResult.passed).toBe(false);
+    expect(feedbackResult.detail).toContain("判卷发送方");
+  });
+
+  // #206 review 9: post-continue rows must carry the judge-owned target, in ledger order.
+  it("GC-07/GC-12 bind post-continue rows to the judge target and ledger order", () => {
+    expect(evaluateGroupChatEvidence("GC-07", gc07Base()).passed).toBe(true);
+    expect(evaluateGroupChatEvidence("GC-12", gc12Base()).passed).toBe(true);
+    // Wrong dispatchId on both rows.
+    const gc07WrongDispatch = gc07Base().postContinueOldPermitResults.map((row) => ({
+      ...row,
+      target: { ...gc07OldTarget, dispatchId: "test-dispatch:other" },
+    }));
+    const gc07DispatchResult = evaluateGroupChatEvidence("GC-07", {
+      ...gc07Base(),
+      postContinueOldPermitResults: gc07WrongDispatch,
+    });
+    expect(gc07DispatchResult.passed).toBe(false);
+    expect(gc07DispatchResult.detail).toContain("六元组");
+    // Another identity field moved instead.
+    const gc07WrongGeneration = gc07Base().postContinueOldPermitResults.map((row) => ({
+      ...row,
+      target: { ...gc07OldTarget, generation: 99 },
+    }));
+    expect(
+      evaluateGroupChatEvidence("GC-07", {
+        ...gc07Base(),
+        postContinueOldPermitResults: gc07WrongGeneration,
+      }).passed,
+    ).toBe(false);
+    // Reversed ledger order: rejected before returned.
+    const gc07Reversed = {
+      ...gc07Base(),
+      postContinueOldPermitResults: [
+        gc07ResultRow("gc07-old-permit", "rejected", 20, "ROOM_CONTROL_CUTOFF"),
+        gc07ResultRow("gc07-old-permit", "returned", 21),
+      ],
+    };
+    const gc07ReversedResult = evaluateGroupChatEvidence("GC-07", gc07Reversed);
+    expect(gc07ReversedResult.passed).toBe(false);
+    expect(gc07ReversedResult.detail).toContain("没有先于");
+    // GC-12: same bindings.
+    const gc12WrongDispatch = gc12Base().postContinueStoppedResults.map((row) => ({
+      ...row,
+      target: { ...gc12OldTarget, dispatchId: "test-dispatch:other" },
+    }));
+    expect(
+      evaluateGroupChatEvidence("GC-12", {
+        ...gc12Base(),
+        postContinueStoppedResults: gc12WrongDispatch,
+      }).passed,
+    ).toBe(false);
+    const gc12Reversed = {
+      ...gc12Base(),
+      postContinueStoppedResults: [
+        gc12ResultRow("gc12-cutoff-old", "rejected", 30, "ROOM_CONTROL_CUTOFF"),
+        gc12ResultRow("gc12-cutoff-old", "returned", 31),
+      ],
+    };
+    expect(evaluateGroupChatEvidence("GC-12", gc12Reversed).passed).toBe(false);
+  });
+
+  // #206 review 10: the independent world's first late return after continue, pinned — a
+  // memoized terminal rejection has no cache entry for this operation, so commit/leak,
+  // missing/extra rows, blank reasons, wrong identity and reversed order all go red.
+  it("GC-07/GC-12 pin the independent world's first late return after continue", () => {
+    expect(evaluateGroupChatEvidence("GC-07", gc07Base()).passed).toBe(true);
+    expect(evaluateGroupChatEvidence("GC-12", gc12Base()).passed).toBe(true);
+    const shapes: readonly (readonly MemberResultRecord[])[] = [
+      [],
+      [gc07IndependentRow("returned", 40)],
+      [gc07IndependentRow("returned", 40), gc07IndependentRow("committed", 41)],
+      [gc07IndependentRow("returned", 40), gc07IndependentRow("rejected", 41, "")],
+      [
+        gc07IndependentRow("returned", 40),
+        gc07IndependentRow("rejected", 41, "ROOM_CONTROL_CUTOFF"),
+        gc07IndependentRow("committed", 42),
+      ],
+      [
+        gc07IndependentRow("returned", 40),
+        gc07IndependentRow("rejected", 41, "ROOM_CONTROL_CUTOFF"),
+        gc07IndependentRow("rejected", 42, "ROOM_CONTROL_CUTOFF"),
+      ],
+      [
+        gc07IndependentRow("rejected", 40, "ROOM_CONTROL_CUTOFF"),
+        gc07IndependentRow("returned", 41),
+      ],
+      [
+        gc07IndependentRow("returned", 40),
+        gc07IndependentRow("rejected", 41, "ROOM_CONTROL_CUTOFF", {
+          ...gc07IndependentTarget,
+          dispatchId: "test-dispatch:other",
+        }),
+      ],
+    ];
+    for (const independentFirstReturnResults of shapes) {
+      const result = evaluateGroupChatEvidence("GC-07", {
+        ...gc07Base(),
+        independentFirstReturnResults,
+      });
+      expect(result.passed, JSON.stringify(independentFirstReturnResults)).toBe(false);
+    }
+    const gc07Committed = evaluateGroupChatEvidence("GC-07", {
+      ...gc07Base(),
+      independentFirstReturnResults: [
+        gc07IndependentRow("returned", 40),
+        gc07IndependentRow("committed", 41),
+      ],
+    });
+    expect(gc07Committed.passed).toBe(false);
+    expect(gc07Committed.detail).toContain("仍被提交");
+    expect(
+      evaluateGroupChatEvidence("GC-07", { ...gc07Base(), independentFirstReturnBodyInRoom: true })
+        .passed,
+    ).toBe(false);
+    expect(
+      evaluateGroupChatEvidence("GC-07", { ...gc07Base(), independentNewPermitCommitted: false })
+        .passed,
+    ).toBe(false);
+    for (const shape of shapes) {
+      const independentFirstReturnResults = shape.map((row) => ({
+        ...row,
+        operationId: "gc12-independent-old",
+        target:
+          row.target.dispatchId === "test-dispatch:other"
+            ? { ...gc12IndependentTarget, dispatchId: "test-dispatch:other" }
+            : gc12IndependentTarget,
+      }));
+      const result = evaluateGroupChatEvidence("GC-12", {
+        ...gc12Base(),
+        independentFirstReturnResults,
+      });
+      expect(result.passed, JSON.stringify(independentFirstReturnResults)).toBe(false);
+    }
+    const gc12Committed = evaluateGroupChatEvidence("GC-12", {
+      ...gc12Base(),
+      independentFirstReturnResults: [
+        gc12IndependentRow("returned", 50),
+        gc12IndependentRow("committed", 51),
+      ],
+    });
+    expect(gc12Committed.passed).toBe(false);
+    expect(gc12Committed.detail).toContain("复活");
+    expect(
+      evaluateGroupChatEvidence("GC-12", { ...gc12Base(), independentFirstReturnBodyInRoom: true })
+        .passed,
+    ).toBe(false);
+    expect(
+      evaluateGroupChatEvidence("GC-12", { ...gc12Base(), independentNewPermitCommitted: false })
+        .passed,
+    ).toBe(false);
+    // Control truth and continue-sequence binding (review 10 second pass): the world's own
+    // stop/continue ledger must prove the pair, and every first-return row must land after
+    // the continue-effective sequence.
+    const gc07ControlShapes: readonly (readonly ControlRecord[])[] = [
+      gc07IndependentControls().filter((row) => row.action !== "continue"),
+      gc07IndependentControls().filter(
+        (row) => row.action !== "continue" || row.phase !== "effective",
+      ),
+      [
+        gc07IndependentControlRow("stop", "accepted", 30),
+        gc07IndependentControlRow("stop", "effective", 31),
+        gc07IndependentControlRow("continue", "effective", 32),
+        gc07IndependentControlRow("continue", "accepted", 33),
+      ],
+      [
+        gc07IndependentControlRow("stop", "accepted", 30),
+        gc07IndependentControlRow("continue", "accepted", 32),
+        gc07IndependentControlRow("continue", "effective", 33),
+        gc07IndependentControlRow("stop", "effective", 34),
+      ],
+    ];
+    for (const independentControls of gc07ControlShapes) {
+      const result = evaluateGroupChatEvidence("GC-07", { ...gc07Base(), independentControls });
+      expect(result.passed, JSON.stringify(independentControls)).toBe(false);
+    }
+    for (const independentFirstReturnResults of [
+      [
+        gc07IndependentRow("returned", 33),
+        gc07IndependentRow("rejected", 41, "ROOM_CONTROL_CUTOFF"),
+      ],
+      [
+        gc07IndependentRow("returned", 20),
+        gc07IndependentRow("rejected", 21, "ROOM_CONTROL_CUTOFF"),
+      ],
+    ]) {
+      const result = evaluateGroupChatEvidence("GC-07", {
+        ...gc07Base(),
+        independentFirstReturnResults,
+      });
+      expect(result.passed, JSON.stringify(independentFirstReturnResults)).toBe(false);
+      expect(result.detail).toContain("生效之前");
+    }
+    const gc12ControlShapes: readonly (readonly ControlRecord[])[] = gc07ControlShapes.map(
+      (shape) =>
+        shape.map((row) => ({
+          ...row,
+          controlId: `gc12-independent-${row.action}`,
+          cutoffId: `control-cutoff:gc12-independent-${row.action}`,
+          sequence: row.sequence + 10,
+        })),
+    );
+    for (const independentControls of gc12ControlShapes) {
+      const result = evaluateGroupChatEvidence("GC-12", { ...gc12Base(), independentControls });
+      expect(result.passed, JSON.stringify(independentControls)).toBe(false);
+    }
+    for (const independentFirstReturnResults of [
+      [
+        gc12IndependentRow("returned", 43),
+        gc12IndependentRow("rejected", 51, "ROOM_CONTROL_CUTOFF"),
+      ],
+      [
+        gc12IndependentRow("returned", 30),
+        gc12IndependentRow("rejected", 31, "ROOM_CONTROL_CUTOFF"),
+      ],
+    ]) {
+      const result = evaluateGroupChatEvidence("GC-12", {
+        ...gc12Base(),
+        independentFirstReturnResults,
+      });
+      expect(result.passed, JSON.stringify(independentFirstReturnResults)).toBe(false);
+      expect(result.detail).toContain("生效之前");
+    }
+    // Control-identity binding (review 10 round 3): every row of the pair must match the
+    // judge-owned controlId/issuerId/targetId. cutoffId stays unjudged — the driver contract
+    // only freezes `string | null`, no cutoffId shape is part of the adapter protocol.
+    const gc07IdentityShapes: readonly (readonly ControlRecord[])[] = [
+      gc07IndependentControls().map((row) =>
+        row.action === "stop" ? { ...row, controlId: "gc07-independent-washed" } : row,
+      ),
+      gc07IndependentControls().map((row) =>
+        row.action === "continue" ? { ...row, targetId: fixture.residentIds.b } : row,
+      ),
+      gc07IndependentControls().map((row) =>
+        row.action === "stop" ? { ...row, issuerId: fixture.unauthorizedHumanId } : row,
+      ),
+    ];
+    const gc07IdentityReasons = ["授权身份", "授权身份", "授权身份"] as const;
+    for (const [index, independentControls] of gc07IdentityShapes.entries()) {
+      const result = evaluateGroupChatEvidence("GC-07", { ...gc07Base(), independentControls });
+      expect(result.passed, JSON.stringify(independentControls)).toBe(false);
+      expect(result.detail).toContain(gc07IdentityReasons[index] ?? "");
+    }
+    const gc12IdentityShapes: readonly (readonly ControlRecord[])[] = gc07IdentityShapes.map(
+      (shape) =>
+        shape.map((row) => ({
+          ...row,
+          controlId: row.controlId.replace("gc07-independent", "gc12-independent"),
+          cutoffId:
+            row.cutoffId === null
+              ? null
+              : row.cutoffId.replace("gc07-independent", "gc12-independent"),
+          sequence: row.sequence + 10,
+        })),
+    );
+    for (const independentControls of gc12IdentityShapes) {
+      const result = evaluateGroupChatEvidence("GC-12", { ...gc12Base(), independentControls });
+      expect(result.passed, JSON.stringify(independentControls)).toBe(false);
+    }
+  });
+});
+
+describe("#191/#192 runner: real-host provenance and static source scan", () => {
   const head = "0123456789abcdef0123456789abcdef01234567";
   const judgePid = 4242;
   const node = "/opt/test-node/bin/node";
@@ -1307,6 +4006,24 @@ describe("#191 runner: real-host provenance and static source scan", () => {
     },
   );
 
+  it("fails restart provenance when the previous host pid is still alive or reused", () => {
+    const previous = { pid: 5000, commit: head };
+    const current = { pid: 5001, commit: head };
+    const factsFor = (alivePids: readonly number[]): HostProvenanceFacts => ({
+      headCommit: head,
+      judgePid,
+      judgeExecutable: node,
+      repoRoot,
+      readProcess: (pid) =>
+        alivePids.includes(pid) ? hostProcess({ ancestors: [judgePid, 1] }) : null,
+    });
+    expect(restartedHostProvenanceProblem(previous, current, factsFor([5000, 5001]))).toMatch(
+      /still alive/,
+    );
+    expect(restartedHostProvenanceProblem(previous, previous, factsFor([5001]))).toMatch(/reused/);
+    expect(restartedHostProvenanceProblem(previous, current, factsFor([5001]))).toBeNull();
+  });
+
   it.todo(
     "writes a durable challenge straight into the host's room ledger and reads it back through the adapter (needs the #191 adapter's data-root contract)",
   );
@@ -1330,5 +4047,158 @@ describe("#191 runner: real-host provenance and static source scan", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("#206 review 1 runner: restart provenance failure is a whole-run red, never one lamp", () => {
+  const head = "0123456789abcdef0123456789abcdef01234567";
+  const judgePid = 4242;
+  const node = "/opt/test-node/bin/node";
+  const repoRoot = fileURLToPath(new URL("..", import.meta.url));
+  const entry = join("src", "installer", "cli.ts");
+
+  type HostRun = { readonly pid: number; readonly commit: string };
+  type RestartScript = (previous: HostRun, alive: Set<number>) => HostRun;
+
+  /** A synthetic host whose process story is readable by the judge's own facts. */
+  class RestartProbeHost extends SyntheticGroupChatHost {
+    private readonly alivePids = new Set<number>();
+    private stoppedNow = false;
+    private currentRun: HostRun = { pid: 5000, commit: head };
+    constructor(private readonly restartScript: RestartScript) {
+      super();
+    }
+    override async startHost(): Promise<HostRun> {
+      this.alivePids.add(this.currentRun.pid);
+      return this.currentRun;
+    }
+    override async restartHost(): Promise<HostRun> {
+      this.currentRun = this.restartScript(this.currentRun, this.alivePids);
+      return this.currentRun;
+    }
+    override async stopHost(): Promise<void> {
+      this.stoppedNow = true;
+      this.alivePids.clear();
+    }
+    override async readRoomEvents(roomId?: string): Promise<readonly RoomEvent[]> {
+      if (this.stoppedNow) throw new Error("host stopped");
+      return super.readRoomEvents(roomId);
+    }
+    get livePids(): ReadonlySet<number> {
+      return this.alivePids;
+    }
+  }
+
+  const probeFacts = (host: RestartProbeHost): HostProvenanceFacts => ({
+    headCommit: head,
+    judgePid,
+    judgeExecutable: node,
+    repoRoot,
+    readProcess: (pid) =>
+      host.livePids.has(pid)
+        ? {
+            alive: true,
+            ancestors: [judgePid, 1],
+            executable: node,
+            args: [node, "--import", "tsx", entry],
+          }
+        : null,
+  });
+
+  const runWith = async (restartScript: RestartScript, strict: boolean) => {
+    const host = new RestartProbeHost(restartScript);
+    return executeGroupChatAcceptance({
+      strict,
+      loadDriver: async () => ({ driver: host, stubbed: new Set<string>() }),
+      facts: probeFacts(host),
+      log: () => {},
+    });
+  };
+
+  const healthyRestart: RestartScript = (previous, alive) => {
+    alive.delete(previous.pid);
+    const next = { pid: previous.pid + 1, commit: previous.commit };
+    alive.add(next.pid);
+    return next;
+  };
+
+  it("runs all thirteen lamps green with an attributable restart", async () => {
+    const outcome = await runWith(healthyRestart, true);
+    expect(outcome.provenanceFailed).toBe(false);
+    expect(scoreGroupChatResults(outcome.results)).toEqual({
+      trueGreen: 13,
+      stubGreen: 0,
+      strictPass: true,
+    });
+    expect(outcome.exitCode).toBe(0);
+  });
+
+  it.each([
+    ["a reused pid", (previous: HostRun, _alive: Set<number>): HostRun => previous],
+    [
+      "the previous pid still alive",
+      (previous: HostRun, alive: Set<number>): HostRun => {
+        const next = { pid: previous.pid + 1, commit: previous.commit };
+        alive.add(next.pid);
+        return next;
+      },
+    ],
+    [
+      "a changed commit",
+      (previous: HostRun, alive: Set<number>): HostRun => {
+        alive.delete(previous.pid);
+        const next = {
+          pid: previous.pid + 1,
+          commit: "fedcba9876543210fedcba9876543210fedcba98",
+        };
+        alive.add(next.pid);
+        return next;
+      },
+    ],
+    [
+      "a current process that is not running",
+      (previous: HostRun, alive: Set<number>): HostRun => {
+        alive.delete(previous.pid);
+        return { pid: previous.pid + 2, commit: previous.commit };
+      },
+    ],
+  ] as const)(
+    "restart provenance failure (%s) paints every lamp red in both modes",
+    async (_label, restartScript) => {
+      for (const strict of [false, true]) {
+        const outcome = await runWith(restartScript, strict);
+        expect(outcome.provenanceFailed, `strict=${strict}`).toBe(true);
+        expect(outcome.results.map((result) => result.id)).toEqual(GROUP_CHAT_CHECK_IDS);
+        for (const result of outcome.results) {
+          expect(result.passed, `strict=${strict}`).toBe(false);
+          expect(result.detail, `strict=${strict}`).toContain("provenance");
+          expect(result.detail, `strict=${strict}`).not.toContain("scenario threw");
+        }
+        expect(scoreGroupChatResults(outcome.results)).toEqual({
+          trueGreen: 0,
+          stubGreen: 0,
+          strictPass: false,
+        });
+        expect(outcome.exitCode, `strict=${strict}`).toBe(1);
+      }
+    },
+  );
+
+  it("keeps a missing driver as the exit-0 report baseline, distinct from provenance red", async () => {
+    const report = await executeGroupChatAcceptance({
+      strict: false,
+      loadDriver: async () => null,
+      log: () => {},
+    });
+    expect(report.driverMissing).toBe(true);
+    expect(report.provenanceFailed).toBe(false);
+    expect(report.exitCode).toBe(0);
+    const strictRun = await executeGroupChatAcceptance({
+      strict: true,
+      loadDriver: async () => null,
+      log: () => {},
+    });
+    expect(strictRun.driverMissing).toBe(true);
+    expect(strictRun.exitCode).toBe(1);
   });
 });

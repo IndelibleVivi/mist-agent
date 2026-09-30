@@ -1,5 +1,5 @@
 /**
- * Host adapter contract for #191 group-chat acceptance. The judge issues
+ * Host adapter contract for #191/#192 group-chat acceptance. The judge issues
  * concrete operations and independently reads host-owned ledgers/projections;
  * an adapter never returns a pre-composed pass/fail evidence card.
  */
@@ -9,8 +9,14 @@ export const GROUP_CHAT_CHECK_IDS = [
   "GC-03",
   "GC-04",
   "GC-05",
+  "GC-06",
+  "GC-07",
+  "GC-08",
   "GC-09",
+  "GC-10",
+  "GC-12",
   "GC-15",
+  "GC-16",
 ] as const;
 
 export type GroupChatCheckId = (typeof GROUP_CHAT_CHECK_IDS)[number];
@@ -22,11 +28,31 @@ export type ResidentId =
   | "test-resident:novel-e";
 export type DeliveryState = "loaded" | "queued" | "not-targeted";
 export type RosterPath = "broadcast" | "mention" | "projection" | "feedback" | "status";
+export type MemberBehavior = "complete" | "pass" | "fail" | "hold";
+export type PressureMode = "normal" | "batch" | "not-included" | "stopped" | "cooling";
+
+export interface DispatchIdentity {
+  readonly residentId: ResidentId;
+  readonly scopeId: string;
+  readonly scopeGeneration: number;
+  readonly windowId: string;
+  readonly generation: number;
+  readonly dispatchId: string;
+}
 
 export const groupChatSyntheticFixture = Object.freeze({
   roomId: "test-room:gc-191",
+  otherRoomId: "test-room:gc-192-other",
   hiddenRoomId: "test-room:gc-191-hidden",
   humanId: "test-human:owner",
+  unauthorizedHumanId: "test-human:unauthorized",
+  /**
+   * Judge-owned setup grant: the only trusted source of the owner binding. An adapter
+   * registers it from resetScenario(id, fixture); the `binding` field of a perform()
+   * command stays untrusted request input and can never create this trust by itself.
+   */
+  trustedOwnerBinding: "test-binding:owner",
+  roots: Object.freeze({ first: "test-root:one", second: "test-root:two" }),
   residentIds: Object.freeze({
     a: "test-resident:a",
     b: "test-resident:b",
@@ -41,6 +67,8 @@ export const groupChatSyntheticFixture = Object.freeze({
     privateC: "TEST-PRIVATE-CANARY:c",
     draft: "TEST-PRIVATE-CANARY:draft",
     tool: "TEST-PRIVATE-CANARY:tool",
+    blocked: "TEST-PRIVATE-CANARY:blocked-body",
+    hiddenProjection: "TEST-PRIVATE-CANARY:hidden-projection",
   }),
 });
 
@@ -62,6 +90,7 @@ export type GroupChatCommand =
       readonly claimedAuthorId?: string;
       readonly body: string;
       readonly visibility?: "public";
+      /** Untrusted request field; the host only compares it against its registered setup grant. */
       readonly binding?: string;
       readonly privateFields?: readonly string[];
     }
@@ -131,7 +160,105 @@ export type GroupChatCommand =
       readonly viewerId: ResidentId;
       readonly ownerId: ResidentId;
     }
-  | { readonly kind: "set-resident"; readonly residentId: ResidentId };
+  | { readonly kind: "set-resident"; readonly residentId: ResidentId }
+  | {
+      readonly kind: "configure-orchestration";
+      readonly rootId: string;
+      readonly policyVersion: string;
+      readonly turnBudget: number | null;
+      readonly deadlineTicks: number;
+      readonly maxMemberAttempts: number;
+    }
+  | {
+      readonly kind: "human-trigger";
+      readonly operationId: string;
+      readonly rootId: string;
+      readonly body: string;
+    }
+  | {
+      readonly kind: "member-turn";
+      readonly operationId: string;
+      readonly rootId: string;
+      readonly claimedRootId?: string;
+      readonly residentId: ResidentId;
+      readonly body: string;
+      readonly target?: DispatchIdentity;
+    }
+  | { readonly kind: "retry-operation"; readonly operationId: string }
+  | {
+      readonly kind: "set-member-behavior";
+      readonly residentId: ResidentId;
+      readonly behavior: MemberBehavior;
+    }
+  | {
+      readonly kind: "set-pressure";
+      readonly residentId: ResidentId;
+      readonly mode: PressureMode;
+    }
+  | { readonly kind: "advance-scheduler"; readonly ticks: number }
+  | { readonly kind: "fill-ordinary-queue"; readonly depth: number }
+  | {
+      readonly kind: "submit-control";
+      readonly controlId: string;
+      readonly issuerId: string;
+      readonly targetId: ResidentId;
+      readonly action: "stop" | "continue";
+      readonly structured: boolean;
+      /** Synthetic credential/binding handle; the host decides whether it authorizes control. */
+      readonly binding: string;
+    }
+  | {
+      readonly kind: "mark-external-effect";
+      readonly operationId: string;
+      readonly targetId: ResidentId;
+    }
+  | {
+      readonly kind: "set-sender-online";
+      readonly residentId: ResidentId;
+      readonly online: boolean;
+    }
+  | {
+      readonly kind: "query-feedback";
+      readonly residentId: ResidentId;
+      readonly via: "query" | "wake";
+    }
+  | {
+      readonly kind: "inject-next-fault";
+      readonly fault: "decision-persist" | "member-dispatch";
+      readonly residentId?: ResidentId;
+    }
+  | {
+      readonly kind: "seed-projection-event";
+      readonly eventId: string;
+      readonly body: string;
+      readonly authorized: boolean;
+    }
+  | {
+      readonly kind: "request-projection";
+      readonly projectionId: string;
+      readonly viewerId: ResidentId;
+      readonly mode: "batch" | "latest" | "truncate";
+      readonly maxCharacters?: number;
+    }
+  | {
+      readonly kind: "attempt-source-read";
+      readonly viewerId: ResidentId;
+      readonly sourceRef: string;
+    }
+  | { readonly kind: "set-room-access"; readonly residentId: ResidentId; readonly allowed: boolean }
+  | {
+      readonly kind: "set-room-membership";
+      readonly residentId: ResidentId;
+      readonly active: boolean;
+    }
+  | { readonly kind: "attempt-delivery"; readonly operationId: string }
+  | { readonly kind: "set-delivery-target"; readonly target: DispatchIdentity }
+  | {
+      readonly kind: "return-member-result";
+      readonly operationId: string;
+      readonly target: DispatchIdentity;
+      readonly body: string;
+    };
 
 export interface RoomEvent {
   readonly id: string;
@@ -200,6 +327,134 @@ export interface AccessAudit {
 export interface ResidentReaction {
   readonly residentId: string;
   readonly eventMarker: string;
+}
+
+/** Acceptance readback vocabulary: adapters map production records into these semantic facts. */
+export interface RoundRecord {
+  readonly sequence: number;
+  readonly operationId: string;
+  readonly rootId: string;
+  readonly senderId: string;
+  readonly policyVersion: string | null;
+  readonly decision:
+    | "human-trigger"
+    | "permitted"
+    | "passed"
+    | "failed"
+    | "held"
+    | "blocked"
+    | "retry-replayed";
+  readonly consumedTurns: number;
+  readonly reasonCode: string | null;
+  readonly target: DispatchIdentity | null;
+}
+
+export interface SchedulerSnapshot {
+  readonly tick: number;
+  readonly ordinaryQueueDepth: number;
+  readonly heldOperationIds: readonly string[];
+  readonly stoppedResidentIds: readonly ResidentId[];
+}
+
+export interface ControlRecord {
+  readonly sequence: number;
+  readonly controlId: string;
+  readonly issuerId: string;
+  readonly targetId: ResidentId;
+  readonly action: "stop" | "continue";
+  readonly phase: "accepted" | "effective" | "rejected" | "incomplete";
+  readonly cutoffId: string | null;
+  readonly externalEffectReversed: boolean;
+}
+
+export interface DeliveryDecisionRecord {
+  readonly sequence: number;
+  readonly operationId: string;
+  readonly senderId: ResidentId;
+  readonly state:
+    | "queued"
+    | "batched"
+    | "not-included"
+    | "stop-blocked"
+    | "dispatch-failed"
+    | "persist-failed"
+    | "dispatched"
+    | "context-committed"
+    | "rejected";
+  readonly reasonCode: string;
+  readonly count: number;
+  readonly permitConsumed: boolean;
+  readonly rosterVersion: number;
+  readonly target: DispatchIdentity | null;
+}
+
+export interface SenderFeedbackRecord {
+  readonly operationId: string;
+  readonly senderId: ResidentId;
+  readonly roomId: string;
+  readonly scopeId: string;
+  readonly reasonCode: string;
+  readonly count: number;
+  readonly phase: "pending" | "delivered";
+  readonly deliveryReceipt: string | null;
+  readonly body: string | null;
+}
+
+export interface ProjectionTruncation {
+  readonly eventId: string;
+  readonly originalLength: number;
+  readonly unit: "characters";
+  readonly keptStart: number;
+  readonly keptEnd: number;
+  readonly sourceRef: string;
+  readonly modelVisible: boolean;
+}
+
+export interface ProjectionReceipt {
+  readonly projectionId: string;
+  readonly viewerId: ResidentId;
+  readonly sourceRange: readonly [string, string];
+  readonly watermark: string;
+  readonly policyVersion: string;
+  readonly includedEventIds: readonly string[];
+  readonly omittedEventIds: readonly string[];
+  readonly complete: boolean;
+  readonly errorCode: string | null;
+  readonly truncations: readonly ProjectionTruncation[];
+}
+
+export interface SourceReadAudit {
+  readonly sourceRef: string;
+  readonly viewerId: ResidentId;
+  readonly outcome: "granted" | "denied";
+  readonly eventId: string | null;
+  readonly body: string | null;
+  readonly errorCode: string | null;
+}
+
+export interface MemberAttemptRecord {
+  readonly sequence: number;
+  readonly operationId: string;
+  readonly memberId: ResidentId;
+  readonly attempt: number;
+  readonly outcome: "in-flight" | "failed" | "unknown" | "completed";
+  readonly reasonCode: string | null;
+}
+
+export interface MemberResultRecord {
+  readonly sequence: number;
+  readonly operationId: string;
+  readonly target: DispatchIdentity;
+  readonly phase: "returned" | "committed" | "rejected";
+  readonly reasonCode: string | null;
+}
+
+/** Judge-owned truth of an independent world's authorized stop/continue control pair. */
+export interface GroupChatIndependentControlTruth {
+  readonly stopControlId: string;
+  readonly continueControlId: string;
+  readonly issuerId: string;
+  readonly targetId: ResidentId;
 }
 
 /** One GC-04 world: add a single newcomer, then read every roster-driven path back. */
@@ -281,14 +536,156 @@ export interface GroupChatEvidenceById {
     rewrittenCallReceiptIds: readonly string[];
     structuredTargetId: ResidentId;
   };
+  "GC-06": {
+    boundedWorlds: readonly {
+      budget: number;
+      /** Every resident round record of this bounded world, in host ledger order. */
+      records: readonly Pick<RoundRecord, "operationId" | "decision" | "reasonCode" | "sequence">[];
+      oneRoot: boolean;
+      policyVersionStable: boolean;
+    }[];
+    retryAddedDispatch: boolean;
+    passRecorded: boolean;
+    failureRecorded: boolean;
+    /** Every round record the host kept for the generation-change stimulus; judge requires exactly one blocked with a stable reason. */
+    identityChangeAttempts: readonly Pick<RoundRecord, "decision" | "reasonCode">[];
+    generationChangeStimulated: boolean;
+    /** Every round record the host kept for the self-root stimulus; judge requires exactly one blocked with a stable reason. */
+    selfRootAttempts: readonly Pick<RoundRecord, "decision" | "reasonCode">[];
+    restartPidChanged: boolean;
+    restartCommitStable: boolean;
+    highWaterBeforeRestart: number;
+    highWaterAfterRestart: number;
+    humanAfterLimitAccepted: boolean;
+    invalidConfigDispatched: boolean;
+    invalidConfigReasoned: boolean;
+  };
+  "GC-07": {
+    ordinaryQueueDepthBeforeControl: number;
+    heldBeforeControl: boolean;
+    stopAcceptedBeforeQueueRelease: boolean;
+    stopEffective: boolean;
+    oldPermitCommitted: boolean;
+    /** Host-owned records for each forged control; every one must be explicitly rejected, without a cutoff. */
+    falseControls: readonly { controlId: string; records: readonly ControlRecord[] }[];
+    acceptedAndEffectiveSeparated: boolean;
+    /** Host-owned records for the unreachable-target control; exactly one incomplete, no accepted/effective/cutoff. */
+    unreachableRecords: readonly ControlRecord[];
+    externalEffectClaimedReversed: boolean;
+    continueEffectiveWhileQueueBlocked: boolean;
+    postContinueNewPermitCommitted: boolean;
+    /** Old-permit result rows recorded after the continue took effect; exactly one returned, one reasoned rejected. */
+    postContinueOldPermitResults: readonly MemberResultRecord[];
+    /** Judge-owned identity of the old permit; both post-continue rows must carry it exactly. */
+    postContinueOldTarget: DispatchIdentity;
+    /** Whether the post-continue old-permit body leaked into the room ledger. */
+    postContinueOldBodyInRoom: boolean;
+    /**
+     * Independent world: this old permit never called return-member-result before stop/continue,
+     * so every row here belongs to the original tuple's FIRST late return after continue.
+     * Only rows recorded after the independent continue took effect may appear.
+     */
+    independentFirstReturnResults: readonly MemberResultRecord[];
+    /** Independent world: every host-owned control record of that world's stop/continue pair. */
+    independentControls: readonly ControlRecord[];
+    /** Judge-owned truth of that world's authorized stop/continue pair; every row must match it. */
+    independentControlTruth: GroupChatIndependentControlTruth;
+    /** Judge-owned identity of the independent world's old permit. */
+    independentFirstReturnTarget: DispatchIdentity;
+    /** Whether the independent first late-return body leaked into the room ledger. */
+    independentFirstReturnBodyInRoom: boolean;
+    /** Independent world: the post-continue new permit still commits normally. */
+    independentNewPermitCommitted: boolean;
+  };
+  "GC-08": {
+    /** Judge ground truth: the exact state each stimulus operation must get exactly one decision for. */
+    expectedByOperation: readonly {
+      operationId: string;
+      /** Judge-owned sender of the stimulus; decision and feedback must both carry it. */
+      senderId: ResidentId;
+      state: DeliveryDecisionRecord["state"];
+    }[];
+    decisions: readonly DeliveryDecisionRecord[];
+    offlineFeedbackMarkedDelivered: boolean;
+    deliveredFeedback: readonly SenderFeedbackRecord[];
+    crossSenderFeedback: readonly SenderFeedbackRecord[];
+    leakedBlockedBody: boolean;
+    stableReasonsAcrossRestart: boolean;
+    persistFailureConsumedPermit: boolean;
+    persistedDecisionCountAfterRetry: number;
+    /** Sender-feedback free text flagged by the shared personal-claim judge. */
+    unsupportedClaims: readonly string[];
+  };
   "GC-09": {
     receipts: readonly SystemReceipt[];
+    /** Receipt snapshots taken before the resident's own react; no resident actor may appear yet. */
+    receiptsAfterRecord: readonly SystemReceipt[];
+    receiptsAfterDispatch: readonly SystemReceipt[];
     prematureReceiptPhases: readonly string[];
     judgeSeededContextCommitId: string | null;
     /** Reactions on the judge event read back before the resident's own react command. */
     reactionAuthorsBeforeResidentReacted: readonly string[];
     reactionAuthorsAfterResidentReacted: readonly string[];
     memoryRecordsAddedByContextCommit: number;
+  };
+  "GC-10": {
+    /** Authorized event ids the judge seeded this round, in seed order; the identity baseline. */
+    authorizedEventIds: readonly string[];
+    batch: ProjectionReceipt | null;
+    latest: ProjectionReceipt | null;
+    truncated: ProjectionReceipt | null;
+    /** Judge ground truth: which event it seeded long, its real body length, and the requested cap. */
+    truncationTruth: {
+      readonly eventId: string;
+      readonly originalLength: number;
+      readonly maxCharacters: number;
+      /** Judge-owned full body of the seeded long event; granted source reads must equal it. */
+      readonly body: string;
+    };
+    projectionContext: string;
+    hiddenWorldFingerprints: readonly string[];
+    grantedRead: SourceReadAudit | null;
+    deniedRead: SourceReadAudit | null;
+  };
+  "GC-12": {
+    revokedDeliveryCommitted: boolean;
+    revokedDeliveryReasoned: boolean;
+    rosterVersionAdvanced: boolean;
+    staleResultActuallyReturned: boolean;
+    staleResultCommitted: boolean;
+    staleResultReasoned: boolean;
+    stoppedResultActuallyReturned: boolean;
+    stoppedResultCommitted: boolean;
+    /** The cutoff-stopped late result must carry an explicit rejected record with a stable reason. */
+    stoppedResultReasoned: boolean;
+    postContinueResultCommitted: boolean;
+    /** Old-permit result rows recorded after the continue took effect; exactly one returned, one reasoned rejected. */
+    postContinueStoppedResults: readonly MemberResultRecord[];
+    /** Judge-owned identity of the old permit; both post-continue rows must carry it exactly. */
+    postContinueOldTarget: DispatchIdentity;
+    /** Whether the post-continue old-permit body leaked into the room ledger. */
+    postContinueOldBodyInRoom: boolean;
+    /**
+     * Independent world: this old permit never called return-member-result before stop/continue,
+     * so every row here belongs to the original tuple's FIRST late return after continue.
+     * Only rows recorded after the independent continue took effect may appear.
+     */
+    independentFirstReturnResults: readonly MemberResultRecord[];
+    /** Independent world: every host-owned control record of that world's stop/continue pair. */
+    independentControls: readonly ControlRecord[];
+    /** Judge-owned truth of that world's authorized stop/continue pair; every row must match it. */
+    independentControlTruth: GroupChatIndependentControlTruth;
+    /** Judge-owned identity of the independent world's old permit. */
+    independentFirstReturnTarget: DispatchIdentity;
+    /** Whether the independent first late-return body leaked into the room ledger. */
+    independentFirstReturnBodyInRoom: boolean;
+    /** Independent world: the post-continue new permit still commits normally. */
+    independentNewPermitCommitted: boolean;
+    /** The single identity field each of the six forged targets moves; must cover all six exactly once. */
+    forgedTupleFields: readonly string[];
+    forgedTupleAttempts: number;
+    forgedTupleCommits: number;
+    currentTupleCommits: number;
   };
   "GC-15": {
     authorizedPublicSurface: string;
@@ -301,6 +698,28 @@ export interface GroupChatEvidenceById {
     newResidentHistory: readonly GroupChatNewcomerHistoryEvidence[];
     crossRoomReplayAccepted: boolean;
   };
+  "GC-16": {
+    failedMemberAttempts: readonly MemberAttemptRecord[];
+    normalMemberCompleted: boolean;
+    humanContinued: boolean;
+    controlContinued: boolean;
+    heldWasActuallyInFlight: boolean;
+    heldTimedOut: boolean;
+    /** The maxMemberAttempts the judge configured for this scenario. */
+    configuredMaxMemberAttempts: number;
+    /** Every attempt row for the failing operation, any outcome: 1-based, unique, contiguous, bounded. */
+    failingOperationAttempts: readonly MemberAttemptRecord[];
+    restartPidChanged: boolean;
+    restartCommitStable: boolean;
+    failuresBeforeRestart: number;
+    failuresAfterRestart: number;
+    highWaterBeforeRestart: number;
+    highWaterAfterRestart: number;
+    failureFeedbackRetained: boolean;
+    falsePresenceClaims: readonly string[];
+    /** System-receipt claims flagged by the shared personal-claim judge. */
+    unsupportedClaims: readonly string[];
+  };
 }
 
 /**
@@ -311,8 +730,10 @@ export interface GroupChatHostDriver {
   readonly kind: "mist-host";
   /** Launch the host as a child process of this judge run (see GroupChatHostRun). */
   startHost(): Promise<GroupChatHostRun>;
+  restartHost(): Promise<GroupChatHostRun>;
   /** Resolve only after the host process has exited; every readback must reject afterwards. */
   stopHost(): Promise<void>;
+  /** Delivers the judge-owned setup grant: fixture.trustedOwnerBinding is the only trusted binding source. */
   resetScenario(id: GroupChatCheckId, fixture: typeof groupChatSyntheticFixture): Promise<void>;
   perform(command: GroupChatCommand): Promise<void>;
   /** Omitted roomId means all records in the synthetic test namespace. */
@@ -329,6 +750,16 @@ export interface GroupChatHostDriver {
   readSurface(roomId: string, viewerId: string): Promise<SurfaceSnapshot>;
   readAccessAudit(): Promise<AccessAudit>;
   readReactions(): Promise<readonly ResidentReaction[]>;
+  readRoundRecords(): Promise<readonly RoundRecord[]>;
+  readScheduler(): Promise<SchedulerSnapshot>;
+  readControlRecords(): Promise<readonly ControlRecord[]>;
+  readDeliveryDecisions(): Promise<readonly DeliveryDecisionRecord[]>;
+  readSenderFeedback(residentId: ResidentId): Promise<readonly SenderFeedbackRecord[]>;
+  readProjectionReceipts(): Promise<readonly ProjectionReceipt[]>;
+  readProjectionContext(residentId: ResidentId): Promise<string>;
+  readSourceReads(): Promise<readonly SourceReadAudit[]>;
+  readMemberAttempts(): Promise<readonly MemberAttemptRecord[]>;
+  readMemberResults(): Promise<readonly MemberResultRecord[]>;
 }
 
 /** Clone both arguments and return values at the adapter boundary (#196/#200 pattern). */
