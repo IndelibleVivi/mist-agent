@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 /**
  * #191/#192 stacked red contract for GC-01..10, GC-12, GC-15 and GC-16.
  *
@@ -15,6 +14,7 @@ import { execFileSync } from "node:child_process";
  * both modes: it is a broken adapter, not the missing-driver baseline.
  * STUBBED follows the repo's acceptance convention: declared methods turn a lamp yellow.
  */
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
@@ -459,16 +459,6 @@ export interface GroupChatAcceptanceOutcome {
   readonly provenanceFailed: boolean;
   readonly strict: boolean;
   readonly exitCode: number;
-}
-
-interface JudgeDurabilityResult {
-  readonly passed: boolean;
-  readonly detail: string;
-}
-
-interface HostChecksResult {
-  readonly lamps: GroupChatRunResult[];
-  readonly judgeDurability: JudgeDurabilityResult;
 }
 
 async function runHostChecks(

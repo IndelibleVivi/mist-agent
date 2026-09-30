@@ -4030,7 +4030,7 @@ describe("#191/#192 runner: real-host provenance and static source scan", () => 
     ["host-backed durable ledger", true],
     ["stale adapter memory copy", false],
   ] as const)("checks judge-written durability against %s", async (_label, readsDurableLedger) => {
-    const dataRoot = await mkdtemp(join(tmpdir(), "mist-group-chat-readback-"));
+    const dataRoot = realpathSync(await mkdtemp(join(tmpdir(), "mist-group-chat-readback-")));
     const alivePids = new Set<number>();
     let nextPid = 5000;
     let activePid: number | null = null;
@@ -4177,7 +4177,7 @@ describe("#206 review 1 runner: restart provenance failure is a whole-run red, n
   });
 
   const runWith = async (restartScript: RestartScript, strict: boolean) => {
-    const dataRoot = await mkdtemp(join(tmpdir(), "mist-group-chat-runner-"));
+    const dataRoot = realpathSync(await mkdtemp(join(tmpdir(), "mist-group-chat-runner-")));
     const host = new RestartProbeHost(restartScript, dataRoot);
     try {
       return await executeGroupChatAcceptance({
