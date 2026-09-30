@@ -308,6 +308,16 @@ export function createGroupChatHostDriver(
     readSurface: unsupported("readSurface"),
     readAccessAudit: unsupported("readAccessAudit"),
     readReactions: unsupported("readReactions"),
+    readRoundRecords: unsupported("readRoundRecords"),
+    readScheduler: unsupported("readScheduler"),
+    readControlRecords: unsupported("readControlRecords"),
+    readDeliveryDecisions: unsupported("readDeliveryDecisions"),
+    readSenderFeedback: unsupported("readSenderFeedback"),
+    readProjectionReceipts: unsupported("readProjectionReceipts"),
+    readProjectionContext: unsupported("readProjectionContext"),
+    readSourceReads: unsupported("readSourceReads"),
+    readMemberAttempts: unsupported("readMemberAttempts"),
+    readMemberResults: unsupported("readMemberResults"),
   };
 }
 
