@@ -58,6 +58,26 @@ mist 是一个个人 agent harness（还在图纸阶段）。它的设计从一�
 
 参与方式见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
+## 终端生命周期命令
+
+已由宿主配置 runtime 住户与通道后，终端入口是：
+
+```bash
+npm run resident -- --resident <residentId> --data-dir <dataDir>
+```
+
+默认使用合成传输；真实 pi 通道与所需凭证见 [runtime 配置](docs/runtime-config.md)。
+`npm run setup` 的安装快照尚未接到该入口，不能将上面命令作为 setup 后即能聊天的教程。
+
+在聊天框输入 `/new`、`/clear` 或 `/compact`，都会请求现役 `breathe` 流程：
+先封缄并落盘交接信，再开始下一代；三个命令保留同一窗号和旧流水，不清空历史。
+命令本身不作为用户消息发给模型。成功时显示代际和信标题；失败时显示错误与处理建议，
+仍可继续输入普通文本。`/exit` 退出，Ctrl+C 关闭进程。
+
+这条接线不代表出信已满足全部 D8 语义：现役生成器对已有承诺缺 `ledgerSeq` 时会拒绝换代，
+固定模板的 intent 也不构成当刻亲笔的证据。真实 CLI 输入回归与底层判卷边界见
+[resident-runtime 清单](acceptance/resident-runtime.md#终端命令输入回归)。
+
 ## 一张图看懂 mist
 
 ![mist 架构图](docs/assets/mist-architecture-2026-08-14.png)
