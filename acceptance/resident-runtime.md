@@ -12,6 +12,24 @@ npm run acceptance:resident-runtime
 npm run acceptance:resident-runtime:strict
 ```
 
+## 安装快照与 runtime 的边界
+
+RT-01 的 `provisionChannel()` 正对照直接准备 runtime 住户和凭证，不经过安装器正式
+提交，不能证明 `npm run setup → npm run resident` 已接通。当前安装器提交
+`current.json → snapshots/<install-id>/config.json` 与专属私有凭证；runtime 使用
+`credentials/` 与 `residents/`，缺凭证时不能再把用户送回 setup 当成修复办法。
+
+`tests/installer-run.test.ts` 用 scripted PromptPort 驱动真实 `runInstaller()` 完成正式
+提交，再从相同临时数据根启动独立 CLI 进程。回归观察当前未接线错误与明确处理建议，
+并检查密钥没有复制进 runtime 凭证面、住户没有自动激活、主流没有伪造回复、安装快照
+与原凭证仍完整；模型传输仅 synthetic，无真实用户数据。
+
+这项交付修正诊断与证据边界，不宣称完成安装交接。完整接线需补 committed config 的
+模型/provider 选择，以及 [D22 入住实现](resident-continuity.md) 的住户自认激活路径；
+不能用 `provisionChannel()` 自动生成档案替代该权威。接线实现后，需按新入口更新本段
+未接线断言，并新增激活成功到聊天的端到端正对照，保留不代签与不泄露的负例。
+原 RT 判据与未勾独立复验状态不变。
+
 ## 路线选边（#194 要求开工第一步说清楚）
 
 **走「mist 当宿主，pi 当零件库」**，不走「在 pi 上改造、以 pi 扩展形式跑」。
