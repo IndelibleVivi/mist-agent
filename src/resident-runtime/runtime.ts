@@ -74,6 +74,8 @@ import { CredentialStore } from "./credentials.ts";
 
 const WINDOW_INDEX_SCHEMA = 1;
 
+type RuntimeBootPack = ReturnType<typeof buildBootPack> & Pick<BootPackView, "letter">;
+
 interface WindowIndex {
   readonly schemaVersion: typeof WINDOW_INDEX_SCHEMA;
   readonly windows: Readonly<Record<string, string>>;
@@ -337,33 +339,12 @@ export class ResidentRuntime {
     }
     this.#turnStarted.add(`${window.windowId}#${window.generation}`);
 
-    // 醒来读启动包：身份、承诺、记忆、现行有效事实**整包**随请求进模型（D8 补记三：
-    // 醒来即已读；验收席意见 1：记忆与事实不许中途掉队）。
-    let bootPack: ReturnType<typeof buildBootPack>;
-    try {
-      let currentFacts: ReturnType<FactLedger["currentSet"]> | undefined;
-      if (this.#factLedger !== undefined) {
-        try {
-          currentFacts = this.#factLedger.currentSet(input.residentId);
-        } catch (error) {
-          if (!(error instanceof LedgerNotFoundError)) throw error;
-          // 账接了但这户没开户：对这户仍是「没接账」——currentFacts 缺席即缺席，
-          // 不许跟「账是空的」（空数组）编码成同一个值（MV-A05）。
-        }
-      }
-      bootPack = buildBootPack(
-        this.#residents,
-        input.residentId,
-        currentFacts === undefined ? {} : { currentFacts },
-      );
-    } catch (error) {
-      return fail(
-        "resident-not-found",
-        `启动包装配失败：${(error as Error).message}`,
-        "检查住户档案是否完整（residents/ 快照），损坏就从迁移包恢复",
-        input.residentId,
-      );
-    }
+    // 醒来读启动包：身份、承诺、记忆、现行有效事实、**交接信**整包随请求进模型
+    // （D8 补记三：醒来即已读，不让住户醒来再发一次工具调用去读；验收席意见 1：
+    // 记忆与事实不许中途掉队）。信直接从 letters/ 时间线读原件，不转抄。
+    const assembled = this.#assembleBootPack(input.residentId);
+    if (!assembled.ok) return assembled;
+    const bootPack = assembled.value;
     const route = resolveChannelRoute({
       claudeSubscription: credential.claudeSubscription,
       credentialKind: credential.credentialKind,
@@ -528,29 +509,60 @@ export class ResidentRuntime {
         input.residentId,
       );
     }
-    const pack = buildBootPack(this.#residents, input.residentId);
-    let latestLetter: SealedLetter | null;
+    const assembled = this.#assembleBootPack(input.residentId);
+    if (!assembled.ok) return assembled;
+    const pack = assembled.value;
+    return ok({
+      residentId: pack.residentId,
+      identity: pack.identity,
+      commitments: [...pack.commitments],
+      memories: pack.memories.map(toMemoryEntryView),
+      letter: pack.letter,
+    });
+  }
+
+  /** 诊断读口与模型请求共用装配：事实和交接信从各自真源读，不另造启动包。 */
+  #assembleBootPack(residentId: string): Result<RuntimeBootPack> {
+    let letter: BootPackView["letter"];
     try {
-      latestLetter = this.#letters.latest(input.residentId);
+      const latest = this.#letters.latest(residentId);
+      letter = latest === null ? null : toLetterView(latest);
     } catch (error) {
       // 信档损坏 fail-closed（协助审查）：宁可启动包读不出，也不静默回退旧信。
       return fail(
         "letter-invalid",
         `交接信读不出：${(error as Error).message}`,
         "信档损坏不许静默降级——修复 letters/ 里的信档后再读启动包",
-        input.residentId,
+        residentId,
       );
     }
-    return ok({
-      residentId: pack.residentId,
-      identity: pack.identity,
-      commitments: [...pack.commitments],
-      memories: pack.memories.map(toMemoryEntryView),
-      // 交接信随换代产生（D8）。没换过代 = 没有信，契约里就是 null——
-      // 不拿空信占位（「没有」与「有封空的」不许塌成同一个值）。注入的是
-      // 时间线里的原件（副本等价性 letterShape 同形），不是转抄。
-      letter: latestLetter === null ? null : toLetterView(latestLetter),
-    });
+    try {
+      let currentFacts: ReturnType<FactLedger["currentSet"]> | undefined;
+      if (this.#factLedger !== undefined) {
+        try {
+          currentFacts = this.#factLedger.currentSet(residentId);
+        } catch (error) {
+          if (!(error instanceof LedgerNotFoundError)) throw error;
+          // 接了账但这户未开户：分区缺席，与账是空的（空数组）区分，MV-A05。
+        }
+      }
+      return ok({
+        ...buildBootPack(
+          this.#residents,
+          residentId,
+          currentFacts === undefined ? {} : { currentFacts },
+        ),
+        // 未换过代 = null；有信时使用同一封原件的现役视图，不重新生成。
+        letter,
+      });
+    } catch (error) {
+      return fail(
+        "resident-not-found",
+        `启动包装配失败：${(error as Error).message}`,
+        "检查住户档案是否完整（residents/ 快照），损坏就从迁移包恢复",
+        residentId,
+      );
+    }
   }
 
   // —— 换气与交接信（RT-03 / D8） ——
