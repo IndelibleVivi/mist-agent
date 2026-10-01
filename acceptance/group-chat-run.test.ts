@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { RoomEventStore } from "../src/group-chat/room-event-store.ts";
 import {
   type GroupChatJudgeContext,
   evaluateGroupChatEvidence,
@@ -56,6 +57,7 @@ import {
   hostProvenanceProblem,
   hostStopProblem,
   isRepoEntryFile,
+  judgeDirectWriteReadback,
   provenanceFailedResults,
   readProcessInfo,
   restartedHostProvenanceProblem,
@@ -4024,9 +4026,61 @@ describe("#191/#192 runner: real-host provenance and static source scan", () => 
     expect(restartedHostProvenanceProblem(previous, current, factsFor([5001]))).toBeNull();
   });
 
-  it.todo(
-    "writes a durable challenge straight into the host's room ledger and reads it back through the adapter (needs the #191 adapter's data-root contract)",
-  );
+  it.each([
+    ["host-backed durable ledger", true],
+    ["stale adapter memory copy", false],
+  ] as const)("checks judge-written durability against %s", async (_label, readsDurableLedger) => {
+    const dataRoot = realpathSync(await mkdtemp(join(tmpdir(), "mist-group-chat-readback-")));
+    const alivePids = new Set<number>();
+    let nextPid = 5000;
+    let activePid: number | null = null;
+    let activeStore: RoomEventStore | null = null;
+    let firstMemoryCopy: readonly RoomEvent[] | null = null;
+    const driver = {
+      kind: "mist-host" as const,
+      startHost: async () => {
+        const pid = nextPid++;
+        activePid = pid;
+        alivePids.add(pid);
+        activeStore = new RoomEventStore(dataRoot);
+        firstMemoryCopy ??= activeStore.readRoomEvents();
+        return { pid, commit: head, dataRoot };
+      },
+      stopHost: async () => {
+        if (activePid !== null) alivePids.delete(activePid);
+        activePid = null;
+        activeStore?.close();
+        activeStore = null;
+      },
+      readRoomEvents: async (roomId?: string): Promise<readonly RoomEvent[]> => {
+        if (activeStore === null) throw new Error("host stopped");
+        const events = readsDurableLedger
+          ? activeStore.readRoomEvents(roomId)
+          : (firstMemoryCopy ?? []);
+        return roomId === undefined ? events : events.filter((event) => event.roomId === roomId);
+      },
+    } as unknown as GroupChatHostDriver;
+    const acceptanceFacts: HostProvenanceFacts = {
+      headCommit: head,
+      judgePid,
+      judgeExecutable: node,
+      repoRoot,
+      readProcess: (pid) => (alivePids.has(pid) ? hostProcess() : null),
+    };
+
+    try {
+      const stoppedHost = await driver.startHost();
+      await driver.stopHost();
+      const result = await judgeDirectWriteReadback(driver, stoppedHost, acceptanceFacts);
+      expect(result.passed, _label).toBe(readsDurableLedger);
+      if (!readsDurableLedger) expect(result.detail).toContain("missed or altered");
+      else expect(result.detail).toContain("survived host restart");
+      expect(alivePids.size).toBe(0);
+    } finally {
+      await driver.stopHost();
+      await rm(dataRoot, { recursive: true, force: true });
+    }
+  });
 
   it("finds member-id literals only in non-test source files", async () => {
     const root = await mkdtemp(join(tmpdir(), "gc04-scan-"));
@@ -4058,31 +4112,48 @@ describe("#206 review 1 runner: restart provenance failure is a whole-run red, n
   const entry = join("src", "installer", "cli.ts");
 
   type HostRun = { readonly pid: number; readonly commit: string };
+  type StartedHostRun = HostRun & { readonly dataRoot: string };
   type RestartScript = (previous: HostRun, alive: Set<number>) => HostRun;
 
   /** A synthetic host whose process story is readable by the judge's own facts. */
   class RestartProbeHost extends SyntheticGroupChatHost {
     private readonly alivePids = new Set<number>();
     private stoppedNow = false;
+    private hasStarted = false;
+    private activeStore: RoomEventStore | null = null;
     private currentRun: HostRun = { pid: 5000, commit: head };
-    constructor(private readonly restartScript: RestartScript) {
+    constructor(
+      private readonly restartScript: RestartScript,
+      private readonly dataRoot: string,
+    ) {
       super();
     }
-    override async startHost(): Promise<HostRun> {
+    override async startHost(): Promise<StartedHostRun> {
+      if (this.hasStarted) this.currentRun = { ...this.currentRun, pid: this.currentRun.pid + 1 };
+      this.hasStarted = true;
+      this.stoppedNow = false;
       this.alivePids.add(this.currentRun.pid);
-      return this.currentRun;
+      this.activeStore = new RoomEventStore(this.dataRoot);
+      return { ...this.currentRun, dataRoot: this.dataRoot };
     }
-    override async restartHost(): Promise<HostRun> {
+    override async restartHost(): Promise<StartedHostRun> {
+      this.activeStore?.close();
       this.currentRun = this.restartScript(this.currentRun, this.alivePids);
-      return this.currentRun;
+      this.stoppedNow = false;
+      this.activeStore = new RoomEventStore(this.dataRoot);
+      return { ...this.currentRun, dataRoot: this.dataRoot };
     }
     override async stopHost(): Promise<void> {
       this.stoppedNow = true;
       this.alivePids.clear();
+      this.activeStore?.close();
+      this.activeStore = null;
     }
     override async readRoomEvents(roomId?: string): Promise<readonly RoomEvent[]> {
       if (this.stoppedNow) throw new Error("host stopped");
-      return super.readRoomEvents(roomId);
+      const synthetic = await super.readRoomEvents(roomId);
+      const durable = this.activeStore?.readRoomEvents(roomId) ?? [];
+      return [...synthetic, ...durable];
     }
     get livePids(): ReadonlySet<number> {
       return this.alivePids;
@@ -4106,13 +4177,19 @@ describe("#206 review 1 runner: restart provenance failure is a whole-run red, n
   });
 
   const runWith = async (restartScript: RestartScript, strict: boolean) => {
-    const host = new RestartProbeHost(restartScript);
-    return executeGroupChatAcceptance({
-      strict,
-      loadDriver: async () => ({ driver: host, stubbed: new Set<string>() }),
-      facts: probeFacts(host),
-      log: () => {},
-    });
+    const dataRoot = realpathSync(await mkdtemp(join(tmpdir(), "mist-group-chat-runner-")));
+    const host = new RestartProbeHost(restartScript, dataRoot);
+    try {
+      return await executeGroupChatAcceptance({
+        strict,
+        loadDriver: async () => ({ driver: host, stubbed: new Set<string>() }),
+        facts: probeFacts(host),
+        log: () => {},
+      });
+    } finally {
+      await host.stopHost();
+      await rm(dataRoot, { recursive: true, force: true });
+    }
   };
 
   const healthyRestart: RestartScript = (previous, alive) => {
