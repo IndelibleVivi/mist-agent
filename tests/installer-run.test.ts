@@ -1,6 +1,8 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { InstallerController } from "../src/installer/controller.ts";
 import { FileMemoryLibrary } from "../src/installer/memory-library.ts";
@@ -909,4 +911,70 @@ it("a second occupied memory path is caught at the memory step instead of crashi
   expect(existsSync(join(occupiedA, "data"))).toBe(true);
   expect(existsSync(join(occupiedB, "data"))).toBe(true);
   prompt.expectExhausted();
+});
+
+it("does not send a committed installer user back through setup or silently activate a resident", async () => {
+  const directory = freshDirectory();
+  const memoryPath = join(directory, "memory");
+  mkdirSync(memoryPath);
+  const store = new InstallerStateStore(directory);
+  const residentId = "resident-install-boundary";
+  const secret = "synthetic-install-boundary-secret";
+  const prompt = new ScriptedPrompt({
+    selects: ["codex", "api-key", "codex-key", "external", "existing"],
+    inputs: ["codex-key", memoryPath],
+    secrets: [secret],
+    confirms: [false, false, true],
+  });
+  const installed = await runInstaller({
+    residentId,
+    dataDir: directory,
+    controller: new InstallerController(store),
+    store,
+    prompt,
+    oauth: noOAuth,
+    memoryLibraries: new FileMemoryLibrary(),
+  });
+  if (installed.status !== "committed") throw new Error("installer did not commit");
+  prompt.expectExhausted();
+  expect(store.loadCurrentConfig()?.residentId).toBe(residentId);
+  expect(store.readCredentialSecret("codex-key")).toBe(secret);
+  const currentBefore = readFileSync(join(directory, "current.json"), "utf8");
+  const configPath = join(directory, "snapshots", installed.receipt.snapshotId, "config.json");
+  const configBefore = readFileSync(configPath, "utf8");
+
+  // Prompt IO is scripted, but commit, storage and the fresh CLI process are production paths.
+  const child = spawnSync(
+    process.execPath,
+    [
+      "--import",
+      "tsx",
+      fileURLToPath(new URL("../src/resident-runtime/cli.ts", import.meta.url)),
+      "--resident",
+      residentId,
+      "--data-dir",
+      directory,
+    ],
+    {
+      input: "hello-from-installer\n/exit\n",
+      encoding: "utf8",
+      env: { ...process.env, MIST_RESIDENT_RUNTIME_TRANSPORT: "synthetic" },
+      timeout: 15_000,
+    },
+  );
+  expect(child.error).toBeUndefined();
+  expect(child.status, child.stderr).toBe(0);
+  expect(child.stdout).toContain("credential-missing");
+  expect(child.stdout).toContain("尚未接到");
+  expect(child.stdout).toContain("重复运行 setup");
+  expect(child.stdout).not.toContain("安装器 npm run setup，或 provisionChannel");
+  expect(child.stdout + child.stderr).not.toContain(secret);
+  expect(child.stdout).not.toContain("合成回声已读来信。");
+  expect(existsSync(join(directory, "credentials", "manifest.json"))).toBe(false);
+  expect(readdirSync(join(directory, "credentials", "secrets"))).toEqual([]);
+  expect(readdirSync(join(directory, "residents"))).toEqual([]);
+  expect(existsSync(join(directory, "streams", `${residentId}.stream.json`))).toBe(false);
+  expect(readFileSync(join(directory, "current.json"), "utf8")).toBe(currentBefore);
+  expect(readFileSync(configPath, "utf8")).toBe(configBefore);
+  expect(store.readCredentialSecret("codex-key")).toBe(secret);
 });
