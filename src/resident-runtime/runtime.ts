@@ -940,7 +940,7 @@ export class ResidentRuntime {
    * 当刻亲笔标记由封缄层盖，本层不声称「亲笔已完成」）。
    *
    * 承诺档的真源是权威事实账（图纸 §4.2）：每条现行 entry 一条 commitment，带
-   * `ledgerSeq=entry.seq`、body 沿用 entry.body；已 supersede 的不进 currentSet，
+   * `ledgerSeq=entry.seq`、body 只作短引用，不复印账上正文；已 supersede 的不进 currentSet，
    * 也就不装。
    *
    * `ResidentStore` 里的旧 string commitments **不自动迁/签、不降 fact**：它们没有
@@ -971,8 +971,8 @@ export class ResidentRuntime {
     });
   }
 
-  /** 现行有效集 → 信里 commitment 档的指针集（seq + body）。没接账 = 空集。 */
-  #commitmentsFromLedger(residentId: string): { ledgerSeq: number; body: string }[] {
+  /** 现行有效集 → 信里 commitment 档的 seq 指针集。没接账 = 空集。 */
+  #commitmentsFromLedger(residentId: string): { ledgerSeq: number }[] {
     const ledger = this.#factLedger;
     if (ledger === undefined) return [];
     let current: LedgerEntry[];
@@ -985,7 +985,7 @@ export class ResidentRuntime {
       }
       throw error;
     }
-    return current.map((entry) => ({ ledgerSeq: entry.seq, body: entry.body }));
+    return current.map((entry) => ({ ledgerSeq: entry.seq }));
   }
 
   /** 旧字符串承诺的入账入口说明：指到真实存在的宿主 API，不编不存在的 CLI 命令。 */

@@ -2,7 +2,7 @@
  * #194 运行时出信绑定权威事实账的行为钉子（责任：运行时出信 + CLI 宿主装配）。
  *
  * 覆盖：
- * - 换气落盘信的 commitment 档 seq/body 来自 FactLedger.currentSet()（图纸 §4.2）；
+ * - 换气落盘信的 commitment 档只带 currentSet 的 seq 指针，不复制正文（图纸 §4.2）；
  * - supersede 后的条目不进信；
  * - 住户隔离：甲的账不进乙的信；
  * - ResidentStore 旧 string 承诺未入账时 breath-refused、逐条列出、给真实入口、
@@ -86,7 +86,7 @@ function ledgerSnapshot(
 }
 
 describe("运行时出信绑定权威事实账", () => {
-  it("换气落盘信的 commitment 档 seq/body 来自 currentSet，supersede 的不装", async () => {
+  it("换气落盘信的 commitment 档只带 currentSet 指针，supersede 的不装", async () => {
     const dataDir = tempDir();
     const stub = fixedTransport();
     const runtime = new ResidentRuntime({
@@ -126,12 +126,56 @@ describe("运行时出信绑定权威事实账", () => {
       const commitments = sealed.state.filter((item) => item.tier === "commitment");
       expect(commitments).toHaveLength(1);
       expect(commitments[0]).toMatchObject({
-        body: "我答应过每周写一封",
+        body: `账上第 ${kept.seq} 条`,
         ledgerSeq: kept.seq,
       });
       expect(authority.ledger.entries("r-letter").map((e) => e.seq)).toContain(doomed.seq);
       const timeline = unwrap<LetterTimeline>(runtime.letterTimeline({ residentId: "r-letter" }));
       expect(timeline.letters).toHaveLength(1);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("封存信只带承诺指针；解除后新代有效事实不再带旧正文，原信不改", async () => {
+    const dataDir = tempDir();
+    const stub = fixedTransport();
+    const runtime = new ResidentRuntime({
+      dataDir,
+      transport: stub.transport,
+      ledger: { dataDir: join(dataDir, "residents") },
+    });
+    try {
+      provision(runtime, "r-pointer");
+      const authority = runtime.ledgerAuthority();
+      if (authority === null) throw new Error("缺认证账");
+      const fact = authority.host
+        .system("mist-host")
+        .append(
+          "r-pointer",
+          { kind: "active_rule", body: "只在权威账上保存的承诺正文" },
+          "宿主维护",
+        );
+      unwrap(await runtime.say({ residentId: "r-pointer", text: "第一代" }));
+      expect(stub.requests[0]?.bootPack.currentFacts).toContainEqual(fact);
+      unwrap(await runtime.breathe({ residentId: "r-pointer", via: "new" }));
+      const original = readFileSync(letterPath(dataDir, "r-pointer"), "utf8");
+      const letter = JSON.parse(original) as {
+        state: { tier: string; body: string; ledgerSeq?: number }[];
+      };
+      const commitments = letter.state.filter((item) => item.tier === "commitment");
+      expect(commitments).toHaveLength(1);
+      expect(commitments[0]?.ledgerSeq).toBe(fact.seq);
+      expect(commitments[0]?.body).not.toContain(fact.body);
+
+      authority.host
+        .system("mist-host")
+        .supersede("r-pointer", fact.seq, { reason: "承诺解除" }, "宿主维护");
+      unwrap(await runtime.say({ residentId: "r-pointer", text: "第二代" }));
+      expect(stub.requests.at(-1)?.bootPack.currentFacts?.map((entry) => entry.seq)).not.toContain(
+        fact.seq,
+      );
+      expect(readFileSync(letterPath(dataDir, "r-pointer"), "utf8")).toBe(original);
     } finally {
       await runtime.close();
     }
@@ -395,7 +439,7 @@ describe("运行时出信绑定权威事实账", () => {
       expect(sealed.state).toContainEqual({
         tier: "commitment",
         ledgerSeq: fact.seq,
-        body: fact.body,
+        body: `账上第 ${fact.seq} 条`,
       });
     } finally {
       await first.close();

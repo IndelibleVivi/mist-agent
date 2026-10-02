@@ -181,7 +181,7 @@ export function toLetterTimeline(
 }
 
 /**
- * 交接信草稿：承诺取权威事实账的 currentSet，seq 指针与正文都装信；记忆与
+ * 交接信草稿：承诺只带权威事实账 currentSet 的 seq 指针，不复印正文；记忆与
  * 本代流计数装为 fact。调用方不从旧字符串、正文匹配或数组序号伪造 ledgerSeq。
  * intent/judgment 沿用现有确定性装配，按主笔 #194 的分工另行讨论当刻亲笔；
  * 这一笔只修账绑定，不声称完成模型写信。
@@ -189,7 +189,6 @@ export function toLetterTimeline(
 export interface LetterCommitment {
   /** 权威事实账上这条现行 entry 的 seq。 */
   readonly ledgerSeq: number;
-  readonly body: string;
 }
 
 export function composeLetterDraft(input: {
@@ -203,7 +202,7 @@ export function composeLetterDraft(input: {
     ...input.commitments.map(
       (commitment): LetterItem => ({
         tier: "commitment",
-        body: commitment.body,
+        body: `账上第 ${commitment.ledgerSeq} 条`,
         ledgerSeq: commitment.ledgerSeq,
       }),
     ),

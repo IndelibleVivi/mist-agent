@@ -41,7 +41,8 @@ mist 是一个个人 agent harness（还在图纸阶段）。它的设计从一�
 按 D25 走订阅或 API key 调模型、把回复经一窗流唯一 writer 落账、到线写交接信换代。
 
 运行时接的是**认证权威事实账**（与住户档案同在 `residents/`）：启动包的 `currentFacts` 与
-交接信里 `commitment` 档的 `ledgerSeq + body` 都取自 `FactLedger.currentSet()`，不自动承接
+交接信里 `commitment` 档的指针都取自 `FactLedger.currentSet()`；信只带 `ledgerSeq` 和短引用，
+不复印账上正文。正文随 `currentFacts` 进模型，Pi 提示同时标出 seq 供对账；不自动承接
 `ResidentStore` 里的旧字符串承诺。`say` 走真实的账交付（`prepareDelivery`）与回合结算：
 模型回复成功落流后、换代前确认（ack）；通道或落流失败不确认、缺口下轮重拉。装配口径见
 [docs/runtime-config.md](docs/runtime-config.md)。
