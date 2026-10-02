@@ -4,8 +4,9 @@ import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 import type { BreathTrigger } from "../../acceptance/resident-runtime-driver.ts";
 import { parseManualBreath } from "../session/breath-trigger.ts";
+import { assembleResidentRuntime } from "./assembly.ts";
+import type { ModelTransport } from "./channels.ts";
 import { CredentialStore } from "./credentials.ts";
-import { ResidentRuntime } from "./runtime.ts";
 import { ResidentChatTui } from "./tui.ts";
 
 interface ResidentCliOptions {
@@ -64,7 +65,14 @@ export function parseResidentCliArguments(args: readonly string[]): ResidentCliO
   return { residentId: residentId ?? "", dataDir: resolve(dataDir), help };
 }
 
-export async function main(args = process.argv.slice(2)): Promise<void> {
+/**
+ * 终端入口。`transport` 只在测试里注入录制传输用（默认走现役通道选择）——
+ * 不新增环境变量、不新增生产命令；真实用户路径不看这个参数。
+ */
+export async function main(
+  args = process.argv.slice(2),
+  injection: { transport?: ModelTransport } = {},
+): Promise<void> {
   const options = parseResidentCliArguments(args);
   if (options.help) {
     process.stdout.write(
@@ -80,7 +88,12 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   const credential = new CredentialStore(join(options.dataDir, "credentials")).find(
     options.residentId,
   );
-  const runtime = new ResidentRuntime({ dataDir: options.dataDir });
+  // 终端宿主装配：与宿主子进程共用同一 seam，接上认证权威事实账（与住户档案同在
+  // residents/，各认各的后缀），使 currentFacts / 信里 commitment 档来自 currentSet()。
+  const runtime = assembleResidentRuntime({
+    dataDir: options.dataDir,
+    ...(injection.transport === undefined ? {} : { transport: injection.transport }),
+  });
   const tui = new ResidentChatTui(runtime, {
     residentId: options.residentId,
     model: credential?.model ?? "未配置",

@@ -51,3 +51,11 @@ pi 通道在子进程中仅按当前 provider 设置一项专属凭证变量，�
 1. 名字带 `MIST_` 前缀；
 2. 本文档先登记（表格一行：读取点、默认、用途），代码后落地；
 3. 没有默认值就不能缺省启动——缺省行为的歧义在评审时解决，不留到运行时。
+
+## 住户运行时的账装配
+
+CLI 与宿主子进程共用 `src/resident-runtime/assembly.ts`，认证账跟着 `dataDir` 落在
+`residents/<id>.facts.json`。嵌入方可选 `ledger: { dataDir }` 接认证宿主，或
+`factLedger` 接已有账的只读视图；两者互斥，都不传则 `currentFacts` 缺席。
+宿主维护经 `AuthenticatedLedgerHost.system(senderId).append`，新承诺用 `active_rule`；
+住户写入仍须经过已认证 ingress 和现役 `forDispatch(...).append`，没有新增终端立承诺命令。
