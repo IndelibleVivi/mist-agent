@@ -284,6 +284,20 @@ export class ResidentIdentityStore {
     };
   }
 
+  activeResidents(): ActiveResidentIdentity[] {
+    return this.#registry.residents
+      .filter((resident) => resident.active)
+      .map((resident) => {
+        const active = this.requireActiveResident(resident.residentId);
+        if (!active.ok) {
+          throw new Error(
+            `active resident ${resident.residentId} failed identity recovery: ${active.reason}`,
+          );
+        }
+        return active.value;
+      });
+  }
+
   #candidateSnapshot(candidate: CandidateRecord): CandidateSnapshot {
     const {
       proposedBy: _proposedBy,

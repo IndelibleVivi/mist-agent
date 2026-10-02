@@ -267,6 +267,9 @@ export class ResidentRuntime {
     mkdirSync(this.#residentsDir, { recursive: true });
     this.#residents = new ResidentStore({ dataDir: this.#residentsDir });
     this.#identities = new ResidentIdentityStore({ dataDir: join(dataDir, "identities") });
+    for (const identity of this.#identities.activeResidents()) {
+      this.#materializeResidentRoom(identity);
+    }
     this.#streams = new CanonicalStreamStore({ dataDir: this.#streamsDir });
     // 写句柄经先决①的唯一开把手拿（构造点全仓唯一，在 window-host/window-history-host.ts
     // 的 openCanonicalStreamWriter 里）：WH-06 的唯一写方判据与 resident-runtime.md
@@ -347,9 +350,7 @@ export class ResidentRuntime {
   }
 
   requireActiveResident(referenceId: string): IdentityResult<ActiveResidentIdentity> {
-    const active = this.#identities.requireActiveResident(referenceId);
-    if (active.ok) this.#materializeResidentRoom(active.value);
-    return active;
+    return this.#identities.requireActiveResident(referenceId);
   }
 
   resolveChannelRoute(input: { channel: ChannelSpecLike }): Result<ChannelRouteLike> {

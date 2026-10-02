@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   BootPackView,
   BreatheOutcome,
@@ -19,6 +19,7 @@ import type {
   TurnResult,
 } from "../acceptance/resident-runtime-driver.ts";
 import { type CanonicalEventDraft, CanonicalStreamStore } from "../src/one-stream/index.ts";
+import { ResidentIdentityStore } from "../src/resident-continuity/identity-store.ts";
 import { LetterStore } from "../src/resident-runtime/breath.ts";
 import {
   ChannelSpecError,
@@ -54,6 +55,7 @@ function tempDir(): string {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   while (tempDirs.length > 0) rmSync(tempDirs.pop() as string, { recursive: true, force: true });
 });
 
@@ -271,6 +273,57 @@ describe("住户号显式入口（判卷与安装器指定的事实不能换号�
 });
 
 describe("#182 入住读闸", () => {
+  it("requireActiveResident 只读；宿主启动单独恢复已持久化的 active room", async () => {
+    const dataDir = tempDir();
+    const roomPath = join(dataDir, "residents", "r-read-gate.json");
+    const runtime = new ResidentRuntime({ dataDir });
+    try {
+      vi.spyOn(ResidentIdentityStore.prototype, "requireActiveResident").mockReturnValue({
+        ok: true,
+        value: {
+          candidateId: "candidate-read-gate",
+          residentId: "r-read-gate",
+          personaVersionId: "persona-read-gate",
+          persona: "persona:read-gate",
+        },
+      });
+      expect(runtime.requireActiveResident("r-read-gate")).toMatchObject({
+        ok: true,
+        value: { residentId: "r-read-gate" },
+      });
+      expect(existsSync(roomPath)).toBe(false);
+    } finally {
+      await runtime.close();
+      vi.restoreAllMocks();
+    }
+
+    const identities = new ResidentIdentityStore({ dataDir: join(dataDir, "identities") });
+    const candidate = identities.createCandidate({
+      persona: "persona:read-gate",
+      proposedBy: { kind: "installer", id: "installer" },
+      residentId: "r-read-gate",
+    });
+    expect(
+      identities.attestCandidate(
+        candidate.candidateId,
+        { kind: "candidate", candidateId: candidate.candidateId },
+        "accepted",
+      ),
+    ).toMatchObject({ ok: true, value: { residentId: "r-read-gate" } });
+    expect(existsSync(roomPath)).toBe(false);
+
+    const restarted = new ResidentRuntime({ dataDir });
+    try {
+      expect(existsSync(roomPath)).toBe(true);
+      expect(restarted.requireActiveResident(candidate.candidateId)).toMatchObject({
+        ok: true,
+        value: { residentId: "r-read-gate" },
+      });
+    } finally {
+      await restarted.close();
+    }
+  });
+
   it("通道配置不再造人；pending、rejected、missing 三态机器可分", async () => {
     const runtime = new ResidentRuntime({ dataDir: tempDir() });
     try {
