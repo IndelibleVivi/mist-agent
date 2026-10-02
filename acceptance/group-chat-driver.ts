@@ -80,6 +80,8 @@ export const groupChatSyntheticFixture = Object.freeze({
 export interface GroupChatHostRun {
   readonly pid: number;
   readonly commit: string;
+  /** Ephemeral, judge-writable root containing this host's durable acceptance ledger. */
+  readonly dataRoot?: string;
 }
 
 export type GroupChatCommand =

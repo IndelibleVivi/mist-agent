@@ -23,8 +23,8 @@ GC-05、GC-09、GC-15 均因 `real-host driver missing` 报预期红，真实宿
 
 本笔 stack 在 main `9f8e3b326424f062d92e53337a721e7fbbdea866`（#202 已合入）之上；
 只扩写同一组 driver/judge 文件，不建立第二套 runner、房间账或生产 adapter。
-#191 的房间原账、成员注册表和结构化 mention 合入前，只冻结 API-agnostic 行为 oracle；
-`src/group-chat-acceptance-driver.ts` 及所有真实宿主正向证据仍须等待 #191 的实际接口。
+#191 PR2（#208）现已提供 `src/group-chat-acceptance-driver.ts` 真实子进程 adapter 和房间原账写口；
+判卷以该 adapter 跑真实宿主正向对照，不再等待 #191 接口。剩余能力仍按实际缺口逐灯报告。
 
 新增 GC-06、GC-07、GC-08、GC-10、GC-12、GC-16 六灯。报告模式退出码为 0，十三灯均因
 `real-host driver missing` 报预期红，真实宿主通过 `0/13`；strict 模式退出非 0。没有导出
@@ -58,9 +58,23 @@ scenario error。故障注入只触发 ledger append/member transport 失败，�
   其他 POSIX 用 `ps`）：`startHost()` 报的进程活着、是本次判卷进程的后代、跑的是判卷同一个
   node、命令行里有本 checkout `src/` 下的非测试入口文件，代码版本等于当前 HEAD。`stopHost()`
   返回后进程须已退出，读回须报错。合成夹具和借来的活进程号（判卷自己、pid 1、无关的 sleep、
-  空转的 `node -e`）都在这一步被拒。这些只挡懒实现：要证明读回确实来自宿主自己的账，得等 #191
-  adapter 定下启动与数据根契约，再由判卷绕过 adapter 直写原账、经 adapter 读回，届时补上（单测
-  留着 todo）。桩灯沿用仓内 `STUBBED` 惯例：申报的方法所在灯记黄，不计真绿。
+  空转的 `node -e`）都在这一步被拒。这些只挡懒实现：要证明读回确实来自宿主自己的账，判卷会
+  绕过 adapter 直接写入持久房间账，再经重启后的 adapter 读回；真实宿主正例和陈旧内存副本反例
+  均有单测。桩灯沿用仓内 `STUBBED` 惯例：申报的方法所在灯记黄，不计真绿。
+
+### PR2 durable-readback contract
+
+- `GroupChatHostRun.dataRoot` 在 driver 类型上保持可选，以兼容不参与此验收的 driver；真实宿主验收
+  必须提供它。缺失时，判卷 detail 为 `adapter did not expose its acceptance dataRoot`。
+- 判卷先对报告路径取 `realpath`；规范化后的根必须是 `realpath(tmpdir())` 的直接子目录，basename
+  以 `mist-group-chat-` 开头。越界会拒绝直写，detail 为
+  `refused judge write: dataRoot is not this adapter's isolated temporary ledger`；无法解析则返回
+  `cannot resolve adapter dataRoot: ...`。
+- 判卷用生产实现 `RoomEventStore` 在该隔离目录直接 append 合成公开事件，关闭写入 store，停止旧宿主，
+  再启动不同 PID、同 checkout commit 的宿主；只有重启后的 adapter 从同一个规范化 dataRoot 读回
+  相同 event id、正文、作者和房间才通过。重启根不一致的 detail 是
+  `restarted host did not reopen the same durable dataRoot`；漏读或改写是
+  `adapter readback missed or altered the judge-only event after host restart`。
 - GC-02：四个越界负例（缺公开声明、缺房间、缺绑定、夹带私有字段）都由同一发送方住户 A 提交，
   每条只缺或多一项。人类入口是否也须显式声明公开，设计图没有单列，PR1 不判。
 - 可信 owner binding 分层（#206 复审）：`groupChatSyntheticFixture.trustedOwnerBinding` 是判卷
