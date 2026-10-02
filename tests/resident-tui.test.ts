@@ -93,6 +93,16 @@ describe("resident CLI", () => {
       dataDir,
       transport: new SyntheticModelTransport(),
     });
+    const candidate = runtime.createCandidate({
+      persona: `persona:${residentId}`,
+      proposedBy: { kind: "installer", id: "cli-test" },
+      residentId,
+    });
+    runtime.attestCandidate(
+      candidate.candidateId,
+      { kind: "candidate", candidateId: candidate.candidateId },
+      "accepted",
+    );
     runtime.provisionChannel({
       residentId,
       channel: { claudeSubscription: false, credentialKind: "api-key", model: "openai/test-model" },
@@ -142,6 +152,16 @@ describe("resident CLI", () => {
       dataDir,
       transport: new SyntheticModelTransport(),
     });
+    const candidate = runtime.createCandidate({
+      persona: `persona:${residentId}`,
+      proposedBy: { kind: "installer", id: "cli-test" },
+      residentId,
+    });
+    runtime.attestCandidate(
+      candidate.candidateId,
+      { kind: "candidate", candidateId: candidate.candidateId },
+      "accepted",
+    );
     runtime.provisionChannel({
       residentId,
       channel: { claudeSubscription: false, credentialKind: "api-key", model: "openai/test-model" },

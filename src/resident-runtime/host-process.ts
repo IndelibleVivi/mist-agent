@@ -13,6 +13,7 @@
  * 换来判卷只经进程边界观察，绝不共享内存态。
  */
 import { randomUUID } from "node:crypto";
+import type { Actor, ContinuityVerdict } from "../../acceptance/resident-continuity-driver.ts";
 import type {
   BootPackView,
   BreathTrigger,
@@ -57,6 +58,12 @@ interface Command {
     readonly authority?: "window" | "owner";
     readonly via?: "new" | "clear" | "compact";
     readonly script?: readonly TuiStep[];
+    readonly candidateId?: string;
+    readonly referenceId?: string;
+    readonly persona?: string;
+    readonly proposedBy?: Actor;
+    readonly actor?: Actor;
+    readonly decision?: ContinuityVerdict;
   };
 }
 
@@ -81,6 +88,22 @@ function required(value: string | undefined, name: string): string {
 async function handle(command: Command): Promise<unknown> {
   const input = command.input ?? {};
   switch (command.op) {
+    case "createCandidate":
+      return runtime.createCandidate({
+        persona: required(input.persona, "persona"),
+        proposedBy: requiredActor(input.proposedBy, "proposedBy"),
+        ...(input.residentId === undefined ? {} : { residentId: input.residentId }),
+      });
+    case "attestCandidate":
+      return runtime.attestCandidate(
+        required(input.candidateId, "candidateId"),
+        requiredActor(input.actor, "actor"),
+        requiredDecision(input.decision),
+      );
+    case "inspectCandidate":
+      return runtime.inspectCandidate(required(input.candidateId, "candidateId"));
+    case "requireActiveResident":
+      return runtime.requireActiveResident(required(input.referenceId, "referenceId"));
     case "resolveChannelRoute":
       return runtime.resolveChannelRoute({
         channel: requiredChannel(input.channel),
@@ -154,6 +177,20 @@ async function handle(command: Command): Promise<unknown> {
     default:
       throw new Error(`unknown op: ${String(command.op)}`);
   }
+}
+
+function requiredDecision(decision: ContinuityVerdict | undefined): ContinuityVerdict {
+  if (decision !== "accepted" && decision !== "rejected") {
+    throw new Error("decision must be accepted or rejected");
+  }
+  return decision;
+}
+
+function requiredActor(actor: Actor | undefined, name: string): Actor {
+  if (actor === undefined || typeof actor.kind !== "string") {
+    throw new Error(`${name} is required`);
+  }
+  return actor;
 }
 
 function requiredChannel(channel: ChannelSpecLike | undefined): ChannelSpecLike {

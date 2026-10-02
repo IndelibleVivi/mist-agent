@@ -34,6 +34,10 @@ export type ResidentRuntimeErrorCode =
   | "credential-invalid"
   /** 通道跑不起来：pi-claude-bridge / pi-ai 扩展没装或起不来。 */
   | "channel-unavailable"
+  /** Candidate exists but has not yet self-attested. */
+  | "candidate-pending"
+  /** Candidate explicitly rejected the proposed persona. */
+  | "candidate-rejected"
   /** 住户不存在。 */
   | "resident-not-found"
   /** 这条一窗流不存在（区别于「流是空的」）。 */
