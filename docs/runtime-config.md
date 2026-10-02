@@ -16,6 +16,8 @@
 | `MIST_WINDOW_ARCHIVE_PATH` | `tests/fixtures/session-registry-host.ts` | 空 = 纯内存 | 窗生命周期 JSONL 归档路径（`window_opened` / `window_archived` 追加写）。不设则不持久化，供无持久化需求的嵌入方 |
 | `MIST_TURN_GATE_DATADIR` | `tests/fixtures/turn-gate-host.ts` | 空 = 纯内存 | 开工闸集成宿主的落盘目录：给了则 ResidentStore 与 FactLedger 同目录共存（各自后缀），供父进程 SIGKILL 后原目录拉起，验猝死切点；不设则全内存 |
 | `MIST_WINDOW_HISTORY_DIR` | `src/window-host/window-history-host.ts`（及后续 window-history 验收宿主夹具） | 空 = 无缺省，须显式传 `dataDir` | window-history 生产宿主的落盘根：canonical stream 文件（`*.stream.json`，窗的代际与归档态也以窗账事实的形式落在这条唯一底座里）、存储格式迁移控制/墓碑账（`window-history.migration.json`）、迁移前字节备份（`window-history.backup/`）、每窗格式记录（`*.wh-format.json`）与故障注入标记（`window-history.faults/`）都落在这里。`WindowHistoryHost` 构造入参 `dataDir` 优先；不给才回落读本变量；两者都缺则拒绝启动（无歧义缺省，见「新增变量的规矩」第 3 条） |
+| `MIST_RESIDENT_RUNTIME_DIR` | `src/resident-runtime/host-process.ts` | 空 = 无缺省，缺则拒绝启动 | 住户运行时宿主子进程的落盘根（`npm run resident` 走 `--data-dir`，不读此变量）。子进程内 ResidentRuntime：一窗流（`streams/`）、住户档案与**认证权威事实账**（同在 `residents/`，档案 `<id>.json` / 账 `<id>.facts.json`，各认各的后缀）、信时间线（`letters/`）、窗账 journal（`sessions/`）都落在这里。**不新增环境变量**，账路径跟着 `dataDir` 走（见「明确不走环境变量的东西」） |
+| `MIST_RESIDENT_RUNTIME_TRANSPORT` | `src/resident-runtime/channels.ts` | `synthetic`（`synthetic` / `pi`） | 模型传输选择：`synthetic` 为本地确定性合成通道（公开 CI 用，不碰网络、不要密钥），`pi` 走真实 pi 通道。CLI 与宿主子进程共用 `assembleResidentRuntime` 装配（`src/resident-runtime/assembly.ts`） |
 
 pi 通道在子进程中仅按当前 provider 设置一项专属凭证变量，值来自住户凭证，不继承主进程中其他 provider 的密钥；未知 provider 拒绝启动，不回退到 `PI_API_KEY`。支持的变量名：
 `ANTHROPIC_API_KEY`、`OPENAI_API_KEY`、`GEMINI_API_KEY`、`OPENROUTER_API_KEY`、`MISTRAL_API_KEY`、`GROQ_API_KEY`、`ANT_LING_API_KEY`、`QWEN_TOKEN_PLAN_API_KEY`、`QWEN_TOKEN_PLAN_CN_API_KEY`、`AZURE_OPENAI_API_KEY`、`NVIDIA_API_KEY`、`DEEPSEEK_API_KEY`、`GOOGLE_CLOUD_API_KEY`、`CEREBRAS_API_KEY`、`XAI_API_KEY`、`RADIUS_API_KEY`、`AI_GATEWAY_API_KEY`、`ZAI_API_KEY`、`ZAI_CODING_CN_API_KEY`、`MINIMAX_API_KEY`、`MINIMAX_CN_API_KEY`、`MOONSHOT_API_KEY`、`HF_TOKEN`、`FIREWORKS_API_KEY`、`TOGETHER_API_KEY`、`BASETEN_API_KEY`、`OPENCODE_API_KEY`、`KIMI_API_KEY`、`META_API_KEY`、`CLOUDFLARE_API_KEY`、`XIAOMI_API_KEY`、`XIAOMI_TOKEN_PLAN_CN_API_KEY`、`XIAOMI_TOKEN_PLAN_AMS_API_KEY`、`XIAOMI_TOKEN_PLAN_SGP_API_KEY`、`COPILOT_GITHUB_TOKEN`、`AWS_BEARER_TOKEN_BEDROCK`。
@@ -40,3 +42,11 @@ pi 通道在子进程中仅按当前 provider 设置一项专属凭证变量，�
 1. 名字带 `MIST_` 前缀；
 2. 本文档先登记（表格一行：读取点、默认、用途），代码后落地；
 3. 没有默认值就不能缺省启动——缺省行为的歧义在评审时解决，不留到运行时。
+
+## 住户运行时的账装配
+
+CLI 与宿主子进程共用 `src/resident-runtime/assembly.ts`，认证账跟着 `dataDir` 落在
+`residents/<id>.facts.json`。嵌入方可选 `ledger: { dataDir }` 接认证宿主，或
+`factLedger` 接已有账的只读视图；两者互斥，都不传则 `currentFacts` 缺席。
+宿主维护经 `AuthenticatedLedgerHost.system(senderId).append`，新承诺用 `active_rule`；
+住户写入仍须经过已认证 ingress 和现役 `forDispatch(...).append`，没有新增终端立承诺命令。

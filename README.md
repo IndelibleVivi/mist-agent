@@ -35,6 +35,21 @@ mist 是一个个人 agent harness（还在图纸阶段）。它的设计从一�
 [docs/design/multi-viewport.md](docs/design/multi-viewport.md)，验收 25 条逐条判卷）；
 一窗流已升格为产品不变量（[docs/decisions.md](docs/decisions.md) D9）。
 
+## 终端住户运行时（#194 / D28）
+
+`npm run resident -- --resident <residentId> [--data-dir <path>]` 起最小 TUI：醒来读启动包、
+按 D25 走订阅或 API key 调模型、把回复经一窗流唯一 writer 落账、到线写交接信换代。
+
+运行时接的是**认证权威事实账**（与住户档案同在 `residents/`）：启动包的 `currentFacts` 与
+交接信里 `commitment` 档的 `ledgerSeq + body` 都取自 `FactLedger.currentSet()`，不自动承接
+`ResidentStore` 里的旧字符串承诺。`say` 走真实的账交付（`prepareDelivery`）与回合结算：
+模型回复成功落流后、换代前确认（ack）；通道或落流失败不确认、缺口下轮重拉。装配口径见
+[docs/runtime-config.md](docs/runtime-config.md)。
+
+现状限制：交接信 `intent` 半仍是确定性装配，当刻亲笔（D8）按主笔
+排期单列；旧字符串承诺的确认/迁移工具另单，本运行时只做 fail-closed 拒绝并给出宿主 API
+入口，不做自动迁移。住户入住的 activation 归 #182；setup 到聊天尚待桥接，#213 仅修诊断。
+
 ## 仓库地图
 
 想干什么，就进哪个门：
@@ -50,6 +65,7 @@ mist 是一个个人 agent harness（还在图纸阶段）。它的设计从一�
 | 读评测的人工判卷标准 | [docs/eval/](docs/eval/)，带版本号，改则升版、旧号不复用 |
 | 跑小机可读性合成维修评测 | [eval/resident-self-repair/](eval/resident-self-repair/)，C1～C4 runner 协议与证据边界 |
 | 查环境变量和运行时配置 | [docs/runtime-config.md](docs/runtime-config.md)，全项目唯一登记处 |
+| 跟住户说上话（终端入口） | `npm run resident -- --resident <id>`，见[终端住户运行时](#终端住户运行时194--d28) |
 | 读或写产品代码 | `src/`（建造中），单元测试在 `tests/` |
 | 参与进来 | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
