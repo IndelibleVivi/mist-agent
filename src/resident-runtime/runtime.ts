@@ -364,7 +364,7 @@ export class ResidentRuntime {
       return fail(
         "credential-invalid",
         `凭证原文读不出（可能刚被吊销或密钥文件损坏）：${(error as Error).message}`,
-        "重新配一条有效凭证（provisionChannel / npm run setup）后重试",
+        "检查 runtime 私有凭证文件与引用；宿主可用 provisionChannel 重新配置有效凭证。安装快照尚未接线，重复 setup 不会修复 runtime 凭证",
         input.residentId,
       );
     }
@@ -505,7 +505,7 @@ export class ResidentRuntime {
       return fail(
         "resident-not-found",
         `住户不存在：${input.residentId}`,
-        "先创建这位住户（createResident / npm run setup），醒来才有包可读",
+        "runtime 尚无这位住户的档案；setup 只保存安装配置，不代替 D22 住户自认。终端首次入住接线仍待 #182，不能自动创建默认身份",
         input.residentId,
       );
     }
@@ -578,7 +578,7 @@ export class ResidentRuntime {
       return fail(
         "resident-not-found",
         `住户不存在：${input.residentId}`,
-        "先创建这位住户（createResident / npm run setup），再设触发线",
+        "runtime 尚无这位住户的档案；setup 只保存安装配置，不代替 D22 住户自认。终端首次入住接线仍待 #182，不能自动创建默认身份",
         input.residentId,
       );
     }
@@ -716,7 +716,7 @@ export class ResidentRuntime {
       return fail(
         "resident-not-found",
         `住户不存在：${input.residentId}`,
-        "先创建这位住户（createResident / npm run setup），时间线才有主",
+        "runtime 尚无这位住户的档案；setup 只保存安装配置，不代替 D22 住户自认。终端首次入住接线仍待 #182，不能自动创建默认身份",
         input.residentId,
       );
     }

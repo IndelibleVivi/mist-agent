@@ -277,6 +277,70 @@ describe("住户号显式入口（判卷与安装器指定的事实不能换号�
 });
 
 describe("评审意见修复（wusaki0723 复审：幂等重试 / 凭证读取边界 / fail-closed 读）", () => {
+  it("ready 清单但密钥文件缺失：结构化拒绝且提示宿主修复，不把用户送回 setup", async () => {
+    const dataDir = tempDir();
+    let calls = 0;
+    const runtime = new ResidentRuntime({
+      dataDir,
+      transport: {
+        async *complete() {
+          calls += 1;
+          yield "不该发生的回复";
+        },
+      },
+    });
+    try {
+      runtimeProvision(runtime, "r-secret-missing");
+      const root = join(dataDir, "credentials");
+      const credentials = new CredentialStore(root);
+      const record = credentials.find("r-secret-missing");
+      expect(record?.status).toBe("ready");
+      if (record === null) throw new Error("fixture 没有配好凭证");
+      const manifest = readFileSync(join(root, "manifest.json"), "utf8");
+      const secretPath = join(
+        root,
+        "secrets",
+        `${record.credentialRef.slice("mist-cred:".length)}.key`,
+      );
+      rmSync(secretPath);
+
+      const result = await runtime.say({ residentId: "r-secret-missing", text: "试读" });
+      expect(failureOf(result).code).toBe("credential-invalid");
+      expect(failureOf(result).remedy).toContain("provisionChannel");
+      expect(failureOf(result).remedy).toContain("重复 setup 不会修复");
+      expect(calls).toBe(0);
+      expect(failureOf(runtime.readStream({ residentId: "r-secret-missing" })).code).toBe(
+        "stream-not-found",
+      );
+      expect(readFileSync(join(root, "manifest.json"), "utf8")).toBe(manifest);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("各缺住户读口与触发线入口给出同一入住边界，不声称 setup 会建人", async () => {
+    const runtime = new ResidentRuntime({ dataDir: tempDir() });
+    try {
+      const results: Result<unknown>[] = [
+        runtime.bootPack({ residentId: "r-absent" }),
+        runtime.setBreathThreshold({
+          residentId: "r-absent",
+          windowId: "w-absent",
+          generation: 1,
+          thresholdTokens: 10,
+          authority: "owner",
+        }),
+        runtime.letterTimeline({ residentId: "r-absent" }),
+      ];
+      for (const result of results) {
+        expect(failureOf(result).code).toBe("resident-not-found");
+        expect(failureOf(result).remedy).toContain("不代替 D22 住户自认");
+      }
+    } finally {
+      await runtime.close();
+    }
+  });
+
   it("同一 turnId 重试幂等：不写重复；不同 turnId 是独立回合（意见 1）", async () => {
     const runtime = new ResidentRuntime({ dataDir: tempDir() });
     try {

@@ -24,6 +24,10 @@ RT-01 的 `provisionChannel()` 正对照直接准备 runtime 住户和凭证，�
 并检查密钥没有复制进 runtime 凭证面、住户没有自动激活、主流没有伪造回复、安装快照
 与原凭证仍完整；模型传输仅 synthetic，无真实用户数据。
 
+`tests/resident-runtime.test.ts` 另覆盖 ready 清单引用的密钥文件缺失：返回
+`credential-invalid`，给出 runtime 私有凭证修复建议，模型零调用、一窗流不写入、
+清单不变；启动包、触发线和信时间线的缺住户入口同样说明 D22 入住边界。
+
 这项交付修正诊断与证据边界，不宣称完成安装交接。完整接线需补 committed config 的
 模型/provider 选择，以及 [D22 入住实现](resident-continuity.md) 的住户自认激活路径；
 不能用 `provisionChannel()` 自动生成档案替代该权威。接线实现后，需按新入口更新本段
