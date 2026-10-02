@@ -40,8 +40,9 @@ mist 是一个个人 agent harness（建造中）。它的设计从一句话长�
 ## 住户运行时
 
 单住户终端入口是 `npm run resident -- --resident <residentId> [--data-dir <path>]`。
-它读取 runtime 数据目录里的住户档案与通道凭证；setup 安装快照到聊天尚待 #182
-生产 activation 接口及后续桥接。运行时行为和验收边界见
+它读取 runtime 数据目录里的身份账、住户档案与通道凭证。宿主先建立人格候选，再由
+candidate 本人自认；`provisionChannel()` 只给已激活住户配通道，不再自动造人。
+setup 安装快照到 candidate 引用与终端入口仍未桥接。运行时行为和验收边界见
 [住户运行时与终端入口](acceptance/resident-runtime.md)。
 
 运行时接的是认证权威事实账（与住户档案同在 `residents/`）：启动包的 `currentFacts` 与
@@ -142,10 +143,12 @@ npm run resident -- --resident <residentId> --data-dir <dataDir>
 读取另一个 runtime 凭证面与住户档案；当前尚未消费安装快照。因此 setup 成功后，
 即使使用同一个数据根，终端仍不能据此直接开始对话，重复 setup 也不会补齐 runtime 状态。
 
-runtime 会明确显示这条边界，保留 `credential-missing` / `credential-invalid` /
-`resident-not-found` 的机器区分。已有宿主嵌入路径可通过 `provisionChannel()` 显式配置模型
-和通道；这不是终端首次入住的替代流程。完整交接还需接入 D22 的住户自认（[#182](https://github.com/mist-agent-harness/mist-agent/issues/182)）
-与明确的模型/provider 路由；安装器不能自动激活默认身份。隔离复现和验证范围见
+runtime 每个普通聊天回合先过激活闸：未自认报 `candidate-pending`，已拒绝报
+`candidate-rejected`，没有 active 身份报 `resident-not-found`；只有已激活住户才进一步
+检查 `credential-missing` / `credential-invalid`。宿主通过 D22 的
+`createCandidate()` / `attestCandidate()` 完成住户本人自认后，才能用 `provisionChannel()`
+显式配置模型和通道。这不是终端首次入住的替代流程；安装桥接还需消费 candidate 引用
+与明确的模型/provider 路由，安装器不能自动激活默认身份。隔离复现和验证范围见
 [resident-runtime 安装边界](acceptance/resident-runtime.md#安装快照与-runtime-的边界)。
 
 ## License

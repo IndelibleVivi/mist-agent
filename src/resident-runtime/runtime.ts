@@ -20,6 +20,11 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type {
+  Actor,
+  CandidateSnapshot,
+  ContinuityVerdict,
+} from "../../acceptance/resident-continuity-driver.ts";
+import type {
   BootPackView,
   BreathTrigger,
   BreatheOutcome,
@@ -41,6 +46,12 @@ import type {
 import { buildBootPack } from "../bootpack.ts";
 import type { CanonicalEventDraft, EventActor, JsonObject } from "../one-stream/event-contract.ts";
 import { CanonicalStreamStore, StreamNotFoundError } from "../one-stream/index.ts";
+import {
+  type ActiveResidentIdentity,
+  type ResidentIdentityResult as IdentityResult,
+  type ResidentIdentityFailureReason,
+  ResidentIdentityStore,
+} from "../resident-continuity/identity-store.ts";
 import { BreathCycle, BreathCycleError } from "../session/breath-cycle.ts";
 import type { DispatchSettlement } from "../session/dispatch-authority.ts";
 import {
@@ -169,6 +180,31 @@ class LetterDraftRefusalError extends Error {
   }
 }
 
+function identityFailure<T>(reason: ResidentIdentityFailureReason, referenceId: string): Result<T> {
+  if (reason === "candidate-pending") {
+    return fail(
+      "candidate-pending",
+      `候选住户尚未自认：${referenceId}`,
+      "先完成这位 candidate 的 self-attestation；接受后再用返回的 residentId 进入运行时",
+      referenceId,
+    );
+  }
+  if (reason === "candidate-rejected") {
+    return fail(
+      "candidate-rejected",
+      `候选住户已拒绝这份人格：${referenceId}`,
+      "停止普通聊天入口；如要重提，创建新的 persona candidate 并重新自认",
+      referenceId,
+    );
+  }
+  return fail(
+    "resident-not-found",
+    `没有 active resident：${referenceId}`,
+    "先创建 persona candidate，并由 candidate 本人接受后使用返回的 residentId",
+    referenceId,
+  );
+}
+
 function isMissingFile(error: unknown): boolean {
   return (error as NodeJS.ErrnoException).code === "ENOENT";
 }
@@ -180,6 +216,7 @@ export class ResidentRuntime {
   readonly #logsDir: string;
   readonly #windowIndexPath: string;
   readonly #residents: ResidentStore;
+  readonly #identities: ResidentIdentityStore;
   readonly #streams: CanonicalStreamStore;
   /** 写句柄类型不点名（点名 import type 会被 RT-07 的「定义」检索数成第二份写入路径），跟开把手的返回类型走。 */
   readonly #writer: ReturnType<typeof openCanonicalStreamWriter>;
@@ -229,6 +266,7 @@ export class ResidentRuntime {
     mkdirSync(this.#streamsDir, { recursive: true });
     mkdirSync(this.#residentsDir, { recursive: true });
     this.#residents = new ResidentStore({ dataDir: this.#residentsDir });
+    this.#identities = new ResidentIdentityStore({ dataDir: join(dataDir, "identities") });
     this.#streams = new CanonicalStreamStore({ dataDir: this.#streamsDir });
     // 写句柄经先决①的唯一开把手拿（构造点全仓唯一，在 window-host/window-history-host.ts
     // 的 openCanonicalStreamWriter 里）：WH-06 的唯一写方判据与 resident-runtime.md
@@ -279,6 +317,41 @@ export class ResidentRuntime {
 
   // —— 通道（D25） ——
 
+  createCandidate(input: {
+    persona: string;
+    proposedBy: Actor;
+    residentId?: string;
+  }): CandidateSnapshot {
+    if (input.residentId !== undefined && this.#residents.has(input.residentId)) {
+      throw new Error(`resident id collision with an existing runtime room: ${input.residentId}`);
+    }
+    return this.#identities.createCandidate(input);
+  }
+
+  attestCandidate(
+    candidateId: string,
+    actor: Actor,
+    decision: ContinuityVerdict,
+  ): IdentityResult<CandidateSnapshot> {
+    const result = this.#identities.attestCandidate(candidateId, actor, decision);
+    if (result.ok && result.value.state === "active") {
+      const active = this.#identities.requireActiveResident(candidateId);
+      if (!active.ok) throw new Error(active.reason);
+      this.#materializeResidentRoom(active.value);
+    }
+    return result;
+  }
+
+  inspectCandidate(candidateId: string): IdentityResult<CandidateSnapshot> {
+    return this.#identities.inspectCandidate(candidateId);
+  }
+
+  requireActiveResident(referenceId: string): IdentityResult<ActiveResidentIdentity> {
+    const active = this.#identities.requireActiveResident(referenceId);
+    if (active.ok) this.#materializeResidentRoom(active.value);
+    return active;
+  }
+
   resolveChannelRoute(input: { channel: ChannelSpecLike }): Result<ChannelRouteLike> {
     try {
       return ok(resolveChannelRoute(input.channel));
@@ -298,16 +371,12 @@ export class ResidentRuntime {
     } catch (error) {
       return specFailure(error, input.residentId);
     }
-    if (!this.#residents.has(input.residentId)) {
-      // 入住流程（#182）没接之前，配通道即建档：身份先以住户号为名，
-      // 换真名是入住单的事，不在这儿编。
-      this.#residents.createResident(input.residentId, { residentId: input.residentId });
-    }
-    // 认证账的每户开户也在这里对齐：配通道是运行时侧「这户存在」的入口点，
-    // 后续窗登记与承诺写入都要先有这本账。
-    this.#ensureLedgerBook(input.residentId);
+    const active = this.requireActiveResident(input.residentId);
+    if (!active.ok) return identityFailure(active.reason, input.residentId);
+    // 只给已激活的 canonical resident 开账；配通道不代替住户自认。
+    this.#ensureLedgerBook(active.value.residentId);
     const record = this.#credentials.provision({
-      residentId: input.residentId,
+      residentId: active.value.residentId,
       channel: input.channel,
       secret: input.canarySecret,
     });
@@ -330,7 +399,11 @@ export class ResidentRuntime {
    * 落账」全程占坑，后一个 say() 排队等前一回合落完账——回合不许拆散交错。
    */
   say(input: SayInput): Promise<Result<TurnResult>> {
-    return this.#enqueue(input.residentId, () => this.#runTurn(input));
+    if (input.text.trim().length === 0) return this.#runTurn(input);
+    const active = this.requireActiveResident(input.residentId);
+    if (!active.ok) return Promise.resolve(identityFailure(active.reason, input.residentId));
+    const normalized = { ...input, residentId: active.value.residentId };
+    return this.#enqueue(normalized.residentId, () => this.#runTurn(normalized));
   }
 
   #enqueue<T>(residentId: string, task: () => Promise<T>): Promise<T> {
@@ -346,8 +419,8 @@ export class ResidentRuntime {
     return run;
   }
 
-  async #runTurn(input: SayInput): Promise<Result<TurnResult>> {
-    if (input.text.trim().length === 0) {
+  async #runTurn(request: SayInput): Promise<Result<TurnResult>> {
+    if (request.text.trim().length === 0) {
       // runtime 层自己拦（评审意见 4）：IPC 层的形状检查不是实现的防线。
       // 归 channel-unavailable 是沿用本层先例（specFailure 也把输入不合法归这码）——
       // 契约的错误码枚举是判卷资产，不为单个校验加码。
@@ -355,9 +428,12 @@ export class ResidentRuntime {
         "channel-unavailable",
         "消息文本不许为空",
         "把要说的话写进 text 再发——空消息不是合法往返",
-        input.residentId,
+        request.residentId,
       );
     }
+    const active = this.requireActiveResident(request.residentId);
+    if (!active.ok) return identityFailure(active.reason, request.residentId);
+    const input = { ...request, residentId: active.value.residentId };
     const requestedTurnId = input.turnId;
     const turnId = requestedTurnId ?? randomUUID();
     if (requestedTurnId !== undefined) {
@@ -590,6 +666,11 @@ export class ResidentRuntime {
       reply,
       streamed: chunks >= 2,
     });
+  }
+
+  #materializeResidentRoom(identity: ActiveResidentIdentity): void {
+    if (this.#residents.has(identity.residentId)) return;
+    this.#residents.createResident(identity.persona, { residentId: identity.residentId });
   }
 
   // —— 一窗流只读 ——

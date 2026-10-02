@@ -9,6 +9,7 @@ import { SyntheticModelTransport } from "../src/resident-runtime/channels.ts";
 import { parseResidentCliArguments, parseResidentCliInput } from "../src/resident-runtime/cli.ts";
 import { ResidentRuntime } from "../src/resident-runtime/runtime.ts";
 import { type ChatTurnPort, ResidentChatTui } from "../src/resident-runtime/tui.ts";
+import { activateSyntheticResident } from "./fixtures/resident-identity.ts";
 
 const cliPath = fileURLToPath(new URL("../src/resident-runtime/cli.ts", import.meta.url));
 
@@ -178,6 +179,16 @@ describe("resident CLI", () => {
       dataDir,
       transport: new SyntheticModelTransport(),
     });
+    const candidate = runtime.createCandidate({
+      persona: `persona:${residentId}`,
+      proposedBy: { kind: "installer", id: "cli-test" },
+      residentId,
+    });
+    runtime.attestCandidate(
+      candidate.candidateId,
+      { kind: "candidate", candidateId: candidate.candidateId },
+      "accepted",
+    );
     runtime.provisionChannel({
       residentId,
       channel: { claudeSubscription: false, credentialKind: "api-key", model: "openai/test-model" },
@@ -227,6 +238,16 @@ describe("resident CLI", () => {
       dataDir,
       transport: new SyntheticModelTransport(),
     });
+    const candidate = runtime.createCandidate({
+      persona: `persona:${residentId}`,
+      proposedBy: { kind: "installer", id: "cli-test" },
+      residentId,
+    });
+    runtime.attestCandidate(
+      candidate.candidateId,
+      { kind: "candidate", candidateId: candidate.candidateId },
+      "accepted",
+    );
     runtime.provisionChannel({
       residentId,
       channel: { claudeSubscription: false, credentialKind: "api-key", model: "openai/test-model" },
@@ -301,7 +322,7 @@ function spawnResidentCli(input: {
   });
 }
 
-/** 在临时数据目录里用现役 provisionChannel 备好一位无承诺的合成住户。 */
+/** 在临时目录里显式自认，再用 provisionChannel 配合成通道。 */
 async function provisionSyntheticResident(input: {
   readonly dataDir: string;
   readonly residentId: string;
@@ -310,6 +331,7 @@ async function provisionSyntheticResident(input: {
     dataDir: input.dataDir,
     transport: new SyntheticModelTransport(),
   });
+  activateSyntheticResident(runtime, input.residentId);
   const provisioned = runtime.provisionChannel({
     residentId: input.residentId,
     channel: { claudeSubscription: false, credentialKind: "api-key", model: "openai/test-model" },

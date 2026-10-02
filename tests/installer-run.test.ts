@@ -964,9 +964,10 @@ it("does not send a committed installer user back through setup or silently acti
   );
   expect(child.error).toBeUndefined();
   expect(child.status, child.stderr).toBe(0);
-  expect(child.stdout).toContain("credential-missing");
-  expect(child.stdout).toContain("尚未接到");
-  expect(child.stdout).toContain("重复运行 setup");
+  // activation gate 先于凭证读取；安装快照不能自动建立 active identity。
+  expect(child.stdout).toContain("resident-not-found");
+  expect(child.stdout).toContain("candidate");
+  expect(child.stdout).toContain("本人接受");
   expect(child.stdout).not.toContain("安装器 npm run setup，或 provisionChannel");
   expect(child.stdout + child.stderr).not.toContain(secret);
   expect(child.stdout).not.toContain("合成回声已读来信。");

@@ -54,6 +54,10 @@ pi 通道在子进程中仅按当前 provider 设置一项专属凭证变量，�
 
 ## 住户运行时的账装配
 
+身份与人格候选的权威登记在 `dataDir/identities/registry.json`；candidate 本人自认后才有
+active resident 与首个人格版本。住户运行授权仍不从身份激活推导。普通 `say()` 每回合
+先查询 active 身份，再进入通道与认证账路径；配通道本身不会创建住户。
+
 CLI 与宿主子进程共用 `src/resident-runtime/assembly.ts`，认证账跟着 `dataDir` 落在
 `residents/<id>.facts.json`。嵌入方可选 `ledger: { dataDir }` 接认证宿主，或
 `factLedger` 接已有账的只读视图；两者互斥，都不传则 `currentFacts` 缺席。

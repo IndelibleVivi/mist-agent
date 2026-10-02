@@ -1,11 +1,3 @@
-/**
- * #194 住户运行时的单元测试：测试跟着功能走（仓规六）。
- *
- * 覆盖面：通道映射（D25 三）、凭证面（RT-06 存而不漏）、循环落账纪律
- * （RT-01 成功才落账 / RT-02 跨重启只追加）、失败机器可分（credential-missing
- * vs credential-invalid vs channel-unavailable）、住户号显式入口的撞号防线。
- * 端到端判卷归 acceptance/resident-runtime-*.ts，这里只钉单元行为。
- */
 import {
   existsSync,
   mkdtempSync,
@@ -43,6 +35,15 @@ import { sealLetter } from "../src/session/handover-letter.ts";
 import { FactLedger } from "../src/store/fact-ledger.ts";
 import { ResidentStore } from "../src/store/resident-store.ts";
 import { openCanonicalStreamWriter } from "../src/window-host/window-history-host.ts";
+/**
+ * #194 住户运行时的单元测试：测试跟着功能走（仓规六）。
+ *
+ * 覆盖面：通道映射（D25 三）、凭证面（RT-06 存而不漏）、循环落账纪律
+ * （RT-01 成功才落账 / RT-02 跨重启只追加）、失败机器可分（credential-missing
+ * vs credential-invalid vs channel-unavailable）、住户号显式入口的撞号防线。
+ * 端到端判卷归 acceptance/resident-runtime-*.ts，这里只钉单元行为。
+ */
+import { activateSyntheticResident as activateResident } from "./fixtures/resident-identity.ts";
 
 const tempDirs: string[] = [];
 
@@ -155,11 +156,7 @@ describe("凭证面（RT-06 存而不漏）", () => {
   it("吊销只翻状态不删档：后续说话说 credential-invalid 而不是 credential-missing", async () => {
     const runtime = new ResidentRuntime({ dataDir: tempDir() });
     try {
-      runtime.provisionChannel({
-        residentId: "r-rev",
-        channel: claudeChannel,
-        canarySecret: "sk-1",
-      });
+      runtimeProvision(runtime, "r-rev", "sk-1");
       runtime.revokeCredential({ residentId: "r-rev" });
       const result = await runtime.say({ residentId: "r-rev", text: "还在吗" });
       expect(failureOf(result).code).toBe("credential-invalid");
@@ -173,11 +170,7 @@ describe("住户运行时循环（RT-01 / RT-02）", () => {
   it("say 往返成功才落账：user → assistant 两条事件、流文件恰好一个、扫描面干净", async () => {
     const runtime = new ResidentRuntime({ dataDir: tempDir() });
     try {
-      const provisioned = runtime.provisionChannel({
-        residentId: "r-a",
-        channel: claudeChannel,
-        canarySecret: "sk-canary-1",
-      });
+      const provisioned = runtimeProvision(runtime, "r-a", "sk-canary-1");
       expect(provisioned.ok).toBe(true);
       const turn = unwrap<TurnResult>(await runtime.say({ residentId: "r-a", text: "第一句" }));
       expect(turn.streamed).toBe(true);
@@ -238,6 +231,7 @@ describe("住户运行时循环（RT-01 / RT-02）", () => {
     };
     const runtime = new ResidentRuntime({ dataDir: tempDir(), transport: broken });
     try {
+      activateResident(runtime, "r-c");
       const missing = await runtime.say({ residentId: "r-c", text: "x" });
       expect(failureOf(missing)).toMatchObject({ code: "credential-missing" });
       expect(failureOf(missing).remedy.length).toBeGreaterThan(0);
@@ -273,6 +267,84 @@ describe("住户号显式入口（判卷与安装器指定的事实不能换号�
     expect(store.has("r-explicit")).toBe(true);
     expect(() => store.createResident("别人", { residentId: "r-explicit" })).toThrow(/collision/);
     expect(() => store.createResident("坏号", { residentId: "../escape" })).toThrow(/文件名/);
+  });
+});
+
+describe("#182 入住读闸", () => {
+  it("通道配置不再造人；pending、rejected、missing 三态机器可分", async () => {
+    const runtime = new ResidentRuntime({ dataDir: tempDir() });
+    try {
+      const pending = runtime.createCandidate({
+        persona: "persona:pending",
+        proposedBy: { kind: "installer", id: "installer" },
+        residentId: "r-pending",
+      });
+      expect(
+        failureOf(
+          runtime.provisionChannel({
+            residentId: pending.candidateId,
+            channel: claudeChannel,
+            canarySecret: "sk-pending",
+          }),
+        ).code,
+      ).toBe("candidate-pending");
+      runtime.attestCandidate(
+        pending.candidateId,
+        { kind: "candidate", candidateId: pending.candidateId },
+        "rejected",
+      );
+      expect(
+        failureOf(
+          runtime.provisionChannel({
+            residentId: pending.candidateId,
+            channel: claudeChannel,
+            canarySecret: "sk-rejected",
+          }),
+        ).code,
+      ).toBe("candidate-rejected");
+      expect(
+        failureOf(
+          runtime.provisionChannel({
+            residentId: "resident-does-not-exist",
+            channel: claudeChannel,
+            canarySecret: "sk-missing",
+          }),
+        ).code,
+      ).toBe("resident-not-found");
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("active candidate materializes its runtime room and every say rechecks identity", async () => {
+    const runtime = new ResidentRuntime({ dataDir: tempDir() });
+    try {
+      const candidate = runtime.createCandidate({
+        persona: "persona:active",
+        proposedBy: { kind: "installer", id: "installer" },
+        residentId: "r-active",
+      });
+      const before = await runtime.say({ residentId: candidate.candidateId, text: "不能提前聊" });
+      expect(failureOf(before).code).toBe("candidate-pending");
+      const active = runtime.attestCandidate(
+        candidate.candidateId,
+        { kind: "candidate", candidateId: candidate.candidateId },
+        "accepted",
+      );
+      expect(active).toMatchObject({ ok: true, value: { residentId: "r-active" } });
+      expect(
+        runtime.provisionChannel({
+          residentId: "r-active",
+          channel: claudeChannel,
+          canarySecret: "sk-active",
+        }).ok,
+      ).toBe(true);
+      expect(
+        unwrap<TurnResult>(await runtime.say({ residentId: "r-active", text: "现在可以" })),
+      ).toMatchObject({ residentId: "r-active", generation: 1 });
+    } finally {
+      await runtime.close();
+    }
   });
 });
 
@@ -423,11 +495,7 @@ describe("评审意见修复（wusaki0723 复审：幂等重试 / 凭证读取�
     const runtime = new ResidentRuntime({ dataDir: tempDir() });
     try {
       runtimeProvision(runtime, "r-a");
-      runtime.provisionChannel({
-        residentId: "r-ab",
-        channel: claudeChannel,
-        canarySecret: "sk-r-ab",
-      });
+      runtimeProvision(runtime, "r-ab", "sk-r-ab");
       unwrap<TurnResult>(await runtime.say({ residentId: "r-a", text: "甲说" }));
       unwrap<TurnResult>(await runtime.say({ residentId: "r-ab", text: "乙说特有词" }));
       // 反对照：扫 r-a 不许串到 r-ab 的文件。
@@ -482,10 +550,12 @@ describe("回合语义（验收席复核三处 + 两项观察）", () => {
       "测试备账：给请求级核对喂一条现行事实",
     );
     const stub = countingTransport(() => "收到。");
-    // 记忆先进住户档案，再开运行时（运行时的住户面从同一个 residents/ 快照读）。
+    // 先经入住流程成立，再从同一个 residents/ 快照写入记忆。
     const dataDir = tempDir();
+    const initializer = new ResidentRuntime({ dataDir, transport: stub.transport });
+    activateResident(initializer, "r-full");
+    await initializer.close();
     const stores = new ResidentStore({ dataDir: join(dataDir, "residents") });
-    stores.createResident("小满", { residentId: "r-full" });
     stores.remember("r-full", "爱吃苹果");
     const runtime = new ResidentRuntime({ dataDir, transport: stub.transport, factLedger: ledger });
     try {
@@ -955,8 +1025,10 @@ describe("交接信随启动包进模型请求（D8 补记三：醒来即已读�
   it("手动换代后下一次 say 的请求带正确原信（标题 / 作者代际 / writtenAt / 条目原文）", async () => {
     const recorder = recordingTransport();
     const dataDir = tempDir();
+    const initializer = new ResidentRuntime({ dataDir, transport: recorder.transport });
+    activateResident(initializer, "r-ho", "接信者");
+    await initializer.close();
     const stores = new ResidentStore({ dataDir: join(dataDir, "residents") });
-    stores.createResident("接信者", { residentId: "r-ho" });
     stores.remember("r-ho", "上代在做迁移");
     const runtime = new ResidentRuntime({ dataDir, transport: recorder.transport });
     try {
@@ -1228,10 +1300,15 @@ function foreignDraft(): CanonicalEventDraft {
   };
 }
 
-function runtimeProvision(runtime: ResidentRuntime, residentId: string): void {
-  runtime.provisionChannel({
+function runtimeProvision(
+  runtime: ResidentRuntime,
+  residentId: string,
+  canarySecret = `sk-${residentId}`,
+): ReturnType<ResidentRuntime["provisionChannel"]> {
+  if (!runtime.requireActiveResident(residentId).ok) activateResident(runtime, residentId);
+  return runtime.provisionChannel({
     residentId,
     channel: claudeChannel,
-    canarySecret: `sk-${residentId}`,
+    canarySecret,
   });
 }

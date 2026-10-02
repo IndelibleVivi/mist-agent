@@ -1,3 +1,11 @@
+import { type ChildProcess, spawn } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterEach, describe, expect, it } from "vitest";
+import { assembleResidentRuntime } from "../src/resident-runtime/assembly.ts";
+import type { ModelCompletionRequest, ModelTransport } from "../src/resident-runtime/channels.ts";
 /**
  * CLI / 宿主装配边界：认证账接线的真实证据（责任：CLI 宿主装配）。
  *
@@ -8,14 +16,7 @@
  *   认证账并完成真实交付（落盘 .facts.json 的窗确认位推进），不是「传了 option」就算。
  * 不动真实 provider、不用密钥（synthetic transport）。
  */
-import { type ChildProcess, spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
-import { assembleResidentRuntime } from "../src/resident-runtime/assembly.ts";
-import type { ModelCompletionRequest, ModelTransport } from "../src/resident-runtime/channels.ts";
+import { activateSyntheticResident } from "./fixtures/resident-identity.ts";
 
 const dirs: string[] = [];
 const children: ChildProcess[] = [];
@@ -51,6 +52,7 @@ describe("CLI 宿主装配 seam（录制 transport）", () => {
     };
     const runtime = assembleResidentRuntime({ dataDir, transport: recording });
     try {
+      activateSyntheticResident(runtime, "r-cli");
       runtime.provisionChannel({ residentId: "r-cli", channel, canarySecret: "sk-test" });
       const authority = runtime.ledgerAuthority();
       if (authority === null) throw new Error("CLI seam 没接上认证账");
@@ -72,7 +74,7 @@ describe("实际 CLI entry 回归", () => {
   it("真实 CLI 子进程接上认证账并完成交付（落盘确认位推进）", async () => {
     const dataDir = tempDir();
     const residentId = "resident-cli-ledger";
-    // 先用共用 seam 建档并落一条账（含窗确认位），再让真实 CLI 从同一盘里恢复。
+    // 先用共用 seam 完成本人自认并落一条账（含窗确认位），再让真实 CLI 从同一盘里恢复。
     const prep = assembleResidentRuntime({
       dataDir,
       transport: {
@@ -83,6 +85,7 @@ describe("实际 CLI entry 回归", () => {
       },
     });
     try {
+      activateSyntheticResident(prep, residentId);
       prep.provisionChannel({ residentId, channel, canarySecret: "sk-test" });
       const authority = prep.ledgerAuthority();
       if (authority === null) throw new Error("准备阶段没接上账");

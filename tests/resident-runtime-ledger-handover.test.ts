@@ -1,17 +1,3 @@
-/**
- * #194 运行时出信绑定权威事实账的行为钉子（责任：运行时出信 + CLI 宿主装配）。
- *
- * 覆盖：
- * - 换气落盘信的 commitment 档 seq/body 来自 FactLedger.currentSet()（图纸 §4.2）；
- * - supersede 后的条目不进信；
- * - 住户隔离：甲的账不进乙的信；
- * - ResidentStore 旧 string 承诺未入账时 breath-refused、逐条列出、给真实入口、
- *   不换代、不落信、不入账、不自动清（remedy 不承诺入账后即可换气）；
- * - say 走真实认证交付：成功回合 settle+ack，失败回合不 ack（读落盘 .facts.json 取证）；
- * - 换代后账窗重登记：新代 say/写正常，旧代不冒充新代。
- *
- * 端到端七灯归 acceptance/resident-runtime-*.ts；这里钉单元行为。
- */
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,6 +12,21 @@ import type { ModelCompletionRequest, ModelTransport } from "../src/resident-run
 import { ResidentRuntime } from "../src/resident-runtime/runtime.ts";
 import { FactLedger } from "../src/store/fact-ledger.ts";
 import { ResidentStore } from "../src/store/resident-store.ts";
+/**
+ * #194 运行时出信绑定权威事实账的行为钉子（责任：运行时出信 + CLI 宿主装配）。
+ *
+ * 覆盖：
+ * - 换气落盘信的 commitment 档 seq/body 来自 FactLedger.currentSet()（图纸 §4.2）；
+ * - supersede 后的条目不进信；
+ * - 住户隔离：甲的账不进乙的信；
+ * - ResidentStore 旧 string 承诺未入账时 breath-refused、逐条列出、给真实入口、
+ *   不换代、不落信、不入账、不自动清（remedy 不承诺入账后即可换气）；
+ * - say 走真实认证交付：成功回合 settle+ack，失败回合不 ack（读落盘 .facts.json 取证）；
+ * - 换代后账窗重登记：新代 say/写正常，旧代不冒充新代。
+ *
+ * 端到端七灯归 acceptance/resident-runtime-*.ts；这里钉单元行为。
+ */
+import { activateSyntheticResident } from "./fixtures/resident-identity.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -67,6 +68,7 @@ function fixedTransport(): { transport: ModelTransport; requests: ModelCompletio
 }
 
 function provision(runtime: ResidentRuntime, residentId: string): void {
+  activateSyntheticResident(runtime, residentId);
   runtime.provisionChannel({ residentId, channel, canarySecret: `sk-${residentId}` });
 }
 
@@ -86,6 +88,87 @@ function ledgerSnapshot(
 }
 
 describe("运行时出信绑定权威事实账", () => {
+  it("激活闸先于认证账：pending/rejected 不开户，active 的两种引用共用回合与确认位", async () => {
+    const dataDir = tempDir();
+    const stub = fixedTransport();
+    const runtime = new ResidentRuntime({
+      dataDir,
+      transport: stub.transport,
+      ledger: { dataDir: join(dataDir, "residents") },
+    });
+    try {
+      const pending = runtime.createCandidate({
+        persona: "synthetic pending persona",
+        proposedBy: { kind: "installer", id: "preflight-test" },
+      });
+      expect(
+        failureOf(await runtime.say({ residentId: pending.candidateId, text: "在吗" })).code,
+      ).toBe("candidate-pending");
+      expect(
+        failureOf(
+          runtime.provisionChannel({
+            residentId: pending.candidateId,
+            channel,
+            canarySecret: "sk-test",
+          }),
+        ).code,
+      ).toBe("candidate-pending");
+      runtime.attestCandidate(
+        pending.candidateId,
+        { kind: "candidate", candidateId: pending.candidateId },
+        "rejected",
+      );
+      expect(
+        failureOf(await runtime.say({ residentId: pending.candidateId, text: "在吗" })).code,
+      ).toBe("candidate-rejected");
+      expect(stub.requests).toHaveLength(0);
+      expect(readdirSync(join(dataDir, "residents"))).toEqual([]);
+
+      const candidate = runtime.createCandidate({
+        persona: "synthetic active persona",
+        proposedBy: { kind: "installer", id: "preflight-test" },
+        residentId: "r-gate-active",
+      });
+      const activated = runtime.attestCandidate(
+        candidate.candidateId,
+        { kind: "candidate", candidateId: candidate.candidateId },
+        "accepted",
+      );
+      expect(activated.ok).toBe(true);
+      unwrap(
+        runtime.provisionChannel({
+          residentId: candidate.candidateId,
+          channel,
+          canarySecret: "sk-test",
+        }),
+      );
+      const authority = runtime.ledgerAuthority();
+      if (authority === null) throw new Error("缺认证账");
+      const entry = authority.host
+        .system("mist-host")
+        .append("r-gate-active", { kind: "active_rule", body: "合成接线约束" }, "宿主维护");
+      const turns = await Promise.all([
+        runtime.say({ residentId: candidate.candidateId, text: "候选引用" }),
+        runtime.say({ residentId: "r-gate-active", text: "住户引用" }),
+      ]);
+      for (const turn of turns) unwrap(turn);
+      expect(stub.requests.map((request) => request.residentId)).toEqual([
+        "r-gate-active",
+        "r-gate-active",
+      ]);
+      expect(
+        stub.requests.every((request) =>
+          request.bootPack.currentFacts?.some((fact) => fact.seq === entry.seq),
+        ),
+      ).toBe(true);
+      const snapshot = ledgerSnapshot(dataDir, "r-gate-active");
+      expect(snapshot.viewports).toHaveLength(1);
+      expect(snapshot.viewports[0]?.ackedSeq).toBe(entry.seq);
+    } finally {
+      await runtime.close();
+    }
+  });
+
   it("换气落盘信的 commitment 档 seq/body 来自 currentSet，supersede 的不装", async () => {
     const dataDir = tempDir();
     const stub = fixedTransport();
@@ -174,8 +257,11 @@ describe("运行时出信绑定权威事实账", () => {
   it("旧 string 承诺未入账：breath-refused、逐条列出、给真实入口、不换代不落信不入账不清数据", async () => {
     const dataDir = tempDir();
     const stub = fixedTransport();
+    // 先完成合成住户自认，再保留旧 string 字段作为换气负例；不自动迁移旧承诺。
+    const initializer = new ResidentRuntime({ dataDir, transport: stub.transport });
+    activateSyntheticResident(initializer, "r-old", "old");
+    await initializer.close();
     const residents = new ResidentStore({ dataDir: join(dataDir, "residents") });
-    residents.createResident("old", { residentId: "r-old" });
     residents.commit("r-old", "旧档案里的一句话承诺");
     residents.commit("r-old", "旧档案里的第二句话");
     const runtime = new ResidentRuntime({

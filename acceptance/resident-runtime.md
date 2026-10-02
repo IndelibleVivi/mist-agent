@@ -14,15 +14,15 @@ npm run acceptance:resident-runtime:strict
 
 ## 安装快照与 runtime 的边界
 
-RT-01 的 `provisionChannel()` 正对照直接准备 runtime 住户和凭证，不经过安装器正式
-提交，不能证明 `npm run setup → npm run resident` 已接通。当前安装器提交
+RT-01 的正对照先让合成 candidate 本人自认，再用 `provisionChannel()` 准备通道凭证；
+不经过安装器正式提交，不能证明 `npm run setup → npm run resident` 已接通。当前安装器提交
 `current.json → snapshots/<install-id>/config.json` 与专属私有凭证；runtime 使用
-`credentials/` 与 `residents/`，缺凭证时不能再把用户送回 setup 当成修复办法。
+`identities/`、`credentials/` 与 `residents/`，缺凭证时不能再把用户送回 setup 当成修复办法。
 
 `tests/installer-run.test.ts` 用 scripted PromptPort 驱动真实 `runInstaller()` 完成正式
 提交，再从相同临时数据根启动独立 CLI 进程。回归观察当前未接线错误与明确处理建议，
-并检查密钥没有复制进 runtime 凭证面、住户没有自动激活、主流没有伪造回复、安装快照
-与原凭证仍完整；模型传输仅 synthetic，无真实用户数据。
+激活闸先返回 `resident-not-found`，并检查密钥没有复制进 runtime 凭证面、住户没有自动
+激活、主流没有伪造回复、安装快照与原凭证仍完整；模型传输仅 synthetic，无真实用户数据。
 
 `tests/resident-runtime.test.ts` 另覆盖 ready 清单引用的密钥文件缺失：返回
 `credential-invalid`，给出 runtime 私有凭证修复建议，模型零调用、一窗流不写入、
@@ -115,8 +115,8 @@ npm test -- tests/resident-runtime.test.ts tests/pi-transport.test.ts
 回合。另注入信文件落盘失败，验证错误可见、代际未推进、拒绝后普通对话仍可进行。
 空行、普通输入、`/exit` 与 SIGINT 的既有回归继续保留。
 
-这些测试用临时目录和 synthetic 通道，配置来自 `provisionChannel()`，不覆盖安装器的
-正式提交到 CLI 的交接，也不证明真实 provider 往返或 intent 当刻亲笔成立。
+这些测试用临时目录和 synthetic 通道；住户经合成 candidate 本人自认，通道配置来自
+`provisionChannel()`，不覆盖安装器的正式提交到 CLI 的交接，也不证明真实 provider 往返或 intent 当刻亲笔成立。
 原 RT-03 判据与未勾独立复验状态保持不变。
 
 ## 七盏灯
