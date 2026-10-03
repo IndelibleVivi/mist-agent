@@ -5,7 +5,8 @@ import { pathToFileURL } from "node:url";
 import type { BreathTrigger } from "../../acceptance/resident-runtime-driver.ts";
 import { parseManualBreath } from "../session/breath-trigger.ts";
 import { CredentialStore } from "./credentials.ts";
-import { ResidentRuntime } from "./runtime.ts";
+import { assembleResidentRuntime } from "./assembly.ts";
+import type { ModelTransport } from "./channels.ts";
 import { ResidentChatTui } from "./tui.ts";
 
 interface ResidentCliOptions {
@@ -64,7 +65,10 @@ export function parseResidentCliArguments(args: readonly string[]): ResidentCliO
   return { residentId: residentId ?? "", dataDir: resolve(dataDir), help };
 }
 
-export async function main(args = process.argv.slice(2)): Promise<void> {
+export async function main(
+  args = process.argv.slice(2),
+  injection: { transport?: ModelTransport } = {},
+): Promise<void> {
   const options = parseResidentCliArguments(args);
   if (options.help) {
     process.stdout.write(
@@ -77,7 +81,10 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     return;
   }
 
-  const runtime = new ResidentRuntime({ dataDir: options.dataDir });
+  const runtime = assembleResidentRuntime({
+    dataDir: options.dataDir,
+    ...(injection.transport === undefined ? {} : { transport: injection.transport }),
+  });
   try {
     const active = runtime.requireActiveResident(options.residentId);
     if (!active.ok) throw new Error(active.reason);

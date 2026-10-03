@@ -478,7 +478,7 @@ describe("PiCliTransport", () => {
     expect(prompt).toContain("小派");
     expect(prompt).toContain("每天写日报");
     expect(prompt).toContain("爱吃苹果");
-    expect(prompt).toContain("偏好短句");
+    expect(prompt).toContain("- [#1] 偏好短句");
     expect(prompt).toContain("早安");
     expect(prompt).toContain("早");
   });

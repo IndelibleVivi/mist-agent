@@ -449,7 +449,7 @@ export function renderSystemPrompt(request: ModelCompletionRequest): string {
     const facts =
       pack.currentFacts.length === 0
         ? "（当前没有现行有效事实）"
-        : pack.currentFacts.map((item) => `- ${item.body}`).join("\n");
+        : pack.currentFacts.map((item) => `- [#${item.seq}] ${item.body}`).join("\n");
     parts.push(`现行有效事实：\n${facts}`);
   }
   if (pack.letter != null) {

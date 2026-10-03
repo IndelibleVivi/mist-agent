@@ -37,22 +37,27 @@ mist 是一个个人 agent harness（建造中）。它的设计从一句话长�
 [acceptance/multi-viewport.md](acceptance/multi-viewport.md)；
 一窗流已升格为产品不变量（[docs/decisions.md](docs/decisions.md) D9）。
 
-## 住户运行时
+## 终端住户运行时（#194 / D28）
 
-单住户终端入口是 `npm run resident -- --resident <residentId> [--data-dir <path>]`。
-它读取 runtime 数据目录里的住户档案与通道凭证；安装器的安装快照到该入口的交接仍待
-端到端验证。运行时行为和验收边界见
-[住户运行时与终端入口](acceptance/resident-runtime.md)。
+`npm run resident -- --resident <residentId> [--data-dir <path>]` 起单住户 TUI：醒来读启动包、
+按 D25 走订阅或 API key 调模型、把回复经一窗流唯一 writer 落账、到线写交接信换代。
+
+运行时接的是**认证权威事实账**（与住户档案同在 `residents/`）：启动包的 `currentFacts` 与
+交接信里 `commitment` 档的指针都取自 `FactLedger.currentSet()`；信只带 `ledgerSeq` 和短引用，
+不复印账上正文。正文随 `currentFacts` 进模型，Pi 提示同时标出 seq 供对账；不自动承接
+`ResidentStore` 里的旧字符串承诺。`say` 走真实的账交付（`prepareDelivery`）与回合结算：
+模型回复成功落流后、换代前确认（ack）；通道或落流失败不确认、缺口下轮重拉。装配口径见
+[docs/runtime-config.md](docs/runtime-config.md)。
 
 换代后的模型请求随启动包携带该住户最新的交接信，pi 通道的 system prompt 保留标题、
 署名、写信时间和 commitment / fact / judgment 分档原文。没有信时照常对话；信档无法
 解析或条目结构无法读出时，在调用模型前报 `letter-invalid`。旧代原始对话保留在流水里，
 不自动塞回新一代上下文。
 
-当前交接信草稿由宿主确定性装配；其与 D8「当刻亲笔」的要求仍需单独核对。
-启动包中已有承诺时，现有草稿缺少承诺的账指针 `ledgerSeq`，换气会报 `breath-refused`；
-这条出信接线仍待修复。
-合成 transport 的回归只验证输入接线，真实模型往返和正式独立验收按各自证据记录。
+现状限制：交接信 `intent` 半仍是确定性装配，当刻亲笔（D8）按主笔
+排期单列；旧字符串承诺的确认/迁移工具另单，本运行时只做 fail-closed 拒绝并给出宿主 API
+入口，不做自动迁移。住户入住先经过 #182 的 candidate / self-attestation 生产闸，只有 active 身份物化 room 与账；
+通道配置不代签身份。setup 到聊天尚待桥接，#213 仅修诊断。
 
 ## 仓库地图
 
@@ -69,6 +74,7 @@ mist 是一个个人 agent harness（建造中）。它的设计从一句话长�
 | 读评测的人工判卷标准 | [docs/eval/](docs/eval/)，带版本号，改则升版、旧号不复用 |
 | 跑小机可读性合成维修评测 | [eval/resident-self-repair/](eval/resident-self-repair/)，C1～C4 runner 协议与证据边界 |
 | 查环境变量和运行时配置 | [docs/runtime-config.md](docs/runtime-config.md)，全项目唯一登记处 |
+| 跟住户说上话（终端入口） | `npm run resident -- --resident <id>`，见[终端住户运行时](#终端住户运行时194--d28) |
 | 读或写产品代码 | `src/`（建造中），单元测试在 `tests/` |
 | 参与进来 | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
