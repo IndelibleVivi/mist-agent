@@ -20,9 +20,16 @@ RT-01 的 `provisionChannel()` 正对照直接准备 runtime 住户和凭证，�
 `credentials/` 与 `residents/`，缺凭证时不能再把用户送回 setup 当成修复办法。
 
 `tests/installer-run.test.ts` 用 scripted PromptPort 驱动真实 `runInstaller()` 完成正式
-提交，再从相同临时数据根启动独立 CLI 进程。回归观察当前未接线错误与明确处理建议，
-并检查密钥没有复制进 runtime 凭证面、住户没有自动激活、主流没有伪造回复、安装快照
-与原凭证仍完整；模型传输仅 synthetic，无真实用户数据。
+提交，再从相同临时数据根启动独立 CLI 进程，分两道边界验证：**第一段真实负例**——
+不创建、不自签任何 candidate，CLI 以真实 residentId 启动，退出码 1、stderr 报
+`resident-not-found` 及处理建议，identity registry 未被自动创建 resident、`residents/`
+为空、runtime 凭证清单缺席、无流、无模型回声，安装快照与原凭证字节保持；**第二段诊断
+正对照**——显式构造一个 synthetic accepted candidate 把住户推过身份闸，CLI 以 candidateId
+启动才能确实到达 `credential-missing` 分支（否则只会停在 `resident-not-found`，测不到要
+看的诊断），同时复核没有复制凭证、没有伪造回复、原字节仍保持。身份闸（D22 / #182）先于
+凭证面成立；CLI 从 candidateId 在边界 resolve 一次，运行时只认 canonical residentId。
+模型传输仅 synthetic，无真实用户数据。身份闸的 pending/rejected 两码与「不自动接受、
+不造 room、不复制凭证、无流」的 CLI 回归钉在 `tests/resident-runtime.test.ts`。
 
 `tests/resident-runtime.test.ts` 另覆盖 ready 清单引用的密钥文件缺失：返回
 `credential-invalid`，给出 runtime 私有凭证修复建议，模型零调用、一窗流不写入、

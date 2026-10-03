@@ -103,6 +103,13 @@ runtime 会明确显示这条边界，保留 `credential-missing` / `credential-
 与明确的模型/provider 路由；安装器不能自动激活默认身份。隔离复现和验证范围见
 [resident-runtime 安装边界](acceptance/resident-runtime.md#安装快照与-runtime-的边界)。
 
+终端还会先过 D22 住户自认这道身份闸：`--resident` 接受 candidateId 并在 CLI 边界
+resolve 一次，运行时只认 canonical residentId。身份闸按原因机器可分地拒绝，各给一条
+处理建议，不冒充 `credential-*`，也不在终端里替住户建人：`candidate-pending`（候选
+尚未自认——引导本人完成 self-attestation）、`candidate-rejected`（候选拒了这份人格
+——引导新建 persona candidate 重提）、`resident-not-found`（查无此住户——引导创建
+persona candidate）。三种都以退出码 1 结束，不崩溃。
+
 ## License
 
 AGPL-3.0。你在网络上向别人提供基于 mist 的服务，也必须开源你的修改。
