@@ -21,6 +21,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
+  CandidateSnapshot,
+  Result as IdentityResult,
+} from "../acceptance/resident-continuity-driver.ts";
+import type {
   BootPackView,
   BreathTrigger,
   BreatheOutcome,
@@ -102,7 +106,9 @@ class ResidentRuntimeProductionDriver implements ResidentRuntimeDriver {
     channel: ChannelSpec;
     canarySecret: string;
   }): Promise<Result<ProvisionedChannelForward>> {
-    return this.#call("provisionChannel", { input });
+    return this.#ensureActiveResident(input.residentId).then(() =>
+      this.#call("provisionChannel", { input }),
+    );
   }
 
   async revokeCredential(input: { residentId: string }): Promise<void> {
@@ -116,7 +122,7 @@ class ResidentRuntimeProductionDriver implements ResidentRuntimeDriver {
   // —— 对话往返 ——
 
   say(input: { residentId: string; text: string }): Promise<Result<TurnResult>> {
-    return this.#call("say", { input });
+    return this.#ensureActiveResident(input.residentId).then(() => this.#call("say", { input }));
   }
 
   // —— 一窗流只读 ——
@@ -173,7 +179,9 @@ class ResidentRuntimeProductionDriver implements ResidentRuntimeDriver {
     channel: ChannelSpec;
     script: readonly TuiStep[];
   }): Promise<Result<TuiTranscript>> {
-    return this.#call("tuiTranscript", { input });
+    return this.#ensureActiveResident(input.residentId).then(() =>
+      this.#call("tuiTranscript", { input }),
+    );
   }
 
   // —— 静态审计的检索根（RT-07） ——
@@ -253,6 +261,33 @@ class ResidentRuntimeProductionDriver implements ResidentRuntimeDriver {
           });
         }),
     );
+  }
+
+  async #ensureActiveResident(residentId: string): Promise<void> {
+    const current = await this.#call<IdentityResult<unknown>>("requireActiveResident", {
+      input: { referenceId: residentId },
+    });
+    if (current.ok) return;
+    if (current.reason !== "resident-not-found") {
+      throw new Error(`acceptance resident ${residentId} is not activatable: ${current.reason}`);
+    }
+    const candidate = await this.#call<CandidateSnapshot>("createCandidate", {
+      input: {
+        persona: `acceptance-persona:${residentId}`,
+        proposedBy: { kind: "installer", id: "resident-runtime-acceptance" },
+        residentId,
+      },
+    });
+    const attested = await this.#call<IdentityResult<CandidateSnapshot>>("attestCandidate", {
+      input: {
+        candidateId: candidate.candidateId,
+        actor: { kind: "candidate", candidateId: candidate.candidateId },
+        decision: "accepted",
+      },
+    });
+    if (!attested.ok || attested.value.residentId !== residentId) {
+      throw new Error(`failed to activate acceptance resident ${residentId}`);
+    }
   }
 }
 

@@ -17,7 +17,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   BootPackView,
   BreatheOutcome,
@@ -27,6 +27,7 @@ import type {
   TurnResult,
 } from "../acceptance/resident-runtime-driver.ts";
 import { type CanonicalEventDraft, CanonicalStreamStore } from "../src/one-stream/index.ts";
+import { ResidentIdentityStore } from "../src/resident-continuity/identity-store.ts";
 import {
   ChannelSpecError,
   type ChannelSpecLike,
@@ -50,6 +51,7 @@ function tempDir(): string {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   while (tempDirs.length > 0) rmSync(tempDirs.pop() as string, { recursive: true, force: true });
 });
 
@@ -152,11 +154,7 @@ describe("凭证面（RT-06 存而不漏）", () => {
   it("吊销只翻状态不删档：后续说话说 credential-invalid 而不是 credential-missing", async () => {
     const runtime = new ResidentRuntime({ dataDir: tempDir() });
     try {
-      runtime.provisionChannel({
-        residentId: "r-rev",
-        channel: claudeChannel,
-        canarySecret: "sk-1",
-      });
+      runtimeProvision(runtime, "r-rev", "sk-1");
       runtime.revokeCredential({ residentId: "r-rev" });
       const result = await runtime.say({ residentId: "r-rev", text: "还在吗" });
       expect(failureOf(result).code).toBe("credential-invalid");
@@ -170,11 +168,7 @@ describe("住户运行时循环（RT-01 / RT-02）", () => {
   it("say 往返成功才落账：user → assistant 两条事件、流文件恰好一个、扫描面干净", async () => {
     const runtime = new ResidentRuntime({ dataDir: tempDir() });
     try {
-      const provisioned = runtime.provisionChannel({
-        residentId: "r-a",
-        channel: claudeChannel,
-        canarySecret: "sk-canary-1",
-      });
+      const provisioned = runtimeProvision(runtime, "r-a", "sk-canary-1");
       expect(provisioned.ok).toBe(true);
       const turn = unwrap<TurnResult>(await runtime.say({ residentId: "r-a", text: "第一句" }));
       expect(turn.streamed).toBe(true);
@@ -235,6 +229,7 @@ describe("住户运行时循环（RT-01 / RT-02）", () => {
     };
     const runtime = new ResidentRuntime({ dataDir: tempDir(), transport: broken });
     try {
+      activateResident(runtime, "r-c");
       const missing = await runtime.say({ residentId: "r-c", text: "x" });
       expect(failureOf(missing)).toMatchObject({ code: "credential-missing" });
       expect(failureOf(missing).remedy.length).toBeGreaterThan(0);
@@ -270,6 +265,141 @@ describe("住户号显式入口（判卷与安装器指定的事实不能换号�
     expect(store.has("r-explicit")).toBe(true);
     expect(() => store.createResident("别人", { residentId: "r-explicit" })).toThrow(/collision/);
     expect(() => store.createResident("坏号", { residentId: "../escape" })).toThrow(/文件名/);
+  });
+});
+
+describe("#182 入住读闸", () => {
+  it("requireActiveResident 只读；宿主启动单独恢复已持久化的 active room", async () => {
+    const dataDir = tempDir();
+    const roomPath = join(dataDir, "residents", "r-read-gate.json");
+    const runtime = new ResidentRuntime({ dataDir });
+    try {
+      vi.spyOn(ResidentIdentityStore.prototype, "requireActiveResident").mockReturnValue({
+        ok: true,
+        value: {
+          candidateId: "candidate-read-gate",
+          residentId: "r-read-gate",
+          personaVersionId: "persona-read-gate",
+          persona: "persona:read-gate",
+        },
+      });
+      expect(runtime.requireActiveResident("r-read-gate")).toMatchObject({
+        ok: true,
+        value: { residentId: "r-read-gate" },
+      });
+      expect(existsSync(roomPath)).toBe(false);
+    } finally {
+      await runtime.close();
+      vi.restoreAllMocks();
+    }
+
+    const identities = new ResidentIdentityStore({ dataDir: join(dataDir, "identities") });
+    const candidate = identities.createCandidate({
+      persona: "persona:read-gate",
+      proposedBy: { kind: "installer", id: "installer" },
+      residentId: "r-read-gate",
+    });
+    expect(
+      identities.attestCandidate(
+        candidate.candidateId,
+        { kind: "candidate", candidateId: candidate.candidateId },
+        "accepted",
+      ),
+    ).toMatchObject({ ok: true, value: { residentId: "r-read-gate" } });
+    expect(existsSync(roomPath)).toBe(false);
+
+    const restarted = new ResidentRuntime({ dataDir });
+    try {
+      expect(existsSync(roomPath)).toBe(true);
+      expect(restarted.requireActiveResident(candidate.candidateId)).toMatchObject({
+        ok: true,
+        value: { residentId: "r-read-gate" },
+      });
+    } finally {
+      await restarted.close();
+    }
+  });
+
+  it("边界读口区分 pending、rejected、missing；运行时入口只接受 canonical residentId", async () => {
+    const runtime = new ResidentRuntime({ dataDir: tempDir() });
+    try {
+      const pending = runtime.createCandidate({
+        persona: "persona:pending",
+        proposedBy: { kind: "installer", id: "installer" },
+        residentId: "r-pending",
+      });
+      expect(runtime.requireActiveResident(pending.candidateId)).toEqual({
+        ok: false,
+        reason: "candidate-pending",
+      });
+      expect(
+        failureOf(
+          runtime.provisionChannel({
+            residentId: pending.candidateId,
+            channel: claudeChannel,
+            canarySecret: "sk-pending",
+          }),
+        ).code,
+      ).toBe("resident-not-found");
+      runtime.attestCandidate(
+        pending.candidateId,
+        { kind: "candidate", candidateId: pending.candidateId },
+        "rejected",
+      );
+      expect(runtime.requireActiveResident(pending.candidateId)).toEqual({
+        ok: false,
+        reason: "candidate-rejected",
+      });
+      expect(
+        failureOf(
+          runtime.provisionChannel({
+            residentId: "resident-does-not-exist",
+            channel: claudeChannel,
+            canarySecret: "sk-missing",
+          }),
+        ).code,
+      ).toBe("resident-not-found");
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("active candidate materializes its runtime room and say rechecks the canonical residentId", async () => {
+    const runtime = new ResidentRuntime({ dataDir: tempDir() });
+    try {
+      const candidate = runtime.createCandidate({
+        persona: "persona:active",
+        proposedBy: { kind: "installer", id: "installer" },
+        residentId: "r-active",
+      });
+      const before = await runtime.say({ residentId: candidate.candidateId, text: "不能提前聊" });
+      expect(failureOf(before).code).toBe("resident-not-found");
+      const active = runtime.attestCandidate(
+        candidate.candidateId,
+        { kind: "candidate", candidateId: candidate.candidateId },
+        "accepted",
+      );
+      expect(active).toMatchObject({ ok: true, value: { residentId: "r-active" } });
+      expect(runtime.requireActiveResident(candidate.candidateId)).toMatchObject({
+        ok: true,
+        value: { residentId: "r-active" },
+      });
+      expect(
+        failureOf(await runtime.say({ residentId: candidate.candidateId, text: "别名" })).code,
+      ).toBe("resident-not-found");
+      expect(
+        runtime.provisionChannel({
+          residentId: "r-active",
+          channel: claudeChannel,
+          canarySecret: "sk-active",
+        }).ok,
+      ).toBe(true);
+      expect(
+        unwrap<TurnResult>(await runtime.say({ residentId: "r-active", text: "现在可以" })),
+      ).toMatchObject({ residentId: "r-active", generation: 1 });
+    } finally {
+      await runtime.close();
+    }
   });
 });
 
@@ -420,11 +550,7 @@ describe("评审意见修复（wusaki0723 复审：幂等重试 / 凭证读取�
     const runtime = new ResidentRuntime({ dataDir: tempDir() });
     try {
       runtimeProvision(runtime, "r-a");
-      runtime.provisionChannel({
-        residentId: "r-ab",
-        channel: claudeChannel,
-        canarySecret: "sk-r-ab",
-      });
+      runtimeProvision(runtime, "r-ab", "sk-r-ab");
       unwrap<TurnResult>(await runtime.say({ residentId: "r-a", text: "甲说" }));
       unwrap<TurnResult>(await runtime.say({ residentId: "r-ab", text: "乙说特有词" }));
       // 反对照：扫 r-a 不许串到 r-ab 的文件。
@@ -479,10 +605,12 @@ describe("回合语义（验收席复核三处 + 两项观察）", () => {
       "测试备账：给请求级核对喂一条现行事实",
     );
     const stub = countingTransport(() => "收到。");
-    // 记忆先进住户档案，再开运行时（运行时的住户面从同一个 residents/ 快照读）。
+    // 先经入住流程成立，再从同一个 residents/ 快照写入记忆。
     const dataDir = tempDir();
+    const initializer = new ResidentRuntime({ dataDir, transport: stub.transport });
+    activateResident(initializer, "r-full");
+    await initializer.close();
     const stores = new ResidentStore({ dataDir: join(dataDir, "residents") });
-    stores.createResident("小满", { residentId: "r-full" });
     stores.remember("r-full", "爱吃苹果");
     const runtime = new ResidentRuntime({ dataDir, transport: stub.transport, factLedger: ledger });
     try {
@@ -941,10 +1069,31 @@ function foreignDraft(): CanonicalEventDraft {
   };
 }
 
-function runtimeProvision(runtime: ResidentRuntime, residentId: string): void {
-  runtime.provisionChannel({
+function activateResident(runtime: ResidentRuntime, residentId: string): void {
+  const candidate = runtime.createCandidate({
+    persona: `persona:${residentId}`,
+    proposedBy: { kind: "installer", id: "runtime-test" },
+    residentId,
+  });
+  const activated = runtime.attestCandidate(
+    candidate.candidateId,
+    { kind: "candidate", candidateId: candidate.candidateId },
+    "accepted",
+  );
+  if (!activated.ok || activated.value.residentId !== residentId) {
+    throw new Error(`failed to activate test resident ${residentId}`);
+  }
+}
+
+function runtimeProvision(
+  runtime: ResidentRuntime,
+  residentId: string,
+  canarySecret = `sk-${residentId}`,
+): ReturnType<ResidentRuntime["provisionChannel"]> {
+  if (!runtime.requireActiveResident(residentId).ok) activateResident(runtime, residentId);
+  return runtime.provisionChannel({
     residentId,
     channel: claudeChannel,
-    canarySecret: `sk-${residentId}`,
+    canarySecret,
   });
 }
