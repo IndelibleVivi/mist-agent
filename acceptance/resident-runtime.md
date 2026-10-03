@@ -93,8 +93,9 @@ npm test -- tests/resident-runtime.test.ts tests/pi-transport.test.ts
 回合。另注入信文件落盘失败，验证错误可见、代际未推进、拒绝后普通对话仍可进行。
 空行、普通输入、`/exit` 与 SIGINT 的既有回归继续保留。
 
-这些测试用临时目录和 synthetic 通道，身份先由 synthetic candidate 本人显式自认，通道配置来自 `provisionChannel()`，不覆盖安装器的
-正式提交到 CLI 的交接，也不证明真实 provider 往返或 intent 当刻亲笔成立。
+这些测试用临时目录和 synthetic 通道：身份先由 synthetic candidate 本人显式自认，
+再经 `provisionChannel()` 配通道。不覆盖安装器正式提交到 CLI 的交接，也不证明
+真实 provider 往返或 intent 当刻亲笔成立。
 原 RT-03 判据与未勾独立复验状态保持不变。
 
 ## 七盏灯

@@ -1019,8 +1019,10 @@ describe("交接信随启动包进模型请求（D8 补记三：醒来即已读�
   it("手动换代后下一次 say 的请求带正确原信（标题 / 作者代际 / writtenAt / 条目原文）", async () => {
     const recorder = recordingTransport();
     const dataDir = tempDir();
+    const prep = new ResidentRuntime({ dataDir, transport: recorder.transport });
+    activateResident(prep, "r-ho");
+    await prep.close();
     const stores = new ResidentStore({ dataDir: join(dataDir, "residents") });
-    stores.createResident("接信者", { residentId: "r-ho" });
     stores.remember("r-ho", "上代在做迁移");
     const runtime = new ResidentRuntime({ dataDir, transport: recorder.transport });
     try {

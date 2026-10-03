@@ -12,7 +12,7 @@
  *
  * 端到端七灯归 acceptance/resident-runtime-*.ts；这里钉单元行为。
  */
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -66,8 +66,24 @@ function fixedTransport(): { transport: ModelTransport; requests: ModelCompletio
   };
 }
 
+function activate(runtime: ResidentRuntime, residentId: string): void {
+  const candidate = runtime.createCandidate({
+    persona: `persona:${residentId}`,
+    proposedBy: { kind: "installer", id: "ledger-test" },
+    residentId,
+  });
+  expect(
+    runtime.attestCandidate(
+      candidate.candidateId,
+      { kind: "candidate", candidateId: candidate.candidateId },
+      "accepted",
+    ).ok,
+  ).toBe(true);
+}
+
 function provision(runtime: ResidentRuntime, residentId: string): void {
-  runtime.provisionChannel({ residentId, channel, canarySecret: `sk-${residentId}` });
+  if (!runtime.requireActiveResident(residentId).ok) activate(runtime, residentId);
+  unwrap(runtime.provisionChannel({ residentId, channel, canarySecret: `sk-${residentId}` }));
 }
 
 function letterPath(root: string, residentId: string): string {
@@ -86,6 +102,118 @@ function ledgerSnapshot(
 }
 
 describe("运行时出信绑定权威事实账", () => {
+  it("只有本人 accepted 才物化 room 与账，配通道和身份查询不开户", async () => {
+    const dataDir = tempDir();
+    const runtime = new ResidentRuntime({
+      dataDir,
+      transport: fixedTransport().transport,
+      ledger: { dataDir: join(dataDir, "residents") },
+    });
+    try {
+      const residentId = "r-room-book";
+      const candidate = runtime.createCandidate({
+        persona: "synthetic persona",
+        proposedBy: { kind: "installer", id: "room-book-test" },
+        residentId,
+      });
+      const room = join(dataDir, "residents", `${residentId}.json`);
+      const book = join(dataDir, "residents", `${residentId}.facts.json`);
+      expect(runtime.requireActiveResident(candidate.candidateId).ok).toBe(false);
+      expect(
+        runtime.provisionChannel({ residentId, channel, canarySecret: "synthetic-only" }).ok,
+      ).toBe(false);
+      expect(
+        runtime.attestCandidate(
+          candidate.candidateId,
+          { kind: "installer", id: "room-book-test" },
+          "accepted",
+        ).ok,
+      ).toBe(false);
+      expect(existsSync(room)).toBe(false);
+      expect(existsSync(book)).toBe(false);
+      expect(
+        runtime.attestCandidate(
+          candidate.candidateId,
+          { kind: "candidate", candidateId: candidate.candidateId },
+          "accepted",
+        ).ok,
+      ).toBe(true);
+      expect(existsSync(room)).toBe(true);
+      expect(existsSync(book)).toBe(true);
+      expect(runtime.ledgerAuthority()?.ledger.currentSet(residentId)).toEqual([]);
+      // 不需要先 provision：认证 writer 在 active room 物化后已经能向账追加。
+      runtime
+        .ledgerAuthority()
+        ?.host.system("mist-host")
+        .append(
+          residentId,
+          { kind: "active_rule", body: "synthetic promise" },
+          "synthetic fixture",
+        );
+      const before = readFileSync(book, "utf8");
+      unwrap(runtime.provisionChannel({ residentId, channel, canarySecret: "synthetic-only" }));
+      expect(readFileSync(book, "utf8")).toBe(before);
+      const rejected = runtime.createCandidate({
+        persona: "rejected persona",
+        proposedBy: { kind: "installer", id: "room-book-test" },
+        residentId: "r-rejected-book",
+      });
+      expect(
+        runtime.attestCandidate(
+          rejected.candidateId,
+          { kind: "candidate", candidateId: rejected.candidateId },
+          "rejected",
+        ).ok,
+      ).toBe(true);
+      expect(existsSync(join(dataDir, "residents", "r-rejected-book.facts.json"))).toBe(false);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("启动时为已有 active room 补齐认证账，重启不重建既有账或代签身份", async () => {
+    const dataDir = tempDir();
+    // 模拟已合身份入口在无认证账嵌入方物化了 room；启动装配承担账恢复。
+    const prep = new ResidentRuntime({ dataDir, transport: fixedTransport().transport });
+    activate(prep, "r-recovered-book");
+    await prep.close();
+    const book = join(dataDir, "residents", "r-recovered-book.facts.json");
+    expect(existsSync(book)).toBe(false);
+    const options = {
+      dataDir,
+      transport: fixedTransport().transport,
+      ledger: { dataDir: join(dataDir, "residents") },
+    };
+    const restored = new ResidentRuntime(options);
+    try {
+      expect(restored.requireActiveResident("r-recovered-book").ok).toBe(true);
+      expect(existsSync(book)).toBe(true);
+      restored
+        .ledgerAuthority()
+        ?.host.system("mist-host")
+        .append(
+          "r-recovered-book",
+          { kind: "active_rule", body: "recover me" },
+          "synthetic fixture",
+        );
+    } finally {
+      await restored.close();
+    }
+    const before = readFileSync(book, "utf8");
+    const again = new ResidentRuntime(options);
+    try {
+      expect(readFileSync(book, "utf8")).toBe(before);
+      expect(
+        again
+          .ledgerAuthority()
+          ?.ledger.currentSet("r-recovered-book")
+          .map((entry) => entry.body),
+      ).toEqual(["recover me"]);
+    } finally {
+      await again.close();
+    }
+  });
+
   it("换气落盘信的 commitment 档只带 currentSet 指针，supersede 的不装", async () => {
     const dataDir = tempDir();
     const stub = fixedTransport();
@@ -218,8 +346,10 @@ describe("运行时出信绑定权威事实账", () => {
   it("旧 string 承诺未入账：breath-refused、逐条列出、给真实入口、不换代不落信不入账不清数据", async () => {
     const dataDir = tempDir();
     const stub = fixedTransport();
+    const prep = new ResidentRuntime({ dataDir, transport: fixedTransport().transport });
+    activate(prep, "r-old");
+    await prep.close();
     const residents = new ResidentStore({ dataDir: join(dataDir, "residents") });
-    residents.createResident("old", { residentId: "r-old" });
     residents.commit("r-old", "旧档案里的一句话承诺");
     residents.commit("r-old", "旧档案里的第二句话");
     const runtime = new ResidentRuntime({

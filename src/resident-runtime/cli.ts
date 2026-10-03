@@ -4,9 +4,9 @@ import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 import type { BreathTrigger } from "../../acceptance/resident-runtime-driver.ts";
 import { parseManualBreath } from "../session/breath-trigger.ts";
-import { CredentialStore } from "./credentials.ts";
 import { assembleResidentRuntime } from "./assembly.ts";
 import type { ModelTransport } from "./channels.ts";
+import { CredentialStore } from "./credentials.ts";
 import { ResidentChatTui } from "./tui.ts";
 
 interface ResidentCliOptions {

@@ -39,6 +39,22 @@ function tempDir(): string {
   return dir;
 }
 
+function activate(runtime: ReturnType<typeof assembleResidentRuntime>, residentId: string): string {
+  const candidate = runtime.createCandidate({
+    persona: `persona:${residentId}`,
+    proposedBy: { kind: "installer", id: "cli-ledger-test" },
+    residentId,
+  });
+  expect(
+    runtime.attestCandidate(
+      candidate.candidateId,
+      { kind: "candidate", candidateId: candidate.candidateId },
+      "accepted",
+    ).ok,
+  ).toBe(true);
+  return candidate.candidateId;
+}
+
 describe("CLI 宿主装配 seam（录制 transport）", () => {
   it("模型请求里带的是账里实际的 currentFacts body", async () => {
     const dataDir = tempDir();
@@ -51,6 +67,7 @@ describe("CLI 宿主装配 seam（录制 transport）", () => {
     };
     const runtime = assembleResidentRuntime({ dataDir, transport: recording });
     try {
+      activate(runtime, "r-cli");
       runtime.provisionChannel({ residentId: "r-cli", channel, canarySecret: "sk-test" });
       const authority = runtime.ledgerAuthority();
       if (authority === null) throw new Error("CLI seam 没接上认证账");
@@ -72,7 +89,7 @@ describe("实际 CLI entry 回归", () => {
   it("真实 CLI 子进程接上认证账并完成交付（落盘确认位推进）", async () => {
     const dataDir = tempDir();
     const residentId = "resident-cli-ledger";
-    // 先用共用 seam 建档并落一条账（含窗确认位），再让真实 CLI 从同一盘里恢复。
+    // 先显式自认，用共用 seam 建档并落一条账（含窗确认位），再让真实 CLI 从同一盘里恢复。
     const prep = assembleResidentRuntime({
       dataDir,
       transport: {
@@ -82,7 +99,9 @@ describe("实际 CLI entry 回归", () => {
         }),
       },
     });
+    let candidateId: string;
     try {
+      candidateId = activate(prep, residentId);
       prep.provisionChannel({ residentId, channel, canarySecret: "sk-test" });
       const authority = prep.ledgerAuthority();
       if (authority === null) throw new Error("准备阶段没接上账");
@@ -95,7 +114,7 @@ describe("实际 CLI entry 回归", () => {
 
     const child = spawn(
       process.execPath,
-      ["--import", "tsx", cliPath, "--resident", residentId, "--data-dir", dataDir],
+      ["--import", "tsx", cliPath, "--resident", candidateId, "--data-dir", dataDir],
       {
         env: { ...process.env, MIST_RESIDENT_RUNTIME_TRANSPORT: "synthetic" },
         stdio: ["pipe", "pipe", "pipe"],

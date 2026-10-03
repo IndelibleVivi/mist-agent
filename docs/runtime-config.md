@@ -46,7 +46,9 @@ pi 通道在子进程中仅按当前 provider 设置一项专属凭证变量，�
 ## 住户运行时的账装配
 
 CLI 与宿主子进程共用 `src/resident-runtime/assembly.ts`，认证账跟着 `dataDir` 落在
-`residents/<id>.facts.json`。嵌入方可选 `ledger: { dataDir }` 接认证宿主，或
+`residents/<id>.facts.json`。candidate 本人接受后，room 与账在同一物化入口创建；
+启动时为 active 身份恢复 room / 账，查询与 `provisionChannel()` 不负责开户。
+嵌入方可选 `ledger: { dataDir }` 接认证宿主，或
 `factLedger` 接已有账的只读视图；两者互斥，都不传则 `currentFacts` 缺席。
 交接信的 `commitment` 只保存 seq 指针和短引用，不复印正文；现行正文随 `currentFacts`
 进入启动包，Pi 系统提示按 `[#seq] 正文` 渲染，供信里的指针定位。

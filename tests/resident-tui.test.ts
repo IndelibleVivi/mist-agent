@@ -321,7 +321,7 @@ function spawnResidentCli(input: {
   });
 }
 
-/** 在临时数据目录里用现役 provisionChannel 备好一位无承诺的合成住户。 */
+/** 在临时数据目录里显式自认，再用现役 provisionChannel 备好合成通道。 */
 async function provisionSyntheticResident(input: {
   readonly dataDir: string;
   readonly residentId: string;
@@ -330,6 +330,17 @@ async function provisionSyntheticResident(input: {
     dataDir: input.dataDir,
     transport: new SyntheticModelTransport(),
   });
+  const candidate = runtime.createCandidate({
+    persona: `persona:${input.residentId}`,
+    proposedBy: { kind: "installer", id: "cli-test" },
+    residentId: input.residentId,
+  });
+  const activated = runtime.attestCandidate(
+    candidate.candidateId,
+    { kind: "candidate", candidateId: candidate.candidateId },
+    "accepted",
+  );
+  if (!activated.ok) throw new Error("synthetic self-attestation failed");
   const provisioned = runtime.provisionChannel({
     residentId: input.residentId,
     channel: { claudeSubscription: false, credentialKind: "api-key", model: "openai/test-model" },
