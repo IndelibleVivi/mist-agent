@@ -1044,8 +1044,11 @@ it("does not send a committed installer user back through setup or silently acti
   // 安装负例：凭证面未被安装快照复制或自签。
   expect(existsSync(join(credentialsDir, "manifest.json"))).toBe(false);
   expect(readdirSync(join(credentialsDir, "secrets"))).toEqual([]);
-  // 第二段只多出这次显式 synthetic 自认落下的住户档案（且字节稳定）。
-  expect(readdirSync(residentsDir)).toEqual([`${residentId}.json`]);
+  // 第二段只物化这次显式自认的同一户：档案字节稳定；认证账装配可另建同户 .facts.json。
+  // 账文件不是第二位住户，不应把 room+账的合法物化误判为自动激活；其他文件仍拒绝。
+  expect(readdirSync(residentsDir).filter((file) => file !== `${residentId}.facts.json`)).toEqual([
+    `${residentId}.json`,
+  ]);
   expect(readFileSync(join(residentsDir, `${residentId}.json`), "utf8")).toBe(roomBefore);
   // 身份闸真在跑：candidateId 不是 runtime 别名，runtime 只认 canonical residentId。
   const identities = new ResidentIdentityStore({ dataDir: identitiesDir });
