@@ -86,6 +86,17 @@ npm test -- tests/resident-runtime.test.ts tests/pi-transport.test.ts
 拒绝（`breath-refused`），这条出信接线仍待修复。上述检查证明已有信被送入模型，
 不判信的内容质量，也不替代 D8「当刻亲笔」的语义核对或正式独立验收落章。
 
+## 终端命令输入回归
+
+`tests/resident-tui.test.ts` 从真实 `src/resident-runtime/cli.ts` 子进程的 stdin 输入
+`/new`、`/clear`、`/compact`，观察落盘信、代际、同一窗号与主流正文；命令不得成为聊天
+回合。另注入信文件落盘失败，验证错误可见、代际未推进、拒绝后普通对话仍可进行。
+空行、普通输入、`/exit` 与 SIGINT 的既有回归继续保留。
+
+这些测试用临时目录和 synthetic 通道，配置来自 `provisionChannel()`，不覆盖安装器的
+正式提交到 CLI 的交接，也不证明真实 provider 往返或 intent 当刻亲笔成立。
+原 RT-03 判据与未勾独立复验状态保持不变。
+
 ## 七盏灯
 
 每条带主证据形式。标 [集成] 的由 Vitest 集成测试或验收驱动提供（真实宿主子进程、
