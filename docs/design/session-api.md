@@ -1,6 +1,6 @@
 # 会话 API（session API）· 给 external 前端的接入说明
 
-状态：v0.4（refs #58 第 3 条、#82、#121；#148 复验订正）。会话模型与线协议三端点已经按 D7 多活窗对齐；`SessionRegistry` 的窗口语义在 §1，`session.list / session.create / session.history` 的窗口映射唯一以 §1.1 为准。HTTP/WS 信封、鉴权与下行流的真源是本仓 `webui/docs/research/mist-wire-contract.md`。#121 已交付真实 handler 的宿主服务通道：官方 frontend 插件从 `context.services` 获取 `mist.session-handler@^1.0.0`，缺服务在 prepare 前被拒，不再固定创建 mock。通道可用不代表生产 history port、浏览器交互或完整 P1 产品面已验收。
+状态：v0.5（refs #58 第 3 条、#82、#121；#148 复验订正；D30 / #217 订正）。`SessionRegistry` 的窗口语义在 §1，`session.list / session.create / session.history` 的窗口映射以 §1.1 为准，两节不动。DSH 线协议（HTTP/WS 信封、鉴权与下行流的旧稿、三个 session 端点的实现、#121 的官方 frontend 插件）已随 `webui/` 删除（D30），只在 `bf7d9fe` 及之前的 git 历史里，main 上不再有 session 线协议；§1.1 提到的线侧实现和测试也只在那段历史里。根仓插件宿主的 `mist.session-handler` 服务通道保留，暂时没有消费者。在新的前端口令落地之前，主人入口是 D28 终端，见 §2。
 
 ## 0. 一句话
 
@@ -10,7 +10,7 @@ mist 不替前端保管任何东西。线协议里的一个 session 对应一扇
 
 | 概念 | 含义 | 前端要做的事 |
 |---|---|---|
-| `residentId` | 住户 id；一位住户可同时有多扇活窗 | 由 Mist handler 绑定，不进入 webui session 线协议 |
+| `residentId` | 住户 id；一位住户可同时有多扇活窗 | 由 Mist handler 绑定，不进入 session 线协议 |
 | `scopeId` | 可见性／隔离边界，不是窗；缺省只能落私聊 | 创建窗时可显式给出，不从 workspace 或 lane 猜 |
 | `windowId` / 线协议 `sessionId` | 同一扇窗的同一个宿主签发标识（`w_` + ULID） | 当作会话句柄；不得由客户端预分配 |
 | `generation` | 窗内代际号；换气只令它加一，`windowId` 不变 | 与 `sessionId` 一起过滤迟到结果 |
@@ -39,15 +39,21 @@ mist 不替前端保管任何东西。线协议里的一个 session 对应一扇
 
 **代价**：列表需要同时读活窗与归档窗；history 必须由窗流水的权威存储提供只读端口，不能拿 `residentId` 级整棵消息树冒充某一窗的流水。宿主须显式注册所声明版本的 session handler 服务，并随插件事务撤销服务句柄。`mist-plugin-host-composition.spec.ts` 使用真实事务宿主、官方插件、HTTP 和 SessionRegistry，但 history 是 fixture；它证明交付通道，不替生产窗流水持久化判卷（#120）。
 
-## 2. 线协议（端点 / 鉴权 / 信封）
+## 2. 现在的入口与以后接网页前端（D30）
 
-HTTP/WS 信封、双下行流、seq/断线语义、token 门与部署形状的真源是本仓 `webui/docs/research/mist-wire-contract.md`；三个 session 端点的窗口语义真源是 §1.1，该文档的 P0 表只作线侧摘要，不另立映射口径。
+在新的前端口令落地之前，主人入口是 D28 终端：
 
-本页不复抄完整信封。external 前端接线时至少要同时核对：
+```
+npm run resident -- --resident <id>
+```
 
-- 端点清单（会话 open/kill、消息派发、下行流）与它们对应到 §1 哪个语义；其中三端点映射以 §1.1 为准；
-- 鉴权：token 从哪来、放哪（header / query / cookie）、loopback 是否豁免（#49 已定：**默认强制开启，loopback 也不豁免**）；
-- 最小示例：一次 create → 拿到 `sessionId=windowId` 与 generation → 一次派发 → 收到带 `windowId + generation` 的回执 → 一条下行消息 → kill。
+仓里现在没有网页前端，也没有对外的会话线协议。旧的 DSH 线协议稿只在 `bf7d9fe` 及之前的 git 历史里，不再是真源，不要照着它接线。
+
+以后要接网页前端，另起主笔口令，前端协议、适配层契约和对接文档到时一起定（D30 第四条）。不管新协议是什么形状，下面三条仍是硬要求：
+
+- D11 第二条：附件、选项／阻断不退化成纯文本；
+- D11 第四条：对外只一条主流；
+- #49：鉴权默认强制开启，loopback 也不豁免。
 
 ## 3. 安装器里的入口
 

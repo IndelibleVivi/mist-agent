@@ -591,7 +591,7 @@ scope 的 ready。
 
 ## 11. v0.1 宿主服务交付
 
-首个真实消费者（#61/#111，webui 整包 `frontend` 插件）把 v0 的宿主服务空白补成以下
+首个真实消费者（#61/#111，webui 整包 `frontend` 插件；已随 `webui/` 删除，D30，服务通道保留、暂无消费者）把 v0 的宿主服务空白补成以下
 最小协议：
 
 - 插件在 manifest 的 `hostServices` 中以 `{ id, requires }` 显式声明所需服务；`requires`

@@ -42,7 +42,7 @@ const DURABLE_WRITE_CALLS = [
   "ftruncateSync",
 ] as const;
 
-const SKIPPED_DIRECTORIES = new Set(["node_modules", ".git", "dist", "build", "coverage", "webui"]);
+const SKIPPED_DIRECTORIES = new Set(["node_modules", ".git", "dist", "build", "coverage"]);
 
 export type WriteSurfaceFindingKind =
   | "port-missing"
