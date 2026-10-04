@@ -17,7 +17,7 @@
  * 所以两套类型只能各自声明。这份副本必须与 acceptance/window-history-driver.ts 的
  * 冻结判卷契约逐字段对齐（字段名、可空性、错误码并集），任何一侧改动都要同步另一侧，
  * 否则生产 port 与判卷口径会漂移。唯一共享的是 JsonObject（从 src/one-stream 引入，
- * 底座即用此类型），不引 webui / @deepseek-ai/dsh-* 任何类型。
+ * 底座即用此类型），不引任何前端包的类型。
  */
 import type { JsonObject } from "../one-stream/index.ts";
 

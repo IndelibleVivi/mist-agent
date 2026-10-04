@@ -100,7 +100,7 @@ export interface ResidentRuntimeWriteSurfaceReport {
   readonly findings: readonly WriteSurfaceFinding[];
 }
 
-const SKIPPED_DIRECTORIES = new Set(["node_modules", ".git", "dist", "build", "coverage", "webui"]);
+const SKIPPED_DIRECTORIES = new Set(["node_modules", ".git", "dist", "build", "coverage"]);
 
 /**
  * 去掉注释与字符串字面量内容，避免文档注释里的词被当成源码事实。
