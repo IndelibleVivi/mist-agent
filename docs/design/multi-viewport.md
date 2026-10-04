@@ -97,17 +97,9 @@ Item = { tier: 'commitment' | 'fact' | 'judgment', body: string }
 
 **代价**：模板越细，写信越像填表，亲笔的温度会被格式吃掉——这是真实风险，缓解靠「标题 + intent 半自由文体」：格式只管分区和标注，不规定措辞。
 
-## 5. 与 webui 线协议的对齐
+## 5. 与线协议的对齐
 
-webui P0 的 `session.list / session.create / session.history` 与多活窗同向：
-
-- `session.list` → 列出住户的窗（活窗 + 归档窗）
-- `session.create` → `open(residentId, scopeId)`
-- `session.history` → 窗的归档流水（只读）
-
-差异说明（实现后回到 session-api.md §1.1 更新）：线协议的 session 概念 = 本图纸的窗；住户级概念（账、记忆）不进线协议，webui 不感知。
-
-**代价**：线协议那边 session 一词已经写进若干文档，改名成本高、收益低——协议层保留 session 叫法，文档注明映射即可，不强求词汇统一。
+DSH 线协议已随 webui 删除（D30）。
 
 ## 6. 非目标
 
