@@ -346,7 +346,7 @@ token 原文不进日志、投影记录、响应 id/body/error、原始 JSON/SSE
 6. 应用本图纸的后台任务禁用配置；Pipe 对残留的非聊天 task 显式拒绝。
 
 「展示」和「安装」必须是同一次、可检查的提案与执行关联：`runWebuiCommand` 回读里给出
-本次 `proposal_id` 与实际安装的插件身份（opaque `plugin_id` + `category`），审计同时保留
+本次 `proposalId` 与 `installedPlugin` 的实际插件身份（opaque `pluginId` + `category`），审计同时保留
 展示过的 proposal 与经 `frontend` 闸执行的安装操作，两者按 proposal id 归属。判卷核提案里的
 组件名（Open WebUI）、资源占用、将启动服务与实装插件逐项对得上，沿 opaque id 合同、
 不假设宿主 plugin id 的字面；空 proposal 或非 `frontend` 类别不能通过。资源占用是**展示估计**，
