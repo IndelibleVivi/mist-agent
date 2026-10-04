@@ -36,11 +36,13 @@ Bearer token ref
 同一 token 下开多少个前端会话，都落到同一位住户、同一 scope、同一条主流；界面和底层语义
 会有意不完全一致。
 
-## 2. 请求历史只作兼容壳
+## 2. 兼容端点
 
-入口为 `POST /v1/chat/completions`。请求可带完整 `messages`，但 adapter 只消费**数组最后一项、
-且该项必须是 `role: "user"`**，作为本次新 turn。最后一项不是 user、messages 为空、或当前
-user content 无法解析时，返回 OpenAI 风格错误包，code 为 `MIST_INVALID_TURN_SHAPE`。
+### `POST /v1/chat/completions`
+
+这是 FE-02 的必需对话口子。请求可带完整 `messages`，但 adapter 只消费**数组最后一项、且该项
+必须是 `role: "user"`**，作为本次新 turn。最后一项不是 user、messages 为空、或当前 user
+content 无法解析时，返回 OpenAI 风格错误包，code 为 `MIST_INVALID_TURN_SHAPE`。
 
 最后一项之前的所有 messages：
 
@@ -54,6 +56,16 @@ user content 无法解析时，返回 OpenAI 风格错误包，code 为 `MIST_IN
 
 **代价**：部分前端习惯靠重放 history 接无状态模型；在 mist 这里，这些字节会被刻意丢弃。
 前端里删除、编辑或 fork 某条旧消息也不会改写住户历史。
+
+### `GET /v1/models`
+
+OpenAI-compatible client 可不经 Pipe Function 直接接 FE-02；为减少手填 model id，功能实现宜提供
+同一 Bearer 闸后的 model discovery。它最多暴露当前 binding 的一个 server-owned model id，不能
+列出住户名、scope、provider 凭证或其他 binding。请求里的 `model` 仍不取得路由权。
+
+这不是第八盏灯：Open WebUI 可以通过 allowlist 或 Pipe Function 指定 model id，现有 FE-02 也不以
+`/v1/models` 是否存在申绿。若主笔决定把 discovery 升成必需面，应在写功能前把它加进 FE-02
+驱动，而不是实现后补测试。
 
 ## 3. 普通消息
 
@@ -93,7 +105,7 @@ user event 与一次 assistant event，不能一边 streaming 一边重复写账
 }
 ```
 
-未知扩展字段会被普通客户端忽略；Open WebUI Pipe 可以读取完整 `mist` 段。
+未知扩展字段会被普通客户端忽略；Open WebUI Pipe Function 可以读取完整 `mist` 段。
 
 ## 4. 附件
 
@@ -131,10 +143,10 @@ assistant 侧附件放在 `mist.attachments[]`，每项至少包含：
 }
 ```
 
-附件不是 markdown 假链接、`[attachment]` 文本标记或内联 base64。支持附件的 client 声明
-`attachments` capability 后原生呈现；不支持时仍保留结构化对象，并把 `delivery.status` 设为
-`degraded`、`missing_capabilities` 写入 `attachments`。正文只能给出诚实的可见性说明，不能把
-附件内容伪装成已呈现。
+附件不是 markdown 假链接、`[attachment]` 文本标记或内联 base64。client 声明 `attachments`
+capability 时，adapter 选择 native projection；未声明时仍保留结构化对象，并把
+`delivery.status` 设为 `degraded`、`missing_capabilities` 写入 `attachments`。正文只能给出诚实的
+可见性说明，不能把附件内容伪装成已呈现。
 
 ## 5. 选项、批准与阻断
 
@@ -156,7 +168,7 @@ assistant 侧附件放在 `mist.attachments[]`，每项至少包含：
 }
 ```
 
-支持交互的 Pipe 用请求扩展提交：
+支持交互的 Pipe Function 用请求扩展提交：
 
 ```json
 {
@@ -172,14 +184,14 @@ assistant 侧附件放在 `mist.attachments[]`，每项至少包含：
 服务端按 interaction id、现行住户/scope、未解决状态与 option id 逐项核验。普通 user 文本永远
 不能被猜成「点了某个按钮」。
 
-不支持 `interactions` capability 的通用前端仍收到结构化 interaction，但
+不声明 `interactions` capability 的通用前端仍收到结构化 interaction，但
 `delivery.status = "blocked"`。普通正文只说明当前 surface 无法完成这项控制，不列出可复制粘贴
-的编号选项，不接受自然语言替代点击。用户可换到终端或支持 Pipe 的前端继续。
+的编号选项，不接受自然语言替代点击。用户可换到终端或支持 Pipe Function 的前端继续。
 
 **代价**：纯 OpenAI 通用客户端可以聊天，却可能在批准/选择点停住。这比把高权限动作降成一行
 可伪造文本更诚实。
 
-## 6. 前端能力与住户可见性
+## 6. 前端能力、投影决策与证据边界
 
 请求扩展可声明：
 
@@ -187,24 +199,35 @@ assistant 侧附件放在 `mist.attachments[]`，每项至少包含：
 {
   "mist": {
     "client": {
-      "surface": "open-webui-pipe",
+      "surface": "open-webui-pipe-function",
       "capabilities": ["attachments", "interactions"]
     }
   }
 }
 ```
 
-声明只影响呈现，不参与鉴权或授权。未声明时按 generic text-only surface 处理。
+声明只影响呈现，不参与鉴权或授权；它也是 client claim，不是宿主已经验证过的 UI 能力。未声明
+时按 generic text-only surface 处理。
 
-adapter 在组装本轮模型输入时，加入宿主生成的 surface capability 事实；回复提交后，再把
-`native / degraded / blocked` 与缺失 capability 作为**结构化呈现回执**关联到本轮 canonical
-事件。下一轮住户能知道上次内容是否真的在那块前端呈现，而不是从客户端重放历史里猜。
-呈现回执不是用户话语，不拼进 assistant 正文。
+adapter 在组装本轮模型输入时，加入「本轮 client 声明了哪些 capability」这一宿主事实；回复
+提交后，把 `native / degraded / blocked` 与缺失 capability 作为**服务端投影决策**关联到本轮
+canonical 事件。下一轮住户可以知道 adapter 当时采取了哪种投影、为什么降级或阻断，不必从
+前端重放历史里猜。
 
-## 7. 鉴权与错误
+这条记录**不能证明浏览器最终真的渲染成功**。Chat Completions 响应没有客户端确认通道；把
+capability claim 或「响应已经写出 socket」叫成 UI delivery receipt，会越过实际证据。若以后
+Open WebUI Pipe Function 要回传真实呈现结果，必须另立带 request/event id 的 acknowledgment，
+与当前 `delivery` 对象和 `surface-receipt` 事件分开。当前名字只保留 PR1 早期判卷兼容，语义统一
+解释为 projection decision。它不是用户话语，也不拼进 assistant 正文。
+
+## 7. 鉴权、网络与错误
 
 每次请求都必须带 `Authorization: Bearer <token>`。loopback 不豁免；缺 token 与错 token 均在
 解析消息、读取主流、调用模型之前拒绝。失败后模型调用数、canonical event 数和附件写入数均为零。
+
+生产 listener 默认只绑定 loopback；改为非 loopback 必须显式配置，并先登记进
+`docs/runtime-config.md`。CORS 默认不开 wildcard，token 不进 query string。请求体、附件与并发
+必须有上限；这些是第一处网络入口的实现约束，不因公开 CI 使用合成 transport 而消失。
 
 错误保持 OpenAI 风格 envelope，并有稳定 code：
 
@@ -219,7 +242,7 @@ adapter 在组装本轮模型输入时，加入宿主生成的 surface capabilit
 }
 ```
 
-token 原文不进日志、回执、stream、诊断导出或错误 message。鉴权审计只记请求 id、来源类别、
+token 原文不进日志、投影记录、stream、诊断导出或错误 message。鉴权审计只记请求 id、来源类别、
 结果 code 与时间。
 
 ## 8. `/webui` 的接缝
@@ -230,7 +253,10 @@ token 原文不进日志、回执、stream、诊断导出或错误 message。鉴
 2. 检查 Docker 或 Python，二者都没有时只说明缺项，不安装系统运行时；
 3. 走现有 `frontend` 插件安装闸；
 4. 启动后打印本机 URL；
-5. Pipe 连接本图纸同一个 endpoint，不另开 history、auth 或 writer 后门。
+5. Open WebUI 的 **Pipe Function** 连接本图纸同一个 endpoint，不另开 history、auth 或 writer 后门。
+
+这里说的是 Open WebUI 当前的 in-process Pipe Function，不是已经标为 legacy 的独立 Pipelines
+服务。generic OpenAI-compatible client 不需要安装这段专用代码，但也拿不到完整可点击交互。
 
 ## 9. 可执行判卷映射
 
@@ -240,7 +266,7 @@ token 原文不进日志、回执、stream、诊断导出或错误 message。鉴
 | FE-02 | 普通/流式往返，同一结果、唯一 writer、每个 turn 恰好一份 |
 | FE-03 | 请求前缀历史不进模型、不落账，末尾 user turn 才是本次输入 |
 | FE-04 | model/user/conversation id 不改变 resident/scope/stream/server route |
-| FE-05 | 附件与 interaction 保留结构，generic surface 有 capability 与呈现回执 |
+| FE-05 | 附件与 interaction 保留结构，generic surface 有 capability claim 与投影决策 |
 | FE-06 | 远端/loopback 同一 Bearer 闸；失败零副作用、token 零泄漏 |
 | FE-07 | `/webui` 确认、环境探测、插件闸、URL 与同 endpoint 复用 |
 

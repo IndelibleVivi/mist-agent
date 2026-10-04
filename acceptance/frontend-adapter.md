@@ -45,9 +45,10 @@ npm run acceptance:frontend-adapter:strict
   回显成真实路由。
 
 - [ ] **FE-05 附件与选项/阻断不退化**：支持 capability 的 surface 收到结构化附件；generic
-  surface 仍保留结构化附件/interaction，并得到 `degraded` / `blocked` 呈现回执。附件字节不进
+  surface 仍保留结构化附件/interaction，并得到 `degraded` / `blocked` 投影决策。附件字节不进
   canonical 正文，interaction 选项不摊成 `[option]`、编号列表或可被普通 user 文本冒充的点击。
-  住户的模型输入能读到本轮 surface capabilities，后续 canonical 读口能读到 blocked 回执。
+  住户的模型输入能读到本轮 client 声明的 surface capabilities；后续 canonical 读口能读到
+  adapter 采取了哪种投影。该记录不冒充浏览器实际渲染确认。
 
 - [ ] **FE-06 鉴权默认强制**：缺 token、错 token、loopback 缺 token 都返回 401 与稳定 code，
   且模型调用和 canonical 写入均为零；带正确 token 的 loopback 正对照可通过。日志和回执不含
@@ -60,8 +61,9 @@ npm run acceptance:frontend-adapter:strict
 ## 判卷边界
 
 - FE-02～FE-06 的公开 CI 只用合成住户、合成 token 与合成模型 transport；不需要真实 provider。
-- FE-05 判的是结构、能力与回执，不判某个具体 UI 是否好看。Open WebUI Pipe 的真实点击体验
-  留给功能 PR 的本机观察记录。
+- FE-05 判的是结构、client capability claim 与 adapter projection decision，不判某个具体 UI
+  是否好看，也不声称浏览器已经渲染。Open WebUI Pipe Function 的真实点击体验留给功能 PR 的
+  本机观察记录。
 - FE-07 公开 CI 用安装替身证明确认、环境探测和插件闸；真实 Open WebUI 安装只在隔离本机做，
   不进公共 CI，也不能用「进程起来了」替代一次经同 endpoint 的真实往返。
 - 施工席与独立验收席分开。合成判卷器自检、作者自测与正式落章是三件事。

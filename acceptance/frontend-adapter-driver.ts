@@ -79,11 +79,21 @@ export interface StructuredInteraction {
   reasonCode: string | null;
 }
 
-export interface DeliveryReceipt {
+/**
+ * 服务端根据 client 声明能力作出的投影决策。
+ *
+ * 它能证明 adapter 发出了 native / degraded / blocked 中哪一种形态，不能证明浏览器或其他
+ * client 最终真的渲染成功。真实 UI acknowledgment 若以后需要，必须另立带 request/event id 的
+ * 回传契约，不能把本对象升级解释成客户端回执。
+ */
+export interface SurfaceProjection {
   status: "native" | "degraded" | "blocked";
   missingCapabilities: ClientCapability[];
   canonicalEventIds: string[];
 }
+
+/** @deprecated 名字保留给 PR1 的早期判卷形状；语义以 SurfaceProjection 为准。 */
+export type DeliveryReceipt = SurfaceProjection;
 
 export interface FrontendError {
   code: string;
@@ -99,14 +109,14 @@ export interface FrontendCompletionBody {
   text: string;
   attachments: StructuredAttachment[];
   interaction: StructuredInteraction | null;
-  delivery: DeliveryReceipt;
+  delivery: SurfaceProjection;
 }
 
 export interface FrontendStreamChunk {
   textDelta: string;
   attachments: StructuredAttachment[];
   interaction: StructuredInteraction | null;
-  delivery: DeliveryReceipt | null;
+  delivery: SurfaceProjection | null;
   done: boolean;
 }
 
@@ -139,6 +149,7 @@ export interface ModelTurnReadback {
   canonicalHistoryText: string[];
   currentText: string;
   attachments: StructuredAttachment[];
+  /** Client 声明的呈现能力，只影响投影，不是鉴权或真实渲染事实。 */
   surfaceCapabilities: ClientCapability[];
 }
 
@@ -148,11 +159,12 @@ export interface CanonicalEventReadback {
   scopeId: string;
   streamId: string;
   writerId: string;
+  /** `surface-receipt` 只收录 adapter 投影决策，不代表 client 已确认渲染。 */
   kind: "user" | "assistant" | "attachment" | "interaction" | "surface-receipt";
   text: string | null;
   attachment: StructuredAttachment | null;
   interaction: StructuredInteraction | null;
-  delivery: DeliveryReceipt | null;
+  delivery: SurfaceProjection | null;
 }
 
 export interface InstallerRunReadback {
