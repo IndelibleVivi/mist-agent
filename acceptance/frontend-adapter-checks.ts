@@ -17,6 +17,7 @@ import type {
   SurfaceProjection,
   WebuiCommandReadback,
   WebuiInstallProposal,
+  WebuiRuntime,
 } from "./frontend-adapter-driver.ts";
 
 const pass = (detail: string): FrontendAdapterCheckResult => ({ passed: true, detail });
@@ -1821,7 +1822,8 @@ const fe07: FrontendAdapterCheck = {
   ],
   async run(driver) {
     try {
-      const target = await binding(driver, "fe07");
+      await driver.reset();
+      let target = await binding(driver, "fe07-preinstall");
       /** 从有序操作日志里取出某个 proposal 的操作序列（按原顺序）。 */
       const operationsFor = (
         audit: Awaited<ReturnType<FrontendAdapterDriver["readWebuiAudit"]>>,
@@ -1852,6 +1854,7 @@ const fe07: FrontendAdapterCheck = {
         cancelled.proposalId === null ||
         cancelled.confirmation !== "cancelled" ||
         cancelled.installedPlugin !== null ||
+        cancelled.runtimeUsed !== null ||
         cancelled.serviceId !== null ||
         cancelled.url !== null
       ) {
@@ -1886,6 +1889,7 @@ const fe07: FrontendAdapterCheck = {
         json([...missing.missing].sort()) !== json(["docker", "python"]) ||
         missing.confirmation !== null ||
         missing.installedPlugin !== null ||
+        missing.runtimeUsed !== null ||
         missing.serviceId !== null
       ) {
         return fail(`缺运行环境没有明确停住或擅自进入确认安装：${json(missing)}`);
@@ -1907,9 +1911,9 @@ const fe07: FrontendAdapterCheck = {
        */
       const verifyStart = async (
         result: WebuiCommandReadback,
-        expectedGateCalls: number,
-        label: string,
+        expectedRuntime: WebuiRuntime,
       ): Promise<FrontendAdapterCheckResult | null> => {
+        const label = `${expectedRuntime}-only`;
         if (
           result.status !== "started" ||
           result.serviceId === null ||
@@ -1920,6 +1924,9 @@ const fe07: FrontendAdapterCheck = {
           result.confirmation !== "confirmed"
         ) {
           return fail(`${label}：确认后没有经同一 endpoint 启本机服务：${json(result)}`);
+        }
+        if (result.runtimeUsed !== expectedRuntime) {
+          return fail(`${label}：实际服务选择了不可用 runtime：${json(result)}`);
         }
         if (
           result.proposalId === null ||
@@ -1954,43 +1961,42 @@ const fe07: FrontendAdapterCheck = {
           operations[1].confirmed !== true ||
           operations[2]?.kind !== "install" ||
           operations[2].pluginId !== result.installedPlugin.pluginId ||
-          operations[2].category !== result.installedPlugin.category
+          operations[2].category !== result.installedPlugin.category ||
+          operations[2].runtimeUsed !== result.runtimeUsed
         ) {
           return fail(`${label}：提案→确认→安装的顺序或身份不对：${json({ operations, result })}`);
         }
         if (
-          current.installGateCalls !== expectedGateCalls ||
+          current.installGateCalls !== 1 ||
           current.systemInstallAttempts !== 0 ||
-          !current.startedServiceIds.includes(result.serviceId) ||
-          !current.endpointIds.includes(target.endpointId)
+          json(current.startedServiceIds) !== json([result.serviceId]) ||
+          json(current.endpointIds) !== json([target.endpointId]) ||
+          current.operations.filter((op) => op.kind === "install").length !== 1 ||
+          current.operations.filter((op) => op.kind === "confirmation").length !== 1
         ) {
           return fail(`${label}：安装闸计数或服务审计不成立：${json(current)}`);
         }
         return null;
       };
 
-      // Python-only 成功正例（保持 Docker-only、缺两者、取消路径）。
+      // 每条成功路径都从 reset 后的未安装场景开始，不要求已装服务在同一 binding 重装。
+      await driver.reset();
+      target = await binding(driver, "fe07-python");
       const pythonStarted = await driver.runWebuiCommand(target.bindingId, {
         confirmed: true,
         environment: { docker: false, python: true },
       });
-      const pythonFailure = await verifyStart(pythonStarted, 1, "python-only");
+      const pythonFailure = await verifyStart(pythonStarted, "python");
       if (pythonFailure !== null) return pythonFailure;
 
+      await driver.reset();
+      target = await binding(driver, "fe07-docker");
       const started = await driver.runWebuiCommand(target.bindingId, {
         confirmed: true,
         environment: { docker: true, python: false },
       });
-      const dockerFailure = await verifyStart(started, 2, "docker-only");
+      const dockerFailure = await verifyStart(started, "docker");
       if (dockerFailure !== null) return dockerFailure;
-      audit = await driver.readWebuiAudit();
-      if (
-        audit.startedServiceIds.length !== 2 ||
-        audit.operations.filter((op) => op.kind === "install").length !== 2 ||
-        audit.operations.filter((op) => op.kind === "confirmation").length !== 3
-      ) {
-        return fail(`两次成功安装没有各留一份提案/闸操作/服务：${json(audit)}`);
-      }
 
       const serviceId = started.serviceId as string;
       const context = {

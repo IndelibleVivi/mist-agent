@@ -92,7 +92,10 @@ npm run acceptance:frontend-adapter:strict
   本次展示的 proposal（proposalId、opaque plugin id、`frontend` 类别、Open WebUI 组件名、
   资源占用估计、将启动服务）必须与实际经闸安装的插件身份逐项对得上，沿 opaque id 合同、
   不假设宿主 plugin id 字面；资源占用是展示估计，不冒充实测使用；空 proposal 或错误类别
-  不能通过。Docker-only 与 Python-only 两条成功路径都要成立。
+  不能通过。Docker-only 与 Python-only 两条成功路径都要成立：各自在 reset 后的独立未安装
+  场景运行，各只要求一次安装闸、一次服务启动，不要求同一 binding 重装，允许正确宿主复用
+  已安装服务。`runtimeUsed` 从实际服务配置读回，必须是该场景唯一可用的 runtime，且与安装
+  操作审计一致；选择不可用 runtime 的两种 mutation 都判红。
   Open WebUI 的合成请求复用 FE-02 同一 endpoint 与 canonical stream：本轮恰好新增一对
   同 resident/scope/stream/writer 的 user/assistant 事件；私有附件面写入前后 delta 恰好入站/出站
   两条，每条核完整结构 + binding/resident/scope/stream/writer 五种归属（`writerId` 即 canonical

@@ -308,12 +308,16 @@ export interface WebuiEnvironment {
   python: boolean;
 }
 
+export type WebuiRuntime = "docker" | "python";
+
 export interface WebuiCommandReadback {
   status: "cancelled" | "missing-runtime" | "started";
   missing: Array<"docker" | "python">;
   serviceId: string | null;
   url: string | null;
   endpointId: string | null;
+  /** 从实际启动的服务配置读回所用 runtime；未启动时为 null，不是根据 environment 推测。 */
+  runtimeUsed: WebuiRuntime | null;
   /** 本次展示的提案身份；走安装流程（含展示后取消）时必须非 null。 */
   proposalId: string | null;
   /**
@@ -333,7 +337,13 @@ export interface WebuiCommandReadback {
 export type WebuiOperation =
   | { kind: "proposal"; proposalId: string; pluginId: string; category: string }
   | { kind: "confirmation"; proposalId: string; confirmed: boolean }
-  | { kind: "install"; proposalId: string; pluginId: string; category: string };
+  | {
+      kind: "install";
+      proposalId: string;
+      pluginId: string;
+      category: string;
+      runtimeUsed: WebuiRuntime;
+    };
 
 export interface WebuiAuditReadback {
   installGateCalls: number;

@@ -351,7 +351,11 @@ token 原文不进日志、投影记录、响应 id/body/error、原始 JSON/SSE
 组件名（Open WebUI）、资源占用、将启动服务与实装插件逐项对得上，沿 opaque id 合同、
 不假设宿主 plugin id 的字面；空 proposal 或非 `frontend` 类别不能通过。资源占用是**展示估计**，
 不冒充实测资源使用；提案里的将启动服务 id 与实际启动读回一致。Docker-only 与 Python-only
-两条成功路径都要成立，取消与缺运行环境都不得安装。
+两条成功路径都要成立，取消与缺运行环境都不得安装。两条成功判卷各自在 reset 后的独立
+未安装场景运行，各核一次安装闸与一次服务启动；不要求同一 binding 连续重装，正确宿主
+可以复用已安装服务。`runtimeUsed` 必须从实际启动服务的配置读回，并与同 proposal 的安装
+操作审计一致，不能由输入的 environment flags 推测；Python-only 必须用 Python，Docker-only
+必须用 Docker。代价：宿主 driver 要暴露实际 runtime 选择，判卷需隔离两条安装场景。
 
 顺序也是合同的一部分：**先展示完整提案，再消费确认决定**。`readWebuiAudit` 用有序操作读回
 （proposal → confirmation → install）让这条顺序可检查，并以同一个 proposal id 归属。展示后

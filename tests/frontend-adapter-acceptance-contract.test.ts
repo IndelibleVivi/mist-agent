@@ -102,6 +102,8 @@ type Fault =
   | "webui-proposal-identity-mismatch"
   | "webui-canonical-egress-metadata-drop"
   | "webui-install-before-confirm"
+  | "webui-python-only-uses-docker"
+  | "webui-docker-only-uses-python"
   | "attachment-write-wrong-owner";
 
 interface StoredInteraction extends InteractionReadback {
@@ -269,8 +271,10 @@ function encodeChunk(input: {
 class FixtureDriver implements FrontendAdapterDriver {
   readonly #faults: Set<Fault>;
   readonly #ingressIdPrefix: string;
+  readonly #reuseInstalledWebui: boolean;
   readonly #bindings = new Map<string, StoredBinding>();
   readonly #services = new Map<string, string>();
+  readonly #webuiServices = new Map<string, WebuiCommandReadback>();
   #sequence = 0;
   #security: SecurityAuditReadback = { attempts: 0, accepted: 0, logs: [], receipts: [] };
   #networkAttempts: NetworkAttemptRecord[] = [];
@@ -283,14 +287,20 @@ class FixtureDriver implements FrontendAdapterDriver {
     operations: [],
   };
 
-  constructor(faults: readonly Fault[] = [], ingressIdPrefix = "ingress") {
+  constructor(
+    faults: readonly Fault[] = [],
+    ingressIdPrefix = "ingress",
+    reuseInstalledWebui = false,
+  ) {
     this.#faults = new Set(faults);
     this.#ingressIdPrefix = ingressIdPrefix;
+    this.#reuseInstalledWebui = reuseInstalledWebui;
   }
 
   async reset(): Promise<void> {
     this.#bindings.clear();
     this.#services.clear();
+    this.#webuiServices.clear();
     this.#security = { attempts: 0, accepted: 0, logs: [], receipts: [] };
     this.#networkAttempts = [];
     this.#webui = {
@@ -452,6 +462,11 @@ class FixtureDriver implements FrontendAdapterDriver {
     input: { confirmed: boolean; environment: { docker: boolean; python: boolean } },
   ): Promise<WebuiCommandReadback> {
     const state = this.#state(bindingId);
+    const installed = this.#webuiServices.get(bindingId);
+    if (this.#reuseInstalledWebui && installed !== undefined) {
+      // 正确宿主可以复用已经安装的现役服务，不再次进安装闸或启动服务。
+      return structuredClone(installed);
+    }
     const serviceId = `webui:${bindingId}`;
     const webuiPluginId = `plugin:webui:${bindingId}`;
     // 图纸 §8：先展示完整提案，再消费合成确认决定。
@@ -491,11 +506,20 @@ class FixtureDriver implements FrontendAdapterDriver {
         serviceId: null,
         url: null,
         endpointId: null,
+        runtimeUsed: null,
         proposalId: proposal.proposalId,
         confirmation: null,
         installedPlugin: null,
       };
     }
+    const runtimeUsed =
+      this.#faults.has("webui-python-only-uses-docker") && !input.environment.docker
+        ? "docker"
+        : this.#faults.has("webui-docker-only-uses-python") && !input.environment.python
+          ? "python"
+          : input.environment.docker
+            ? "docker"
+            : "python";
     if (this.#faults.has("webui-install-before-confirm") && !cancelled) {
       // 错误行为：先经闸安装，再登记确认——顺序颠倒。
       this.#webui.installGateCalls += 1;
@@ -504,6 +528,7 @@ class FixtureDriver implements FrontendAdapterDriver {
         proposalId: proposal.proposalId,
         pluginId: proposal.pluginId,
         category: proposal.category,
+        runtimeUsed,
       });
     }
     this.#webui.operations.push({
@@ -519,6 +544,7 @@ class FixtureDriver implements FrontendAdapterDriver {
         serviceId: null,
         url: null,
         endpointId: null,
+        runtimeUsed: null,
         proposalId: proposal.proposalId,
         confirmation: "cancelled",
         installedPlugin: null,
@@ -534,20 +560,24 @@ class FixtureDriver implements FrontendAdapterDriver {
         proposalId: proposal.proposalId,
         pluginId: proposal.pluginId,
         category: proposal.category,
+        runtimeUsed,
       });
     }
     this.#webui.startedServiceIds.push(serviceId);
     this.#webui.endpointIds.push(state.binding.endpointId);
-    return {
+    const started: WebuiCommandReadback = {
       status: "started",
       missing: [],
       serviceId,
       url: "http://127.0.0.1:3000",
       endpointId: state.binding.endpointId,
+      runtimeUsed,
       proposalId: proposal.proposalId,
       confirmation: "confirmed",
       installedPlugin: { pluginId: proposal.pluginId, category: proposal.category },
     };
+    this.#webuiServices.set(bindingId, structuredClone(started));
+    return started;
   }
 
   async readWebuiAudit(): Promise<WebuiAuditReadback> {
@@ -1320,6 +1350,35 @@ describe("#218 frontend adapter acceptance contract", () => {
     }
   });
 
+  it("accepts a host that reuses its installed WebUI service without reinstalling", async () => {
+    const driver = clone(new FixtureDriver([], "ingress", true));
+    const target = await driver.provisionBinding({
+      residentId: "resident:webui-reuse",
+      scopeId: "scope:webui-reuse",
+      label: "webui-reuse",
+    });
+    const first = await driver.runWebuiCommand(target.bindingId, {
+      confirmed: true,
+      environment: { docker: false, python: true },
+    });
+    expect(first.status).toBe("started");
+    expect(first.runtimeUsed).toBe("python");
+    const before = await driver.readWebuiAudit();
+    const reused = await driver.runWebuiCommand(target.bindingId, {
+      confirmed: true,
+      environment: { docker: true, python: false },
+    });
+    expect(reused).toEqual(first);
+    expect(await driver.readWebuiAudit()).toEqual(before);
+    expect(before.installGateCalls).toBe(1);
+    expect(before.startedServiceIds).toEqual([first.serviceId]);
+    await driver.reset();
+    const check = frontendAdapterChecks.find((candidate) => candidate.id === "FE-07");
+    if (check === undefined) throw new Error("missing check FE-07");
+    const result = await check.run(driver);
+    expect(result.passed, result.detail).toBe(true);
+  });
+
   it.each([
     // FE-01
     ["FE-01", "legacy-rewrite"],
@@ -1384,6 +1443,8 @@ describe("#218 frontend adapter acceptance contract", () => {
     ["FE-07", "webui-proposal-identity-mismatch"],
     ["FE-07", "webui-canonical-egress-metadata-drop"],
     ["FE-07", "webui-install-before-confirm"],
+    ["FE-07", "webui-python-only-uses-docker"],
+    ["FE-07", "webui-docker-only-uses-python"],
     ["FE-07", "attachment-write-wrong-owner"],
   ] as const)(
     "%s rejects its targeted false-green mutation (%s)",
