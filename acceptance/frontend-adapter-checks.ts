@@ -1,6 +1,7 @@
 /** #218 / D31 的七盏可执行判卷。 */
 import type {
   AdapterBinding,
+  AttachmentWriteRecord,
   ClientCapability,
   FrontendAdapterCheck,
   FrontendAdapterCheckResult,
@@ -14,6 +15,8 @@ import type {
   StructuredInteraction,
   StructuredInteractionOption,
   SurfaceProjection,
+  WebuiCommandReadback,
+  WebuiInstallProposal,
 } from "./frontend-adapter-driver.ts";
 
 const pass = (detail: string): FrontendAdapterCheckResult => ({ passed: true, detail });
@@ -323,6 +326,32 @@ function sameAttachment(
   );
 }
 
+/**
+ * 逐字段核私有附件面写入记录：完整附件结构 + binding/resident/scope/stream/writer 归属。
+ * 不依赖对象 JSON key 顺序，也不假设 host opaque id 的字面。
+ */
+function sameAttachmentWrite(
+  record: AttachmentWriteRecord | undefined,
+  attachment: StructuredAttachment,
+  owner: {
+    bindingId: string;
+    residentId: string;
+    scopeId: string;
+    streamId: string;
+    writerId: string;
+  },
+): boolean {
+  if (record === undefined) return false;
+  return (
+    sameAttachment(record, attachment) &&
+    record.bindingId === owner.bindingId &&
+    record.residentId === owner.residentId &&
+    record.scopeId === owner.scopeId &&
+    record.streamId === owner.streamId &&
+    record.writerId === owner.writerId
+  );
+}
+
 /** 解析控制响应原始请求体，返回 snake_case 的 interaction_response（缺失返回 undefined）。 */
 function requestInteractionResponse(
   raw: string,
@@ -422,6 +451,7 @@ const fe02: FrontendAdapterCheck = {
     "readRawWire",
     "readModelTurns",
     "readCanonicalEvents",
+    "readInteractions",
     "readAttachmentWrites",
     "reset",
   ],
@@ -574,27 +604,43 @@ const fe02: FrontendAdapterCheck = {
       }
 
       // —— Open WebUI utility task：显式 task hint 只能用来拒绝 ——
-      const beforeUtility = {
-        turns: (await driver.readModelTurns(target.bindingId)).length,
-        events: (await driver.readCanonicalEvents(target.bindingId)).length,
-        attachments: (await driver.readAttachmentWrites()).count,
+      //
+      // 只核文本不够：utility 请求带 inline 附件时，adapter 必须先识别出 utility task，
+      // 在解析/持久化附件之前就拒绝——不能在拒绝之前先把附件字节落进私有附件面，
+      // 再靠 canonical 数为零冒充零副作用。这里逐字比对 model/canonical/control/
+      // 私有附件完整读回的 before/after。
+      const utilitySnapshot = async () => ({
+        turns: await driver.readModelTurns(target.bindingId),
+        events: await driver.readCanonicalEvents(target.bindingId),
+        interactions: await driver.readInteractions(target.bindingId),
+        attachments: await driver.readAttachmentWrites(),
+      });
+      const beforeUtility = await utilitySnapshot();
+      const utilityRequest = request("__task__: generate a title", {
+        taskKind: "title-generation",
+      });
+      utilityRequest.messages[0] = {
+        role: "user",
+        content: [
+          { type: "text", text: "__task__: generate a title" },
+          { type: "file", file: { filename: "utility-in.txt", file_data: "c3ludGhldGlj" } },
+        ],
       };
       const utility = await driver.sendCompletion(
         target.bindingId,
         authorized(target),
-        request("__task__: generate a title", { taskKind: "title-generation" }),
+        utilityRequest,
       );
       if (utility.status === 200 || utility.error?.code !== "MIST_UTILITY_REQUEST_UNSUPPORTED") {
         return fail(`utility task 没有被稳定拒绝：${json(utility)}`);
       }
-      const afterUtility = {
-        turns: (await driver.readModelTurns(target.bindingId)).length,
-        events: (await driver.readCanonicalEvents(target.bindingId)).length,
-        attachments: (await driver.readAttachmentWrites()).count,
-      };
+      const afterUtility = await utilitySnapshot();
       if (json(beforeUtility) !== json(afterUtility)) {
         return fail(
-          `utility 拒绝仍产生 model/canonical/附件副作用：${json({ beforeUtility, afterUtility })}`,
+          `utility 拒绝仍产生 model/canonical/control/附件副作用：${json({
+            beforeUtility,
+            afterUtility,
+          })}`,
         );
       }
       const utilityWire = (await driver.readRawWire(target.bindingId)).at(-1);
@@ -629,8 +675,11 @@ const fe03: FrontendAdapterCheck = {
     "seedCanonicalHistory",
     "queueResidentReply",
     "sendCompletion",
+    "readRawWire",
     "readModelTurns",
     "readCanonicalEvents",
+    "readInteractions",
+    "readAttachmentWrites",
     "reset",
   ],
   async run(driver) {
@@ -669,7 +718,77 @@ const fe03: FrontendAdapterCheck = {
       });
       const leaked = forged.find((marker) => observable.includes(marker));
       if (leaked !== undefined) return fail(`伪造历史进入可观察状态：${leaked}`);
-      return pass("请求前缀历史被丢弃，模型只见 canonical history 与末尾当前 turn");
+
+      // —— 图纸 §2：空 messages / 末尾非 user / 当前 user content 不可解析 ——
+      // 三种形状都必须返回稳定 MIST_INVALID_TURN_SHAPE，且 model/canonical/control/
+      // 私有附件零副作用。不能用类型断言把实现错误藏过去。
+      const snapshot = async () => ({
+        turns: await driver.readModelTurns(target.bindingId),
+        events: await driver.readCanonicalEvents(target.bindingId),
+        interactions: await driver.readInteractions(target.bindingId),
+        attachments: await driver.readAttachmentWrites(),
+      });
+      const unparseableContent = [
+        { type: "audio", audio: { data: "AAAA" } },
+      ] as unknown as FrontendChatRequest["messages"][number]["content"];
+      const invalidShapes: Array<{ label: string; request: FrontendChatRequest }> = [
+        {
+          label: "empty-messages",
+          request: {
+            model: "client-selected-model",
+            stream: false,
+            messages: [],
+            mist: { client: { surface: "acceptance-fixture", capabilities: [] } },
+          },
+        },
+        {
+          label: "last-not-user",
+          request: {
+            model: "client-selected-model",
+            stream: false,
+            messages: [
+              { role: "user", content: "earlier" },
+              { role: "assistant", content: "not a new user turn" },
+            ],
+            mist: { client: { surface: "acceptance-fixture", capabilities: [] } },
+          },
+        },
+        {
+          label: "unparseable-user-content",
+          request: {
+            model: "client-selected-model",
+            stream: false,
+            messages: [{ role: "user", content: unparseableContent }],
+            mist: { client: { surface: "acceptance-fixture", capabilities: [] } },
+          },
+        },
+      ];
+      for (const shape of invalidShapes) {
+        const before = await snapshot();
+        const wireBefore = (await driver.readRawWire(target.bindingId)).length;
+        const denied = await driver.sendCompletion(
+          target.bindingId,
+          authorized(target),
+          shape.request,
+        );
+        if (denied.status !== 400 || denied.error?.code !== "MIST_INVALID_TURN_SHAPE") {
+          return fail(`${shape.label} 没有返回稳定 MIST_INVALID_TURN_SHAPE：${json(denied)}`);
+        }
+        const after = await snapshot();
+        if (json(before) !== json(after)) {
+          return fail(`${shape.label} 的拒绝产生了 model/canonical/control/附件副作用`);
+        }
+        const wires = await driver.readRawWire(target.bindingId);
+        if (
+          wires.length !== wireBefore + 1 ||
+          !wires.at(-1)?.responseBody.includes("MIST_INVALID_TURN_SHAPE")
+        ) {
+          return fail(`${shape.label} 的拒绝没有留下可扫的原始 wire：${json(wires.at(-1))}`);
+        }
+      }
+      return pass(
+        "请求前缀历史被丢弃；空 messages / 末尾非 user / 不可解析 content 均稳定拒绝且零副作用",
+      );
     } finally {
       await driver.reset();
     }
@@ -766,6 +885,7 @@ const fe05: FrontendAdapterCheck = {
     "readCanonicalEvents",
     "readInteractions",
     "readAttachmentWrites",
+    "readNetworkAttempts",
     "reset",
   ],
   async run(driver) {
@@ -844,20 +964,23 @@ const fe05: FrontendAdapterCheck = {
         return fail(`native 附件 wire 扩展不完整或与归一化不符：${json(nativeWire)}`);
       }
       const writesAfterNative = await driver.readAttachmentWrites();
+      const fe05Owner = {
+        bindingId: target.bindingId,
+        residentId: target.residentId,
+        scopeId: target.scopeId,
+        streamId: target.streamId,
+        writerId: target.canonicalWriterId,
+      };
       if (
         writesAfterNative.count !== writesBefore + 2 ||
-        !writesAfterNative.records.some(
-          (record) =>
-            json(record) ===
-            json({ ...inboundAttachment, residentId: target.residentId, scopeId: target.scopeId }),
+        !writesAfterNative.records.some((record) =>
+          sameAttachmentWrite(record, inboundAttachment, fe05Owner),
         ) ||
-        !writesAfterNative.records.some(
-          (record) =>
-            json(record) ===
-            json({ ...outboundAttachment, residentId: target.residentId, scopeId: target.scopeId }),
+        !writesAfterNative.records.some((record) =>
+          sameAttachmentWrite(record, outboundAttachment, fe05Owner),
         )
       ) {
-        return fail(`附件面写入记录与声明结构不符：${json(writesAfterNative)}`);
+        return fail(`附件面写入记录与声明结构/归属不符：${json(writesAfterNative)}`);
       }
       const afterNativeEvents = await driver.readCanonicalEvents(target.bindingId);
       const ingressEvent = afterNativeEvents.find(
@@ -928,6 +1051,72 @@ const fe05: FrontendAdapterCheck = {
       }
       if (/data:|aGVsbG8=|\[attachment\]|!\[[^\]]*\]\(/i.test(degradedBody.text)) {
         return fail(`附件被伪装成正文标记或内联字节：${degradedBody.text}`);
+      }
+
+      // —— 远程 image_url：禁止 SSRF 代抓，拒绝后 network/model/canonical/control/附件零副作用 ——
+      //
+      // 图纸 §4.1：任意 http(s) URL 不由 adapter 代抓。这里用非真实网络的 remote URL 反例，
+      // 并从 network attempt 读口核「实现真的没发起远程抓取」，而不是相信它的自声明。
+      const remoteSnapshot = async () => ({
+        turns: await driver.readModelTurns(target.bindingId),
+        events: await driver.readCanonicalEvents(target.bindingId),
+        interactions: await driver.readInteractions(target.bindingId),
+        attachments: await driver.readAttachmentWrites(),
+        network: await driver.readNetworkAttempts(),
+      });
+      const remoteUrl = "https://images.example.invalid/private.png?token=leak-me";
+      const remoteRequest = request("remote image ingress");
+      remoteRequest.messages[0] = {
+        role: "user",
+        content: [
+          { type: "text", text: "remote image ingress" },
+          { type: "image_url", image_url: { url: remoteUrl } },
+        ],
+      };
+      const remoteBefore = await remoteSnapshot();
+      const remoteWireBefore = (await driver.readRawWire(target.bindingId)).length;
+      const remote = await driver.sendCompletion(
+        target.bindingId,
+        authorized(target),
+        remoteRequest,
+      );
+      if (remote.status === 200 || remote.error?.code !== "MIST_REMOTE_URL_UNSUPPORTED") {
+        return fail(`远程 image_url 没有被稳定拒绝：${json(remote)}`);
+      }
+      const remoteAfter = await remoteSnapshot();
+      if (json(remoteBefore) !== json(remoteAfter)) {
+        return fail(
+          `远程 image_url 拒绝仍产生 network/model/canonical/control/附件副作用：${json({
+            remoteBefore,
+            remoteAfter,
+          })}`,
+        );
+      }
+      if (remoteBefore.network.attempts !== 0 || remoteAfter.network.attempts !== 0) {
+        return fail(`远程抓取尝试读口不是从零开始：${json(remoteBefore.network)}`);
+      }
+      const remoteWires = await driver.readRawWire(target.bindingId);
+      const remoteWire = remoteWires.at(-1);
+      if (
+        remoteWires.length !== remoteWireBefore + 1 ||
+        remoteWire === undefined ||
+        !remoteWire.responseBody.includes("MIST_REMOTE_URL_UNSUPPORTED") ||
+        remoteWire.responseBody.includes("images.example.invalid") ||
+        remoteWire.requestBody.includes(target.token)
+      ) {
+        return fail(`远程拒绝没有留下合规的原始 wire（或不许回显 URL）：${json(remoteWire)}`);
+      }
+      const remoteObservable = json({
+        turns: remoteAfter.turns,
+        events: remoteAfter.events,
+        interactions: remoteAfter.interactions,
+        attachments: remoteAfter.attachments,
+      });
+      if (
+        remoteObservable.includes("images.example.invalid") ||
+        remoteObservable.includes("leak-me")
+      ) {
+        return fail("远程 URL 原文或查询串进入了可观察状态");
       }
 
       // —— native choice：结构完整、wire 完整、待决 ——
@@ -1303,7 +1492,6 @@ const fe05: FrontendAdapterCheck = {
 
       // —— 流式附件 + interaction 扩展：SSE 结构也要完整 ——
       const streamAttachment = attachment("outbound-stream");
-      const streamChoice = interaction("stream-choice");
       await driver.queueResidentReply(target.bindingId, {
         kind: "attachment",
         text: "stream attachment reply",
@@ -1328,7 +1516,105 @@ const fe05: FrontendAdapterCheck = {
       ) {
         return fail(`SSE mist 附件扩展不完整或与归一化不符：${json(streamWire)}`);
       }
-      void streamChoice;
+
+      // —— 独立 stream interaction 正例（kind: blocked）：normalized/wire/canonical 逐字对齐 ——
+      //
+      // 流式回合不能只搬附件：interaction 的 options、reasonCode、投影关联与目标 writer/identity
+      // 都要在归一化值、SSE wire 与 canonical 记录三处一致。这里用 kind: "blocked" 的可执行正例。
+      const streamedInteraction: StructuredInteraction = {
+        ...interaction("stream-blocked", "blocked"),
+        reasonCode: "MIST_INTERACTION_BLOCKED_SURFACE",
+      };
+      await driver.queueResidentReply(target.bindingId, {
+        kind: "interaction",
+        text: "Streamed blocked interaction.",
+        interaction: streamedInteraction,
+      });
+      const streamInteractionEventsBefore = await driver.readCanonicalEvents(target.bindingId);
+      const streamInteractionResponse = await driver.sendCompletion(
+        target.bindingId,
+        authorized(target),
+        request("stream interaction surface", { stream: true, capabilities: ["interactions"] }),
+      );
+      const streamInteractionBody = bodyOf(streamInteractionResponse);
+      if (
+        streamInteractionBody === null ||
+        streamInteractionBody.projection.status !== "native" ||
+        json(streamInteractionBody.interaction) !== json(streamedInteraction) ||
+        streamInteractionBody.attachments.length !== 0
+      ) {
+        return fail(
+          `流式 interaction 归一化结构不完整或与声明不符：${json(streamInteractionResponse)}`,
+        );
+      }
+      const streamInteractionWire = (await driver.readRawWire(target.bindingId)).at(-1);
+      if (streamInteractionWire === undefined || streamInteractionWire.responseKind !== "sse") {
+        return fail(`流式 interaction 没有 SSE wire：${json(streamInteractionWire)}`);
+      }
+      const streamInteractionSse = parseSse(streamInteractionWire.responseBody);
+      if (streamInteractionSse.malformedCount !== 0 || streamInteractionSse.doneCount !== 1) {
+        return fail(
+          `流式 interaction 的 SSE 分词或 [DONE] 不唯一：${streamInteractionWire.responseBody}`,
+        );
+      }
+      const streamInteractionFrame = streamInteractionSse.frames.find(
+        (frame) => Object.keys(frame.mist).length > 0,
+      );
+      if (
+        streamInteractionFrame === undefined ||
+        json(wireInteraction(streamInteractionFrame.mist.interaction)) !==
+          json(streamedInteraction) ||
+        json(wireProjection(streamInteractionFrame.mist.projection)) !==
+          json(streamInteractionBody.projection) ||
+        streamInteractionFrame.mist.stream_id !== target.streamId ||
+        streamInteractionFrame.model !== target.serverModel ||
+        streamInteractionFrame.id !== streamInteractionBody.id ||
+        !streamInteractionSse.frames.some((frame) => frame.choices[0]?.delta?.role === "assistant")
+      ) {
+        return fail(
+          `流式 interaction 的 SSE wire 与归一化/声明不对应：${json(streamInteractionWire)}`,
+        );
+      }
+      const streamInteractionEvents = (await driver.readCanonicalEvents(target.bindingId)).slice(
+        streamInteractionEventsBefore.length,
+      );
+      const streamedInteractionEvents = streamInteractionEvents.filter(
+        (event) => event.interaction?.interactionId === streamedInteraction.interactionId,
+      );
+      if (
+        streamedInteractionEvents.length !== 1 ||
+        json(streamedInteractionEvents[0]?.interaction) !== json(streamedInteraction) ||
+        !allOwned(streamedInteractionEvents)
+      ) {
+        return fail(
+          `流式 interaction 的 canonical 记录结构/归属不对：${json(streamedInteractionEvents)}`,
+        );
+      }
+      if (
+        streamInteractionBody.projection.canonicalEventIds.length === 0 ||
+        streamInteractionBody.projection.canonicalEventIds.some(
+          (id) => !streamInteractionEvents.some((event) => event.eventId === id),
+        ) ||
+        !streamInteractionEvents.some(
+          (event) => json(event.projection) === json(streamInteractionBody.projection),
+        )
+      ) {
+        return fail(
+          `流式 interaction 投影没有关联到本轮 canonical 记录：${json({
+            events: streamInteractionEvents,
+            projection: streamInteractionBody.projection,
+          })}`,
+        );
+      }
+      const streamedInteractionReadback = (await driver.readInteractions(target.bindingId)).find(
+        (item) => item.interactionId === streamedInteraction.interactionId,
+      );
+      if (
+        !sameInteraction(streamedInteractionReadback, streamedInteraction) ||
+        streamedInteractionReadback?.status !== "pending"
+      ) {
+        return fail(`流式 interaction 耐久状态与声明不符：${json(streamedInteractionReadback)}`);
+      }
 
       const turns = await driver.readModelTurns(target.bindingId);
       const firstTurn = turns.find((turn) => turn.currentText === "attachment ingress");
@@ -1379,6 +1665,7 @@ const fe06: FrontendAdapterCheck = {
     "readCanonicalEvents",
     "readInteractions",
     "readAttachmentWrites",
+    "readNetworkAttempts",
     "readSecurityAudit",
     "reset",
   ],
@@ -1477,7 +1764,7 @@ const fe06: FrontendAdapterCheck = {
         return fail(redact(`鉴权审计计数不对：${json(audit)}`, secrets));
       }
 
-      // 全量扫描：accepted 响应体/raw wire(含 SSE)/canonical/model/control/附件/audit 都不许含 token。
+      // 全量扫描：accepted 响应体/raw wire(含 SSE)/canonical/model/control/附件/network/audit 都不许含 token。
       const observable = json({
         accepted,
         streamed,
@@ -1486,6 +1773,7 @@ const fe06: FrontendAdapterCheck = {
         events: await driver.readCanonicalEvents(target.bindingId),
         controls: await driver.readInteractions(target.bindingId),
         attachments: await driver.readAttachmentWrites(),
+        network: await driver.readNetworkAttempts(),
         audit,
       });
       for (const secret of secrets) {
@@ -1534,14 +1822,59 @@ const fe07: FrontendAdapterCheck = {
   async run(driver) {
     try {
       const target = await binding(driver, "fe07");
+      /** 从有序操作日志里取出某个 proposal 的操作序列（按原顺序）。 */
+      const operationsFor = (
+        audit: Awaited<ReturnType<FrontendAdapterDriver["readWebuiAudit"]>>,
+        proposalId: string,
+      ) => audit.operations.filter((op) => op.proposalId === proposalId);
+      const completeProposal = (
+        proposal: WebuiInstallProposal | undefined,
+      ): proposal is WebuiInstallProposal =>
+        proposal !== undefined &&
+        proposal.proposalId.length > 0 &&
+        proposal.pluginId.length > 0 &&
+        proposal.category === "frontend" &&
+        /open\s*webui/i.test(proposal.displayName) &&
+        Number.isFinite(proposal.resourceUsage.diskBytes) &&
+        proposal.resourceUsage.diskBytes > 0 &&
+        Number.isFinite(proposal.resourceUsage.memoryBytes) &&
+        proposal.resourceUsage.memoryBytes > 0 &&
+        proposal.servicesToStart.length > 0 &&
+        proposal.servicesToStart.every((serviceId) => serviceId.length > 0);
+
+      // —— 合法「展示后取消」正例：先展示完整 proposal，再消费取消决定，零安装/服务 ——
       const cancelled = await driver.runWebuiCommand(target.bindingId, {
         confirmed: false,
         environment: { docker: true, python: true },
       });
-      if (cancelled.status !== "cancelled") return fail(`未确认仍继续：${json(cancelled)}`);
+      if (
+        cancelled.status !== "cancelled" ||
+        cancelled.proposalId === null ||
+        cancelled.confirmation !== "cancelled" ||
+        cancelled.installedPlugin !== null ||
+        cancelled.serviceId !== null ||
+        cancelled.url !== null
+      ) {
+        return fail(`展示后取消没有正确停住或没有展示提案：${json(cancelled)}`);
+      }
       let audit = await driver.readWebuiAudit();
-      if (audit.installGateCalls !== 0 || audit.startedServiceIds.length !== 0) {
-        return fail(`未确认仍触发安装或服务：${json(audit)}`);
+      const cancelOperations = operationsFor(audit, cancelled.proposalId);
+      const cancelProposal = audit.proposals.find(
+        (item) => item.proposalId === cancelled.proposalId,
+      );
+      if (
+        audit.installGateCalls !== 0 ||
+        audit.systemInstallAttempts !== 0 ||
+        audit.startedServiceIds.length !== 0 ||
+        !completeProposal(cancelProposal) ||
+        cancelOperations.length !== 2 ||
+        cancelOperations[0]?.kind !== "proposal" ||
+        cancelOperations[0].pluginId !== cancelProposal.pluginId ||
+        cancelOperations[0].category !== cancelProposal.category ||
+        cancelOperations[1]?.kind !== "confirmation" ||
+        cancelOperations[1].confirmed !== false
+      ) {
+        return fail(`取消仍触发安装/服务，或提案→确认顺序/归属不对：${json(audit)}`);
       }
 
       const missing = await driver.runWebuiCommand(target.bindingId, {
@@ -1550,40 +1883,116 @@ const fe07: FrontendAdapterCheck = {
       });
       if (
         missing.status !== "missing-runtime" ||
-        json([...missing.missing].sort()) !== json(["docker", "python"])
+        json([...missing.missing].sort()) !== json(["docker", "python"]) ||
+        missing.confirmation !== null ||
+        missing.installedPlugin !== null ||
+        missing.serviceId !== null
       ) {
-        return fail(`缺运行环境没有明确停住：${json(missing)}`);
+        return fail(`缺运行环境没有明确停住或擅自进入确认安装：${json(missing)}`);
       }
       audit = await driver.readWebuiAudit();
-      if (audit.installGateCalls !== 0 || audit.systemInstallAttempts !== 0) {
-        return fail(`缺环境时自行安装了运行时：${json(audit)}`);
+      if (
+        audit.installGateCalls !== 0 ||
+        audit.systemInstallAttempts !== 0 ||
+        audit.startedServiceIds.length !== 0 ||
+        audit.operations.some((op) => op.kind === "install")
+      ) {
+        return fail(`缺环境时自行安装或启动了服务：${json(audit)}`);
       }
+
+      /**
+       * 核「本次展示的提案」与「实际经闸安装的插件」对得上：
+       * proposal id 归属、frontend 类别、Open WebUI 组件、资源占用与将启动服务。
+       * 沿 opaque id 合同，不假设宿主 plugin id 的字面。
+       */
+      const verifyStart = async (
+        result: WebuiCommandReadback,
+        expectedGateCalls: number,
+        label: string,
+      ): Promise<FrontendAdapterCheckResult | null> => {
+        if (
+          result.status !== "started" ||
+          result.serviceId === null ||
+          result.url === null ||
+          result.url.includes(target.token) ||
+          result.endpointId !== target.endpointId ||
+          !isLoopbackUrl(result.url) ||
+          result.confirmation !== "confirmed"
+        ) {
+          return fail(`${label}：确认后没有经同一 endpoint 启本机服务：${json(result)}`);
+        }
+        if (
+          result.proposalId === null ||
+          result.installedPlugin === null ||
+          result.installedPlugin.pluginId.length === 0 ||
+          result.installedPlugin.category !== "frontend"
+        ) {
+          return fail(`${label}：没有 frontend 类别的实际插件身份或提案归属：${json(result)}`);
+        }
+        const current = await driver.readWebuiAudit();
+        const proposal = current.proposals.find((item) => item.proposalId === result.proposalId);
+        if (
+          !completeProposal(proposal) ||
+          !proposal.servicesToStart.includes(result.serviceId) ||
+          proposal.pluginId !== result.installedPlugin.pluginId
+        ) {
+          return fail(
+            `${label}：展示的提案与实装插件对不上或缺少资源/服务/组件证据：${json({
+              proposal,
+              result,
+            })}`,
+          );
+        }
+        const operations = operationsFor(current, result.proposalId);
+        if (
+          operations.length !== 3 ||
+          operations[0]?.kind !== "proposal" ||
+          operations[0].proposalId !== result.proposalId ||
+          operations[0].pluginId !== proposal.pluginId ||
+          operations[0].category !== proposal.category ||
+          operations[1]?.kind !== "confirmation" ||
+          operations[1].confirmed !== true ||
+          operations[2]?.kind !== "install" ||
+          operations[2].pluginId !== result.installedPlugin.pluginId ||
+          operations[2].category !== result.installedPlugin.category
+        ) {
+          return fail(`${label}：提案→确认→安装的顺序或身份不对：${json({ operations, result })}`);
+        }
+        if (
+          current.installGateCalls !== expectedGateCalls ||
+          current.systemInstallAttempts !== 0 ||
+          !current.startedServiceIds.includes(result.serviceId) ||
+          !current.endpointIds.includes(target.endpointId)
+        ) {
+          return fail(`${label}：安装闸计数或服务审计不成立：${json(current)}`);
+        }
+        return null;
+      };
+
+      // Python-only 成功正例（保持 Docker-only、缺两者、取消路径）。
+      const pythonStarted = await driver.runWebuiCommand(target.bindingId, {
+        confirmed: true,
+        environment: { docker: false, python: true },
+      });
+      const pythonFailure = await verifyStart(pythonStarted, 1, "python-only");
+      if (pythonFailure !== null) return pythonFailure;
 
       const started = await driver.runWebuiCommand(target.bindingId, {
         confirmed: true,
         environment: { docker: true, python: false },
       });
-      if (
-        started.status !== "started" ||
-        started.serviceId === null ||
-        started.url === null ||
-        started.url.includes(target.token) ||
-        started.endpointId !== target.endpointId ||
-        !isLoopbackUrl(started.url)
-      ) {
-        return fail(`确认后没有经同一 endpoint 启本机服务：${json(started)}`);
-      }
+      const dockerFailure = await verifyStart(started, 2, "docker-only");
+      if (dockerFailure !== null) return dockerFailure;
       audit = await driver.readWebuiAudit();
       if (
-        audit.installGateCalls !== 1 ||
-        audit.systemInstallAttempts !== 0 ||
-        !audit.startedServiceIds.includes(started.serviceId) ||
-        !audit.endpointIds.includes(target.endpointId)
+        audit.startedServiceIds.length !== 2 ||
+        audit.operations.filter((op) => op.kind === "install").length !== 2 ||
+        audit.operations.filter((op) => op.kind === "confirmation").length !== 3
       ) {
-        return fail(`插件安装闸/服务审计不成立：${json(audit)}`);
+        return fail(`两次成功安装没有各留一份提案/闸操作/服务：${json(audit)}`);
       }
 
-      const serviceId = started.serviceId;
+      const serviceId = started.serviceId as string;
       const context = {
         token: target.token,
         source: "loopback" as const,
@@ -1604,6 +2013,7 @@ const fe07: FrontendAdapterCheck = {
         attachments: [webuiAttachment],
       });
       const before = await driver.readCanonicalEvents(target.bindingId);
+      const writesBefore = await driver.readAttachmentWrites();
       const webuiRequest = request("through webui", {
         capabilities: ["attachments", "interactions"],
       });
@@ -1671,6 +2081,70 @@ const fe07: FrontendAdapterCheck = {
         json(wireAttachments(webuiEnvelope.mist.attachments)) !== json([webuiAttachment])
       ) {
         return fail(`WebUI wire 没有回同主流且扩展完整：${json(webuiWire)}`);
+      }
+
+      // —— 私有附件面写入：前后 delta 恰好入站/出站两条，元数据与 canonical/输入输出互证 ——
+      const writesAfter = await driver.readAttachmentWrites();
+      const newWrites = writesAfter.records.slice(writesBefore.count);
+      const fe07Owner = {
+        bindingId: target.bindingId,
+        residentId: target.residentId,
+        scopeId: target.scopeId,
+        streamId: target.streamId,
+        writerId: target.canonicalWriterId,
+      };
+      // 入站：与本次 model turn 实际拿到的附件元数据互证（含真实解码字节数），
+      // 不凭空规定输入未声明的媒体类型策略。
+      const ingressTurnAttachment = (await driver.readModelTurns(target.bindingId)).find(
+        (turn) => turn.currentText === "through webui",
+      )?.attachments[0];
+      const ingressCanonicalAttachment = newEvents.find(
+        (event) => event.kind === "attachment" && event.attachment?.filename === "webui-in.txt",
+      )?.attachment;
+      const egressCanonicalAttachment = newEvents.find(
+        (event) =>
+          event.kind === "attachment" &&
+          event.attachment?.attachmentId === webuiAttachment.attachmentId,
+      )?.attachment;
+      if (
+        writesAfter.count !== writesBefore.count + 2 ||
+        writesAfter.records.length !== writesAfter.count ||
+        ingressTurnAttachment === undefined ||
+        ingressCanonicalAttachment === undefined ||
+        ingressTurnAttachment.kind !== "file" ||
+        ingressTurnAttachment.filename !== "webui-in.txt" ||
+        ingressTurnAttachment.source !== "inline" ||
+        ingressTurnAttachment.sizeBytes !== Buffer.from("aGVsbG8=", "base64").length ||
+        !sameAttachment(ingressCanonicalAttachment, ingressTurnAttachment) ||
+        !sameAttachment(egressCanonicalAttachment, webuiAttachment)
+      ) {
+        return fail(
+          `WebUI 入出站附件在 model turn / canonical 缺完整结构或真实字节数：${json({
+            ingressTurnAttachment,
+            ingressCanonicalAttachment,
+            egressCanonicalAttachment,
+          })}`,
+        );
+      }
+      const ingressWrite = newWrites.find((record) =>
+        sameAttachmentWrite(record, ingressTurnAttachment, fe07Owner),
+      );
+      const egressWrite = newWrites.find((record) =>
+        sameAttachmentWrite(record, webuiAttachment, fe07Owner),
+      );
+      if (
+        ingressWrite === undefined ||
+        egressWrite === undefined ||
+        newWrites.length !== 2 ||
+        !sameAttachment(egressWrite, webuiAttachment)
+      ) {
+        return fail(
+          `WebUI 成功路径的私有附件面写入不是恰好入站/出站两条且占位/归属对不上：${json({
+            writesBefore,
+            writesAfter,
+            newEvents,
+          })}`,
+        );
       }
 
       // —— WebUI 路径不许另开鉴权后门；拒绝零副作用 ——

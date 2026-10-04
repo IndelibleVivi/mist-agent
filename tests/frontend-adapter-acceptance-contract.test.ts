@@ -22,6 +22,8 @@ import {
   type InteractionReadback,
   type LegacyFrontendReadback,
   type ModelTurnReadback,
+  type NetworkAttemptReadback,
+  type NetworkAttemptRecord,
   type RawWireExchange,
   type ResidentReply,
   type SecurityAuditReadback,
@@ -30,6 +32,7 @@ import {
   type SurfaceProjection,
   type WebuiAuditReadback,
   type WebuiCommandReadback,
+  type WebuiInstallProposal,
   cloneFrontendAdapterDriverBoundary,
 } from "../acceptance/frontend-adapter-driver.ts";
 
@@ -55,8 +58,12 @@ type Fault =
   | "wire-leak-token-401"
   | "wire-leak-token-sse"
   | "utility-not-refused"
+  | "utility-writes-attachment"
   // FE-03
   | "trust-request-history"
+  | "forgive-empty-messages"
+  | "forgive-non-user-last"
+  | "forgive-unparseable-content"
   // FE-04
   | "split-stream"
   // FE-05
@@ -71,6 +78,9 @@ type Fault =
   | "attachment-metadata-drop"
   | "canonical-drop-options"
   | "canonical-resolution-no-option"
+  | "fetch-remote-image"
+  | "remote-image-writes-attachment"
+  | "sse-drop-stream-interaction"
   // FE-06
   | "loopback-bypass"
   | "auth-writes-attachment"
@@ -84,7 +94,15 @@ type Fault =
   | "webui-bypass-auth"
   | "webui-trust-history"
   | "webui-split-stream"
-  | "webui-utility-not-refused";
+  | "webui-utility-not-refused"
+  | "webui-skip-proposal"
+  | "webui-wrong-category"
+  | "webui-skip-attachment-writes"
+  | "webui-cancel-proposal-empty"
+  | "webui-proposal-identity-mismatch"
+  | "webui-canonical-egress-metadata-drop"
+  | "webui-install-before-confirm"
+  | "attachment-write-wrong-owner";
 
 interface StoredInteraction extends InteractionReadback {
   bindingId: string;
@@ -127,6 +145,7 @@ function attachmentFromPart(
       source: part.file.file_id === undefined ? "inline" : "opaque-ref",
     };
   }
+  if (part.type !== "image_url") return null;
   return {
     attachmentId: `${idPrefix}:image:${index}`,
     kind: "image",
@@ -254,11 +273,14 @@ class FixtureDriver implements FrontendAdapterDriver {
   readonly #services = new Map<string, string>();
   #sequence = 0;
   #security: SecurityAuditReadback = { attempts: 0, accepted: 0, logs: [], receipts: [] };
+  #networkAttempts: NetworkAttemptRecord[] = [];
   #webui: WebuiAuditReadback = {
     installGateCalls: 0,
     systemInstallAttempts: 0,
     startedServiceIds: [],
     endpointIds: [],
+    proposals: [],
+    operations: [],
   };
 
   constructor(faults: readonly Fault[] = [], ingressIdPrefix = "ingress") {
@@ -270,11 +292,14 @@ class FixtureDriver implements FrontendAdapterDriver {
     this.#bindings.clear();
     this.#services.clear();
     this.#security = { attempts: 0, accepted: 0, logs: [], receipts: [] };
+    this.#networkAttempts = [];
     this.#webui = {
       installGateCalls: 0,
       systemInstallAttempts: 0,
       startedServiceIds: [],
       endpointIds: [],
+      proposals: [],
+      operations: [],
     };
   }
 
@@ -385,6 +410,7 @@ class FixtureDriver implements FrontendAdapterDriver {
       bypassAuth: this.#faults.has("webui-bypass-auth"),
       trustHistory: this.#faults.has("webui-trust-history"),
       utilityNotRefused: this.#faults.has("webui-utility-not-refused"),
+      skipAttachmentWrites: this.#faults.has("webui-skip-attachment-writes"),
     });
   }
 
@@ -410,6 +436,13 @@ class FixtureDriver implements FrontendAdapterDriver {
     return { count: records.length, records: structuredClone(records) };
   }
 
+  async readNetworkAttempts(): Promise<NetworkAttemptReadback> {
+    return {
+      attempts: this.#networkAttempts.length,
+      records: structuredClone(this.#networkAttempts),
+    };
+  }
+
   async readSecurityAudit(): Promise<SecurityAuditReadback> {
     return structuredClone(this.#security);
   }
@@ -419,24 +452,89 @@ class FixtureDriver implements FrontendAdapterDriver {
     input: { confirmed: boolean; environment: { docker: boolean; python: boolean } },
   ): Promise<WebuiCommandReadback> {
     const state = this.#state(bindingId);
-    if (!input.confirmed) {
-      return { status: "cancelled", missing: [], serviceId: null, url: null, endpointId: null };
+    const serviceId = `webui:${bindingId}`;
+    const webuiPluginId = `plugin:webui:${bindingId}`;
+    // 图纸 §8：先展示完整提案，再消费合成确认决定。
+    const proposal: WebuiInstallProposal = {
+      proposalId: `proposal:${bindingId}:${this.#webui.proposals.length + 1}`,
+      pluginId: this.#faults.has("webui-skip-proposal") ? "" : webuiPluginId,
+      category: this.#faults.has("webui-wrong-category") ? "channel_adapter" : "frontend",
+      displayName: "Open WebUI",
+      resourceUsage: { diskBytes: 512 * 1024 * 1024, memoryBytes: 256 * 1024 * 1024 },
+      servicesToStart: this.#faults.has("webui-skip-proposal") ? [] : [serviceId],
+    };
+    if (!input.confirmed && this.#faults.has("webui-cancel-proposal-empty")) {
+      // 错误行为：取消路径虽展示了 proposal id，却漏掉组件、资源和计划服务。
+      proposal.displayName = "";
+      proposal.resourceUsage = { diskBytes: 0, memoryBytes: 0 };
+      proposal.servicesToStart = [];
     }
-    if (!input.environment.docker && !input.environment.python) {
+    if (!this.#faults.has("webui-skip-proposal")) {
+      this.#webui.proposals.push(structuredClone(proposal));
+    }
+    this.#webui.operations.push({
+      kind: "proposal",
+      proposalId: proposal.proposalId,
+      pluginId: this.#faults.has("webui-proposal-identity-mismatch")
+        ? "plugin:unrelated-display"
+        : proposal.pluginId,
+      category: proposal.category,
+    });
+
+    const cancelled = !input.confirmed;
+    const envMissing = !input.environment.docker && !input.environment.python;
+    if (!cancelled && envMissing) {
+      // 缺环境只报告缺项，不进入确认安装（不登记确认操作）。
       return {
         status: "missing-runtime",
         missing: ["docker", "python"],
         serviceId: null,
         url: null,
         endpointId: null,
+        proposalId: proposal.proposalId,
+        confirmation: null,
+        installedPlugin: null,
       };
     }
-    const serviceId = `webui:${bindingId}`;
+    if (this.#faults.has("webui-install-before-confirm") && !cancelled) {
+      // 错误行为：先经闸安装，再登记确认——顺序颠倒。
+      this.#webui.installGateCalls += 1;
+      this.#webui.operations.push({
+        kind: "install",
+        proposalId: proposal.proposalId,
+        pluginId: proposal.pluginId,
+        category: proposal.category,
+      });
+    }
+    this.#webui.operations.push({
+      kind: "confirmation",
+      proposalId: proposal.proposalId,
+      confirmed: input.confirmed,
+    });
+
+    if (cancelled) {
+      return {
+        status: "cancelled",
+        missing: [],
+        serviceId: null,
+        url: null,
+        endpointId: null,
+        proposalId: proposal.proposalId,
+        confirmation: "cancelled",
+        installedPlugin: null,
+      };
+    }
     this.#services.set(serviceId, bindingId);
     if (this.#faults.has("bypass-install-gate")) {
       this.#webui.systemInstallAttempts += 1;
-    } else {
+    } else if (!this.#faults.has("webui-install-before-confirm")) {
       this.#webui.installGateCalls += 1;
+      this.#webui.operations.push({
+        kind: "install",
+        proposalId: proposal.proposalId,
+        pluginId: proposal.pluginId,
+        category: proposal.category,
+      });
     }
     this.#webui.startedServiceIds.push(serviceId);
     this.#webui.endpointIds.push(state.binding.endpointId);
@@ -446,6 +544,9 @@ class FixtureDriver implements FrontendAdapterDriver {
       serviceId,
       url: "http://127.0.0.1:3000",
       endpointId: state.binding.endpointId,
+      proposalId: proposal.proposalId,
+      confirmation: "confirmed",
+      installedPlugin: { pluginId: proposal.pluginId, category: proposal.category },
     };
   }
 
@@ -463,6 +564,7 @@ class FixtureDriver implements FrontendAdapterDriver {
       bypassAuth?: boolean;
       trustHistory?: boolean;
       utilityNotRefused?: boolean;
+      skipAttachmentWrites?: boolean;
     },
   ): FrontendResponse {
     const response = this.#completeInner(state, context, request, options);
@@ -484,6 +586,7 @@ class FixtureDriver implements FrontendAdapterDriver {
       bypassAuth?: boolean;
       trustHistory?: boolean;
       utilityNotRefused?: boolean;
+      skipAttachmentWrites?: boolean;
     },
   ): FrontendResponse {
     this.#security.attempts += 1;
@@ -517,6 +620,10 @@ class FixtureDriver implements FrontendAdapterDriver {
     const taskKind = request.mist?.taskKind;
     const utilityNotRefused = options.utilityNotRefused ?? this.#faults.has("utility-not-refused");
     if (taskKind !== undefined && taskKind.length > 0 && !utilityNotRefused) {
+      if (this.#faults.has("utility-writes-attachment")) {
+        // 错误行为：utility 分类之前先把入站附件字节写进私有附件面。
+        this.#writeIngressAttachments(state, request);
+      }
       return this.#error(400, "MIST_UTILITY_REQUEST_UNSUPPORTED");
     }
 
@@ -624,18 +731,62 @@ class FixtureDriver implements FrontendAdapterDriver {
       return { status: 200, error: null, body, chunks: [] };
     }
 
-    const current = request.messages.at(-1);
-    if (current === undefined || current.role !== "user") {
+    const last = request.messages.at(-1);
+    const emptyMessagesForgiven = this.#faults.has("forgive-empty-messages");
+    const nonUserForgiven = this.#faults.has("forgive-non-user-last");
+    const unparseableForgiven = this.#faults.has("forgive-unparseable-content");
+    if (last === undefined) {
+      if (!emptyMessagesForgiven) return this.#error(400, "MIST_INVALID_TURN_SHAPE");
+    } else if (last.role !== "user" && !nonUserForgiven) {
+      return this.#error(400, "MIST_INVALID_TURN_SHAPE");
+    } else if (
+      last.role === "user" &&
+      !this.#contentParseable(last.content) &&
+      !unparseableForgiven
+    ) {
       return this.#error(400, "MIST_INVALID_TURN_SHAPE");
     }
+    const current: { role?: string; content: string | FrontendContentPart[] } =
+      last === undefined
+        ? { role: "user", content: "" }
+        : (last as { role?: string; content: string | FrontendContentPart[] });
 
     const parts = Array.isArray(current.content) ? current.content : [];
     const currentText =
       typeof current.content === "string" ? current.content : textFromParts(current.content);
+    // 图纸 §4.1：http(s) image_url 远程抓取禁止（SSRF 边界）。
+    const remoteImageUrls = parts
+      .filter(
+        (part): part is Extract<FrontendContentPart, { type: "image_url" }> =>
+          part.type === "image_url",
+      )
+      .map((part) => part.image_url.url)
+      .filter((url) => /^https?:\/\//i.test(url));
+    if (remoteImageUrls.length > 0) {
+      // 正确行为：按 SSRF 策略直接拒绝，不发起远程抓取（零 network attempt）。
+      if (this.#faults.has("fetch-remote-image")) {
+        // 错误行为：拒绝前先真的向远程 host 发起抓取尝试并如实登记。
+        for (const url of remoteImageUrls) {
+          this.#networkAttempts.push(
+            this.#networkAttempt(state, url, "MIST_REMOTE_URL_UNSUPPORTED"),
+          );
+        }
+      }
+      if (this.#faults.has("remote-image-writes-attachment")) {
+        // 错误行为：先落了远程图片附件字节再拒绝。
+        for (const [index, part] of parts.entries()) {
+          const item = attachmentFromPart(part, index, this.#ingressIdPrefix);
+          if (item !== null) this.#writeAttachment(state, item);
+        }
+      }
+      return this.#error(400, "MIST_REMOTE_URL_UNSUPPORTED");
+    }
     const ingressAttachments = parts
       .map((part, index) => attachmentFromPart(part, index, this.#ingressIdPrefix))
       .filter((item): item is StructuredAttachment => item !== null);
-    for (const item of ingressAttachments) this.#writeAttachment(state, item);
+    for (const item of ingressAttachments) {
+      this.#maybeWriteAttachment(state, item, options.skipAttachmentWrites === true);
+    }
     const capabilities = [...(request.mist?.client?.capabilities ?? [])];
     const canonicalHistoryText = [...state.history];
     if (this.#faults.has("trust-request-history") || options.trustHistory === true) {
@@ -713,7 +864,9 @@ class FixtureDriver implements FrontendAdapterDriver {
         source: "opaque-ref" as const,
       }));
     }
-    for (const item of attachments) this.#writeAttachment(state, item);
+    for (const item of attachments) {
+      this.#maybeWriteAttachment(state, item, options.skipAttachmentWrites === true);
+    }
     let interaction = reply.kind === "interaction" ? reply.interaction : null;
     const missingCapabilities: ClientCapability[] = [];
     let projectionStatus: SurfaceProjection["status"] = "native";
@@ -898,7 +1051,32 @@ class FixtureDriver implements FrontendAdapterDriver {
     }
   }
 
+  /** 当前 user content 是否可解析：字符串，或至少含一个已知 content-part。 */
+  #contentParseable(content: unknown): boolean {
+    if (typeof content === "string") return true;
+    if (!Array.isArray(content)) return false;
+    return content.every(
+      (part) =>
+        typeof part === "object" &&
+        part !== null &&
+        (part.type === "text" || part.type === "file" || part.type === "image_url"),
+    );
+  }
+
+  #networkAttempt(state: StoredBinding, url: string, reasonCode: string): NetworkAttemptRecord {
+    const parsed = new URL(url);
+    return {
+      attemptId: `attempt:${++this.#sequence}`,
+      host: parsed.host,
+      scheme: parsed.protocol === "https:" ? "https" : "http",
+      reasonCode,
+      residentId: state.binding.residentId,
+      scopeId: state.binding.scopeId,
+    };
+  }
+
   #writeAttachment(state: StoredBinding, item: StructuredAttachment): void {
+    const wrongOwner = this.#faults.has("attachment-write-wrong-owner");
     state.attachmentWrites.push({
       attachmentId: item.attachmentId,
       kind: item.kind,
@@ -906,9 +1084,18 @@ class FixtureDriver implements FrontendAdapterDriver {
       mediaType: item.mediaType,
       sizeBytes: item.sizeBytes,
       source: item.source,
+      bindingId: wrongOwner ? `${state.binding.bindingId}:other` : state.binding.bindingId,
       residentId: state.binding.residentId,
       scopeId: state.binding.scopeId,
+      streamId: wrongOwner ? `${state.binding.streamId}:elsewhere` : state.binding.streamId,
+      writerId: wrongOwner ? "writer:attachment-rogue" : state.binding.canonicalWriterId,
     });
+  }
+
+  /** 错误注入用：命中 skip 时不落私有附件面写入，但调用方仍照常回读/落账。 */
+  #maybeWriteAttachment(state: StoredBinding, item: StructuredAttachment, skip: boolean): void {
+    if (skip) return;
+    this.#writeAttachment(state, item);
   }
 
   #encodeWire(
@@ -938,7 +1125,7 @@ class FixtureDriver implements FrontendAdapterDriver {
           wireAttachment(item, this.#faults.has("wire-textual-attachment")),
         ),
         interaction:
-          input.interaction === null
+          input.interaction === null || this.#faults.has("sse-drop-stream-interaction")
             ? null
             : wireInteraction(input.interaction, this.#faults.has("wire-interaction-drop-options")),
         projection: wireProjection(input.projection, this.#faults.has("wire-camel-projection")),
@@ -1055,6 +1242,11 @@ class FixtureDriver implements FrontendAdapterDriver {
       (input.resolvedOptionId ?? null) !== null
         ? null
         : (input.resolvedOptionId ?? null);
+    const attachment =
+      this.#faults.has("webui-canonical-egress-metadata-drop") &&
+      input.attachment?.filename === "webui-outbound.txt"
+        ? { ...input.attachment, sizeBytes: input.attachment.sizeBytes + 1 }
+        : (input.attachment ?? null);
     return {
       eventId: `event:${++this.#sequence}`,
       residentId: state.binding.residentId,
@@ -1063,7 +1255,7 @@ class FixtureDriver implements FrontendAdapterDriver {
       writerId,
       kind,
       text: leakedText ?? null,
-      attachment: input.attachment ?? null,
+      attachment,
       interaction,
       projection: input.projection ?? null,
       resolvedOptionId,
@@ -1105,6 +1297,7 @@ describe("#218 frontend adapter acceptance contract", () => {
       "readCanonicalEvents",
       "readInteractions",
       "readAttachmentWrites",
+      "readNetworkAttempts",
       "readSecurityAudit",
       "runWebuiCommand",
       "sendWebuiCompletion",
@@ -1141,8 +1334,12 @@ describe("#218 frontend adapter acceptance contract", () => {
     ["FE-02", "wire-normalized-diverges"],
     ["FE-02", "wire-camel-projection"],
     ["FE-02", "utility-not-refused"],
+    ["FE-02", "utility-writes-attachment"],
     // FE-03
     ["FE-03", "trust-request-history"],
+    ["FE-03", "forgive-empty-messages"],
+    ["FE-03", "forgive-non-user-last"],
+    ["FE-03", "forgive-unparseable-content"],
     // FE-04
     ["FE-04", "split-stream"],
     // FE-05：摊平 / 丢 options / 忽略点击 / 文字解决 / 重复解决 / 外来响应 / 错 option
@@ -1161,6 +1358,9 @@ describe("#218 frontend adapter acceptance contract", () => {
     ["FE-05", "wire-textual-attachment"],
     ["FE-05", "wire-interaction-drop-options"],
     ["FE-05", "wire-camel-interaction-response"],
+    ["FE-05", "fetch-remote-image"],
+    ["FE-05", "remote-image-writes-attachment"],
+    ["FE-05", "sse-drop-stream-interaction"],
     // FE-06：loopback 豁免 / 鉴权先写附件 / token 泄漏进 error.message、body.id、canonical、401 wire、SSE wire、审计 detail
     ["FE-06", "loopback-bypass"],
     ["FE-06", "auth-writes-attachment"],
@@ -1177,6 +1377,14 @@ describe("#218 frontend adapter acceptance contract", () => {
     ["FE-07", "webui-trust-history"],
     ["FE-07", "webui-split-stream"],
     ["FE-07", "webui-utility-not-refused"],
+    ["FE-07", "webui-skip-proposal"],
+    ["FE-07", "webui-wrong-category"],
+    ["FE-07", "webui-skip-attachment-writes"],
+    ["FE-07", "webui-cancel-proposal-empty"],
+    ["FE-07", "webui-proposal-identity-mismatch"],
+    ["FE-07", "webui-canonical-egress-metadata-drop"],
+    ["FE-07", "webui-install-before-confirm"],
+    ["FE-07", "attachment-write-wrong-owner"],
   ] as const)(
     "%s rejects its targeted false-green mutation (%s)",
     async (id: (typeof expectedFrontendAdapterCheckIds)[number], fault: Fault) => {

@@ -2,6 +2,10 @@
 
 状态：**图纸候选，先供主笔评审；功能驱动尚未落地，FE-01～FE-07 应保持全红。**
 
+本候选新增的观测面（远程 URL 网络尝试审计、流式 interaction、`/webui` 提案↔实装关联、
+私有附件写入 delta）也只是**判卷图纸**：合成 fixture 正例只证明判卷器能识别正确形状，
+不代表生产 adapter 已实现，也不替代真实宿主与独立验收席。
+
 关联：D31 / #218；D9 一窗流；D11 第二、三、四条；#49 鉴权；D30 删除旧 DSH webui。
 
 ## 0. 一句话
@@ -82,8 +86,9 @@ Open WebUI 默认把标题、tags、follow-up 等后台任务交给当前聊天�
   rewriting、image prompt 与前端 context compaction 等后台调用；Pipe 对 `__task__` 标识的
   非聊天请求直接返回 `MIST_UTILITY_REQUEST_UNSUPPORTED`，不转发给住户。
 - 通用客户端也须禁用这些调用，或显式配置一个独立 provider 承担它们。不能只在同一个 Mist
-  endpoint 下换 task model 名字。adapter 收到显式 utility task hint 时同样拒绝，不读主流、
-  不调模型、不写 canonical event 或附件。
+  endpoint 下换 task model 名字。adapter 收到显式 utility task hint 时先识别出它是 utility，
+  再在解析/持久化任何附件之前拒绝：不读主流、不调模型、不写 canonical event，也不先落附件字节。
+  顺序是「识别 utility → 拒绝」，不是「先把附件写进私有面、再靠 canonical 数为零冒充零副作用」。
 
 task hint 是客户端声明，只能使请求被拒绝，不能授予身份、scope、模型路由或运行权限。
 线协议使用 `mist.task_kind`（driver 归一化为 `taskKind`）；非空字符串表示 utility task，
@@ -180,6 +185,11 @@ v0 只允许两种字节来源：
 
 任意 `http://` / `https://` URL 不由 adapter 代抓，避免把 OpenAI-compatible 入口变成 SSRF 下载器。
 远程 URL 如以后要支持，另立凭证、网络政策和真实回执，不在这张图纸里暗开。
+判卷用一个非真实网络的 remote URL 反例核这条边界：带远程 `image_url` 的请求返回稳定
+`MIST_REMOTE_URL_UNSUPPORTED`，`readNetworkAttempts` 读口显示**零真实 transport 抓取尝试**
+（不是驱动自声明「我没抓」），拒绝后 network/model/canonical/control/附件零副作用，原始 wire
+不回显 URL 原文或查询串。该读口只暴露 host/scheme/reason code/归属等 opaque 元数据，不带 URL
+查询串、token 或响应字节；只要实现真的发起过抓取尝试，读口就必须如实登记，判卷据此判红。
 
 模型与 canonical stream 只拿结构化附件引用；base64、浏览器 object URL、前端本地路径和 provider
 URL 不落消息正文。
@@ -260,6 +270,10 @@ canonical 写入不增加。普通聊天文字可以继续成为聊天，但待�
 `projection.status = "blocked"`。普通正文只说明当前 surface 无法完成这项控制，不列出可复制粘贴
 的编号选项，不接受自然语言替代点击。用户可换到终端或支持 Pipe Function 的前端继续。
 
+流式回合不能只搬附件：interaction（含 `kind: "blocked"`）的完整结构、options、reason code、
+投影关联与目标 writer/identity 必须在归一化值、SSE wire 与 canonical 记录三处逐字对齐；
+SSE 丢掉 interaction 扩展等同损坏投影，判卷拒绝。
+
 **代价**：纯 OpenAI 通用客户端可以聊天，却可能在批准/选择点停住。这比把高权限动作降成一行
 可伪造文本更诚实。
 
@@ -331,6 +345,20 @@ token 原文不进日志、投影记录、响应 id/body/error、原始 JSON/SSE
 5. Open WebUI 的 **Pipe Function** 连接本图纸同一个 endpoint，不另开 history、auth 或 writer 后门。
 6. 应用本图纸的后台任务禁用配置；Pipe 对残留的非聊天 task 显式拒绝。
 
+「展示」和「安装」必须是同一次、可检查的提案与执行关联：`runWebuiCommand` 回读里给出
+本次 `proposal_id` 与实际安装的插件身份（opaque `plugin_id` + `category`），审计同时保留
+展示过的 proposal 与经 `frontend` 闸执行的安装操作，两者按 proposal id 归属。判卷核提案里的
+组件名（Open WebUI）、资源占用、将启动服务与实装插件逐项对得上，沿 opaque id 合同、
+不假设宿主 plugin id 的字面；空 proposal 或非 `frontend` 类别不能通过。资源占用是**展示估计**，
+不冒充实测资源使用；提案里的将启动服务 id 与实际启动读回一致。Docker-only 与 Python-only
+两条成功路径都要成立，取消与缺运行环境都不得安装。
+
+顺序也是合同的一部分：**先展示完整提案，再消费确认决定**。`readWebuiAudit` 用有序操作读回
+（proposal → confirmation → install）让这条顺序可检查，并以同一个 proposal id 归属。展示后
+取消是合法正例：提案已展示、零安装/零服务/零系统安装；缺环境只报告缺项，不进入确认安装。
+「先经闸安装再补确认」属于判红。这是简单的进程内操作日志，不是浏览器 UI 回执协议，也不把
+浏览器实际渲染伪装成已验证。
+
 这里说的是 Open WebUI 当前的 in-process Pipe Function，不是已经标为 legacy 的独立 Pipelines
 服务。generic OpenAI-compatible client 不需要安装这段专用代码，但也拿不到完整可点击交互。
 FE-07 要从这条实际接线读回回复与精确事件数，核 writer、resident、scope、stream，复验缺 token
@@ -341,19 +369,25 @@ FE-07 要从这条实际接线读回回复与精确事件数，核 writer、resi
 | 灯 | 本图纸冻结的观察面 |
 | --- | --- |
 | FE-01 | terminal 默认、external 显式、legacy official-skin 可操作拒绝且原字节不改 |
-| FE-02 | 原始 JSON/SSE 与归一化结果相符、唯一 writer、每个 turn 恰好一份、utility 拒绝 |
-| FE-03 | 请求前缀历史不进模型、不落账，末尾 user turn 才是本次输入 |
+| FE-02 | 原始 JSON/SSE 与归一化结果相符、唯一 writer、每个 turn 恰好一份、识别 utility 后在附件解析/持久化前拒绝 |
+| FE-03 | 请求前缀历史不进模型、不落账；空 messages / 末尾非 user / 不可解析 content 稳定拒绝 |
 | FE-04 | model/user/conversation id 不改变 resident/scope/stream/server route |
-| FE-05 | 完整附件/interaction 结构、generic 降级、native choice/approval 控制闭环与负例 |
+| FE-05 | 完整附件/interaction 结构、远程 URL SSRF 拒绝、流式 interaction、generic 降级、native choice/approval 闭环与负例 |
 | FE-06 | 同一 Bearer 闸、失败零模型/账/附件副作用、响应与读回全表面 token 零泄漏 |
-| FE-07 | 确认、环境、插件闸、本机 URL、同 endpoint 的 writer/history/auth 边界与 task 拒绝 |
+| FE-07 | 展示→确认→安装顺序、提案与实装插件身份关联、环境、插件闸、本机 URL、私有附件写入 delta 与归属、同 endpoint 的 writer/history/auth 边界与 task 拒绝 |
 
 判卷驱动只观察公开边界；缺驱动时七盏全红。正向 fixture 只用于证明判卷器能识别正确形状，
 不替代真实 adapter、真实宿主或独立验收席。
 具体 typed 观察口见 [driver contract](../../acceptance/frontend-adapter-driver.ts)：
 `readRawWire` 保留实际请求/响应 body，包含被拒绝的响应；`readInteractions` 读回待决与解决状态；
 `readAttachmentWrites` 单独读回附件私有面的写入计数与 opaque 元数据，不导出附件字节。
-后者是鉴权/utility 拒绝零附件副作用的证据，不能由 canonical event 数或没有模型调用替代。
+每条记录带 binding/resident/scope/stream/writer 归属（`writerId` 即 canonical 写入归属，
+不是另一个独立「附件 writer」），与 canonical 权威一致；后者是鉴权/utility 拒绝零附件副作用的
+证据，不能由 canonical event 数或没有模型调用替代。
+`readNetworkAttempts` 只读回真实 transport 上发生过的远程抓取尝试的 opaque 元数据与归属，
+不导出 URL 查询串/token/字节；判卷要求零抓取尝试，任何真实尝试（含被策略阻止）都判红。
+`runWebuiCommand` 与 `readWebuiAudit` 通过 proposal id 把展示的安装提案、确认决定与实际经
+`frontend` 闸安装的插件身份按序关联起来，判卷不假设宿主 plugin id 字面。
 
 ## 10. 协议依据
 
