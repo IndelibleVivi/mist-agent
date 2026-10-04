@@ -2,9 +2,12 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
+import type { BreathTrigger } from "../../acceptance/resident-runtime-driver.ts";
 import type { ResidentIdentityFailureReason } from "../resident-continuity/identity-store.ts";
+import { parseManualBreath } from "../session/breath-trigger.ts";
+import { assembleResidentRuntime } from "./assembly.ts";
+import type { ModelTransport } from "./channels.ts";
 import { CredentialStore } from "./credentials.ts";
-import { ResidentRuntime } from "./runtime.ts";
 import { ResidentChatTui } from "./tui.ts";
 
 /** 身份闸拒绝在终端边界的人话 message：保持与 runtime identityFailure 同一口径。 */
@@ -34,6 +37,29 @@ interface ResidentCliOptions {
   readonly help: boolean;
 }
 
+/**
+ * 一条 CLI 输入的去向。命令不是发言（MV-D03）：`/new`、`/clear`、`/compact`
+ * 走换气流程，绝不落进 `say()`，否则命令会被模型当成住户说的一句话。
+ */
+export type ResidentCliInput =
+  | { readonly kind: "exit" }
+  | { readonly kind: "breathe"; readonly via: BreathTrigger }
+  | { readonly kind: "chat"; readonly text: string };
+
+/**
+ * 把一行真实 CLI 输入分派到出口。`/exit` 是本层唯一的退出命令；三个换气命令
+ * 经现役 `parseManualBreath` 归一（大小写、首尾空白、带参数形式同义），转成
+ * 换气 `via`——D8 三个入口同一条流程，不在这里另认一套命令表。
+ */
+export function parseResidentCliInput(line: string): ResidentCliInput {
+  if (line.trim() === "/exit") return { kind: "exit" };
+  const trigger = parseManualBreath(line);
+  if (trigger !== null && trigger.command !== null) {
+    return { kind: "breathe", via: trigger.command.slice(1) as BreathTrigger };
+  }
+  return { kind: "chat", text: line };
+}
+
 export function parseResidentCliArguments(args: readonly string[]): ResidentCliOptions {
   let residentId: string | undefined;
   let dataDir = process.env.MIST_DATA_DIR ?? join(homedir(), ".mist");
@@ -61,17 +87,26 @@ export function parseResidentCliArguments(args: readonly string[]): ResidentCliO
   return { residentId: residentId ?? "", dataDir: resolve(dataDir), help };
 }
 
-export async function main(args = process.argv.slice(2)): Promise<void> {
+export async function main(
+  args = process.argv.slice(2),
+  injection: { transport?: ModelTransport } = {},
+): Promise<void> {
   const options = parseResidentCliArguments(args);
   if (options.help) {
     process.stdout.write(
       "Usage: npm run resident -- --resident <residentId> [--data-dir <path>]\n",
     );
     process.stdout.write("Type /exit to leave the single-resident chat.\n");
+    process.stdout.write(
+      "Type /new, /clear or /compact to breathe (commit a handover letter, start a new generation).\n",
+    );
     return;
   }
 
-  const runtime = new ResidentRuntime({ dataDir: options.dataDir });
+  const runtime = assembleResidentRuntime({
+    dataDir: options.dataDir,
+    ...(injection.transport === undefined ? {} : { transport: injection.transport }),
+  });
   try {
     // CLI 是宿主边界：candidateId 只在这里 resolve 一次，之后一律用 canonical
     // residentId。身份闸（D22 / #182）先于凭证面成立——安装器只保存了配置，没有
@@ -112,12 +147,18 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       tui.start();
       process.stdout.write("输入 /exit 结束。\n你> ");
       for await (const line of input) {
-        if (line.trim() === "/exit") break;
+        const command = parseResidentCliInput(line);
+        if (command.kind === "exit") break;
         if (line.trim().length === 0) {
           process.stdout.write("\n你> ");
           continue;
         }
-        await tui.submit(line);
+        if (command.kind === "breathe") {
+          // 换气命令不是发言：走 D8 的统一流程，绝不落进 say()。
+          await tui.breathe(command.via);
+        } else {
+          await tui.submit(command.text);
+        }
         process.stdout.write("\n你> ");
       }
     } finally {
