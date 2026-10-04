@@ -40,9 +40,11 @@ Bearer token ref
 
 ### `POST /v1/chat/completions`
 
-这是 FE-02 的必需对话口子。请求可带完整 `messages`，但 adapter 只消费**数组最后一项、且该项
-必须是 `role: "user"`**，作为本次新 turn。最后一项不是 user、messages 为空、或当前 user
-content 无法解析时，返回 OpenAI 风格错误包，code 为 `MIST_INVALID_TURN_SHAPE`。
+这是 FE-02 的必需对话口子。鉴权之后先区分普通聊天、显式 utility task 与 interaction response。
+普通聊天请求可带完整 `messages`，但 adapter 只消费**数组最后一项、且该项必须是
+`role: "user"`**，作为本次新 turn。最后一项不是 user、messages 为空、或当前 user content
+无法解析时，返回 OpenAI 风格错误包，code 为 `MIST_INVALID_TURN_SHAPE`。
+utility task 与 interaction response 都不能借这个形状被自动解释成一条新用户话语。
 
 最后一项之前的所有 messages：
 
@@ -59,13 +61,52 @@ content 无法解析时，返回 OpenAI 风格错误包，code 为 `MIST_INVALID
 
 ### `GET /v1/models`
 
-OpenAI-compatible client 可不经 Pipe Function 直接接 FE-02；为减少手填 model id，功能实现宜提供
+在禁用本节下述后台任务后，OpenAI-compatible client 可不经 Pipe Function 直接接 FE-02；
+为减少手填 model id，功能实现宜提供
 同一 Bearer 闸后的 model discovery。它最多暴露当前 binding 的一个 server-owned model id，不能
 列出住户名、scope、provider 凭证或其他 binding。请求里的 `model` 仍不取得路由权。
 
 这不是第八盏灯：Open WebUI 可以通过 allowlist 或 Pipe Function 指定 model id，现有 FE-02 也不以
 `/v1/models` 是否存在申绿。若主笔决定把 discovery 升成必需面，应在写功能前把它加进 FE-02
 驱动，而不是实现后补测试。
+
+### 前端后台任务不进主流
+
+Open WebUI 默认把标题、tags、follow-up 等后台任务交给当前聊天模型；标题请求本身也是一个
+`role: "user"` completion。只丢弃前缀 history 不能识别它，切换请求里的 `model` 也不能隔离它：
+同一 binding 的 server-owned route 不随客户端字段改变。
+
+本候选不提供第二条 utility 模型路由。接入要同时守住两个边界：
+
+- `/webui` 安装配置禁用会发往 Mist 的标题、tags、follow-up、autocomplete、检索/搜索 query
+  rewriting、image prompt 与前端 context compaction 等后台调用；Pipe 对 `__task__` 标识的
+  非聊天请求直接返回 `MIST_UTILITY_REQUEST_UNSUPPORTED`，不转发给住户。
+- 通用客户端也须禁用这些调用，或显式配置一个独立 provider 承担它们。不能只在同一个 Mist
+  endpoint 下换 task model 名字。adapter 收到显式 utility task hint 时同样拒绝，不读主流、
+  不调模型、不写 canonical event 或附件。
+
+task hint 是客户端声明，只能使请求被拒绝，不能授予身份、scope、模型路由或运行权限。
+线协议使用 `mist.task_kind`（driver 归一化为 `taskKind`）；非空字符串表示 utility task，
+例如 `"title_generation"`。缺失或空串不作 utility 声明。它不是 OpenAI 标准字段。
+未声明的普通 user 请求与未标记的 utility prompt 无法可靠区分；adapter 不靠 prompt 关键词猜。
+因此，正确的前端配置是 generic 接入的前提，不把它包装成服务端已经证明的用户意图。
+
+```mermaid
+flowchart LR
+  W[Open WebUI] --> P{Pipe 请求类别}
+  P -->|非聊天 task| X[显式拒绝：零住户调用 / 零主流写入]
+  P -->|聊天或交互响应| A[同一 adapter / Bearer 闸]
+  G[通用前端：禁用后台任务] --> A
+  A -->|显式 utility hint| X
+  A -->|聊天| R[canonical history / 住户回合]
+  A -->|交互响应| I[核验待决 interaction / 控制状态]
+  R --> C[唯一 canonical writer]
+  I --> C
+```
+
+**代价**：接 Mist 的 Open WebUI 默认没有模型自动起标题、标签和 follow-up；想保留这些体验，
+用户要另配独立 provider。没有 task hint 的通用客户端不能由服务端自动排除后台 prompt。
+这项限制必须进入对接说明，不能等主流被污染后再提醒。
 
 ## 3. 普通消息
 
@@ -81,7 +122,7 @@ OpenAI-compatible client 可不经 Pipe Function 直接接 FE-02；为减少手�
 }
 ```
 
-普通回复保持 Chat Completions 可读形状；实现可同时提供非流式与 SSE 流式投影。两种投影都必须
+普通回复保持 Chat Completions 可读形状；FE-02 同时冻结非流式与 SSE 流式投影。两种投影都必须
 来自同一回合结果：流式 chunks 拼回的正文与非流式完整正文一致，canonical writer 只落一次
 user event 与一次 assistant event，不能一边 streaming 一边重复写账。
 
@@ -90,13 +131,19 @@ user event 与一次 assistant event，不能一边 streaming 一边重复写账
 ```json
 {
   "id": "chatcmpl_mist_...",
+  "object": "chat.completion",
+  "created": 1791061200,
   "model": "mist:<server-route>",
-  "choices": [{ "message": { "role": "assistant", "content": "..." } }],
+  "choices": [{
+    "index": 0,
+    "message": { "role": "assistant", "content": "..." },
+    "finish_reason": "stop"
+  }],
   "mist": {
     "stream_id": "...",
     "attachments": [],
     "interaction": null,
-    "delivery": {
+    "projection": {
       "status": "native",
       "missing_capabilities": [],
       "canonical_event_ids": ["..."]
@@ -106,6 +153,15 @@ user event 与一次 assistant event，不能一边 streaming 一边重复写账
 ```
 
 未知扩展字段会被普通客户端忽略；Open WebUI Pipe Function 可以读取完整 `mist` 段。
+
+SSE 使用 `data: <JSON>` 帧；数据对象为 `chat.completion.chunk`，共享同一 id 与 server-owned
+model，经 `choices[0].delta` 发出 assistant role 和 content，结束帧给 `finish_reason: "stop"`，
+最后恰好一个 `data: [DONE]`。流中也要保留附件、interaction 与 projection 扩展，不能只让
+非流式路径拥有结构。公开 CI 可以用合成 transport 返回原始字节；判卷先核原始 JSON/SSE，
+再比其正文与结构化扩展是否和归一化观察值一致，不能让 driver 用私有形状替换损坏的 wire。
+
+**代价**：driver 多一个原始 transport 观察面，fixture 也必须产出真实协议形状；代价换来的是
+判卷能够拒绝“内部往返成功、普通前端却读不懂”的 serializer。
 
 ## 4. 附件
 
@@ -145,7 +201,7 @@ assistant 侧附件放在 `mist.attachments[]`，每项至少包含：
 
 附件不是 markdown 假链接、`[attachment]` 文本标记或内联 base64。client 声明 `attachments`
 capability 时，adapter 选择 native projection；未声明时仍保留结构化对象，并把
-`delivery.status` 设为 `degraded`、`missing_capabilities` 写入 `attachments`。正文只能给出诚实的
+`projection.status` 设为 `degraded`、`missing_capabilities` 写入 `attachments`。正文只能给出诚实的
 可见性说明，不能把附件内容伪装成已呈现。
 
 ## 5. 选项、批准与阻断
@@ -168,10 +224,14 @@ capability 时，adapter 选择 native projection；未声明时仍保留结构�
 }
 ```
 
-支持交互的 Pipe Function 用请求扩展提交：
+支持交互的 Pipe Function 用请求扩展提交控制响应，`messages` 为空即可；不要求为点击捏造一个
+user turn，也不消费客户端重放的 history：
 
 ```json
 {
+  "model": "任意兼容占位值",
+  "stream": false,
+  "messages": [],
   "mist": {
     "interaction_response": {
       "interaction_id": "...",
@@ -184,8 +244,20 @@ capability 时，adapter 选择 native projection；未声明时仍保留结构�
 服务端按 interaction id、现行住户/scope、未解决状态与 option id 逐项核验。普通 user 文本永远
 不能被猜成「点了某个按钮」。
 
+choice 与 approval 的 native 路径都必须可完成：未解决状态保留原始 prompt、kind、blocking、
+option id/label/description 与 reason code；合法控制响应只解决对应 binding 的待决项，恰好
+记录一次可归属的控制结果，保留 interaction id 与被选中的 option id，不作为普通
+user/assistant 对话调用模型。已解决项不可再次消费。
+错误 interaction id、错误 option、跨 binding/scope 响应与重复响应均拒绝，控制状态与模型、
+canonical 写入不增加。普通聊天文字可以继续成为聊天，但待决 blocking 动作不能因此解除，
+也不能把文字猜成点击。
+判卷须读回 pending/resolved 状态与实际选择，不能只看一份返回对象自称成功。
+上述控制拒绝使用稳定 code `MIST_INTERACTION_RESPONSE_INVALID`。合法结果的 canonical 事件
+保留完整 interaction 和选中 option；driver 的 `resolvedOptionId` 与耐久状态的
+`resolutionEventId` 对应同一次追加，不能多写、错户或只在响应中自称解决。
+
 不声明 `interactions` capability 的通用前端仍收到结构化 interaction，但
-`delivery.status = "blocked"`。普通正文只说明当前 surface 无法完成这项控制，不列出可复制粘贴
+`projection.status = "blocked"`。普通正文只说明当前 surface 无法完成这项控制，不列出可复制粘贴
 的编号选项，不接受自然语言替代点击。用户可换到终端或支持 Pipe Function 的前端继续。
 
 **代价**：纯 OpenAI 通用客户端可以聊天，却可能在批准/选择点停住。这比把高权限动作降成一行
@@ -217,8 +289,8 @@ canonical 事件。下一轮住户可以知道 adapter 当时采取了哪种投�
 这条记录**不能证明浏览器最终真的渲染成功**。Chat Completions 响应没有客户端确认通道；把
 capability claim 或「响应已经写出 socket」叫成 UI delivery receipt，会越过实际证据。若以后
 Open WebUI Pipe Function 要回传真实呈现结果，必须另立带 request/event id 的 acknowledgment，
-与当前 `delivery` 对象和 `surface-receipt` 事件分开。当前名字只保留 PR1 早期判卷兼容，语义统一
-解释为 projection decision。它不是用户话语，也不拼进 assistant 正文。
+与当前 `projection` 对象和 `surface-projection` 事件分开。图纸候选统一使用投影命名，
+不保留没有实际调用方的早期回执别名。它不是用户话语，也不拼进 assistant 正文。
 
 ## 7. 鉴权、网络与错误
 
@@ -242,8 +314,11 @@ Open WebUI Pipe Function 要回传真实呈现结果，必须另立带 request/e
 }
 ```
 
-token 原文不进日志、投影记录、stream、诊断导出或错误 message。鉴权审计只记请求 id、来源类别、
-结果 code 与时间。
+token 原文不进日志、投影记录、响应 id/body/error、原始 JSON/SSE、诊断导出或错误 message。
+判卷同时扫描普通及 SSE 成功响应、401 原始响应、模型与 canonical/交互/附件元数据读回和审计；
+失败诊断同样不打印已发现的 token。raw transport 的请求观察只保留 body，不复制 Authorization。
+鉴权审计只记请求 id、来源类别、结果 code 与时间。带附件的未认证请求也必须先拒绝，
+附件私有面不能先落字节再靠 canonical event 数为零冒充“零副作用”。
 
 ## 8. `/webui` 的接缝
 
@@ -254,21 +329,35 @@ token 原文不进日志、投影记录、stream、诊断导出或错误 message
 3. 走现有 `frontend` 插件安装闸；
 4. 启动后打印本机 URL；
 5. Open WebUI 的 **Pipe Function** 连接本图纸同一个 endpoint，不另开 history、auth 或 writer 后门。
+6. 应用本图纸的后台任务禁用配置；Pipe 对残留的非聊天 task 显式拒绝。
 
 这里说的是 Open WebUI 当前的 in-process Pipe Function，不是已经标为 legacy 的独立 Pipelines
 服务。generic OpenAI-compatible client 不需要安装这段专用代码，但也拿不到完整可点击交互。
+FE-07 要从这条实际接线读回回复与精确事件数，核 writer、resident、scope、stream，复验缺 token
+与伪造 history 的拒绝/丢弃，不只比较 endpoint 标签或“文字出现在某处”。
 
 ## 9. 可执行判卷映射
 
 | 灯 | 本图纸冻结的观察面 |
 | --- | --- |
 | FE-01 | terminal 默认、external 显式、legacy official-skin 可操作拒绝且原字节不改 |
-| FE-02 | 普通/流式往返，同一结果、唯一 writer、每个 turn 恰好一份 |
+| FE-02 | 原始 JSON/SSE 与归一化结果相符、唯一 writer、每个 turn 恰好一份、utility 拒绝 |
 | FE-03 | 请求前缀历史不进模型、不落账，末尾 user turn 才是本次输入 |
 | FE-04 | model/user/conversation id 不改变 resident/scope/stream/server route |
-| FE-05 | 附件与 interaction 保留结构，generic surface 有 capability claim 与投影决策 |
-| FE-06 | 远端/loopback 同一 Bearer 闸；失败零副作用、token 零泄漏 |
-| FE-07 | `/webui` 确认、环境探测、插件闸、URL 与同 endpoint 复用 |
+| FE-05 | 完整附件/interaction 结构、generic 降级、native choice/approval 控制闭环与负例 |
+| FE-06 | 同一 Bearer 闸、失败零模型/账/附件副作用、响应与读回全表面 token 零泄漏 |
+| FE-07 | 确认、环境、插件闸、本机 URL、同 endpoint 的 writer/history/auth 边界与 task 拒绝 |
 
 判卷驱动只观察公开边界；缺驱动时七盏全红。正向 fixture 只用于证明判卷器能识别正确形状，
 不替代真实 adapter、真实宿主或独立验收席。
+具体 typed 观察口见 [driver contract](../../acceptance/frontend-adapter-driver.ts)：
+`readRawWire` 保留实际请求/响应 body，包含被拒绝的响应；`readInteractions` 读回待决与解决状态；
+`readAttachmentWrites` 单独读回附件私有面的写入计数与 opaque 元数据，不导出附件字节。
+后者是鉴权/utility 拒绝零附件副作用的证据，不能由 canonical event 数或没有模型调用替代。
+
+## 10. 协议依据
+
+2026-10-04 查阅：[Chat Completions 与 streaming chunk 对象](https://developers.openai.com/api/reference/resources/chat)、
+[Open WebUI Task Models](https://docs.openwebui.com/features/administration/task-models/)、
+[Pipe Function 保留参数](https://docs.openwebui.com/features/extensibility/plugin/functions/pipe/)。
+这些资料说明第三方协议与后台任务行为，不替代主笔对本图纸的评审或真实 Open WebUI 验证。

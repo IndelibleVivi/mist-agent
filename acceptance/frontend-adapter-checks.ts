@@ -7,14 +7,28 @@ import type {
   FrontendAdapterDriver,
   FrontendChatRequest,
   FrontendCompletionBody,
+  FrontendRequestContext,
   FrontendResponse,
+  InteractionReadback,
   StructuredAttachment,
   StructuredInteraction,
+  StructuredInteractionOption,
+  SurfaceProjection,
 } from "./frontend-adapter-driver.ts";
 
 const pass = (detail: string): FrontendAdapterCheckResult => ({ passed: true, detail });
 const fail = (detail: string): FrontendAdapterCheckResult => ({ passed: false, detail });
 const json = (value: unknown): string => JSON.stringify(value);
+
+/** 失败 detail 不许把 token 原文带进判卷输出；合成 token 同样按敏感处理。 */
+function redact(text: string, secrets: readonly string[]): string {
+  let out = text;
+  for (const secret of secrets) {
+    if (secret.length === 0) continue;
+    out = out.split(secret).join("[redacted]");
+  }
+  return out;
+}
 
 function request(
   text: string,
@@ -23,24 +37,36 @@ function request(
     stream?: boolean;
     history?: FrontendChatRequest["messages"];
     capabilities?: ClientCapability[];
+    interactionResponse?: { interactionId: string; optionId: string };
+    taskKind?: string;
+    /**
+     * 控制响应（点击/批准）不捏造 user turn：`messages` 为空、只带 `mist.interaction_response`。
+     * 它不是一条聊天话语，不许调用模型或落 user/assistant 事件。
+     */
+    controlOnly?: boolean;
   } = {},
 ): FrontendChatRequest {
+  const mist: NonNullable<FrontendChatRequest["mist"]> = {
+    client: {
+      surface: "acceptance-fixture",
+      capabilities: input.capabilities ?? [],
+    },
+  };
+  if (input.interactionResponse !== undefined) mist.interactionResponse = input.interactionResponse;
+  if (input.taskKind !== undefined) mist.taskKind = input.taskKind;
   return {
     model: input.model ?? "client-selected-model",
     stream: input.stream ?? false,
-    messages: [
-      ...(input.history ?? []),
-      {
-        role: "user",
-        content: text,
-      },
-    ],
-    mist: {
-      client: {
-        surface: "acceptance-fixture",
-        capabilities: input.capabilities ?? [],
-      },
-    },
+    messages: input.controlOnly
+      ? [...(input.history ?? [])]
+      : [
+          ...(input.history ?? []),
+          {
+            role: "user",
+            content: text,
+          },
+        ],
+    mist,
   };
 }
 
@@ -75,10 +101,13 @@ function attachment(label: string): StructuredAttachment {
   };
 }
 
-function interaction(label: string): StructuredInteraction {
+function interaction(
+  label: string,
+  kind: StructuredInteraction["kind"] = "choice",
+): StructuredInteraction {
   return {
     interactionId: `interaction:${label}`,
-    kind: "choice",
+    kind,
     prompt: `Choose ${label}`,
     blocking: true,
     options: [
@@ -95,6 +124,244 @@ async function binding(driver: FrontendAdapterDriver, label: string): Promise<Ad
     scopeId: `scope:${label}`,
     label,
   });
+}
+
+function sameInteraction(
+  readback: InteractionReadback | undefined,
+  expected: StructuredInteraction,
+): boolean {
+  if (readback === undefined) return false;
+  return (
+    readback.interactionId === expected.interactionId &&
+    readback.kind === expected.kind &&
+    readback.prompt === expected.prompt &&
+    readback.blocking === expected.blocking &&
+    readback.reasonCode === expected.reasonCode &&
+    json(readback.options) === json(expected.options)
+  );
+}
+
+/**
+ * 判卷自己的极简 OpenAI wire 解析器。**故意不与被测驱动共享生成代码**：
+ * 驱动写 wire，判卷独立读 wire，两边各自实现，避免「用同一 helper 生成 oracle 又解析实际值」。
+ */
+interface ParsedJsonEnvelope {
+  id: string;
+  object: string;
+  model: string;
+  choices: Array<{
+    index: number;
+    message?: { role?: string; content?: unknown };
+    delta?: { role?: string; content?: unknown };
+    finish_reason?: unknown;
+  }>;
+  mist: Record<string, unknown>;
+}
+
+function parseJsonEnvelope(raw: string): ParsedJsonEnvelope | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const envelope = parsed as Record<string, unknown>;
+  if (typeof envelope.id !== "string" || typeof envelope.object !== "string") return null;
+  if (!Number.isInteger(envelope.created) || (envelope.created as number) < 0) return null;
+  if (typeof envelope.model !== "string" || !Array.isArray(envelope.choices)) return null;
+  const mist = (
+    typeof envelope.mist === "object" && envelope.mist !== null ? envelope.mist : {}
+  ) as Record<string, unknown>;
+  return {
+    id: envelope.id,
+    object: envelope.object,
+    model: envelope.model,
+    choices: envelope.choices as ParsedJsonEnvelope["choices"],
+    mist,
+  };
+}
+
+interface ParsedSse {
+  frames: ParsedJsonEnvelope[];
+  doneCount: number;
+  malformedCount: number;
+}
+
+function parseSse(raw: string): ParsedSse {
+  const frames: ParsedJsonEnvelope[] = [];
+  let doneCount = 0;
+  let malformedCount = 0;
+  // SSE 空行才会派发事件；逐行解析会误认没有分帧的多个 JSON 为正常流。
+  const blocks = raw.replace(/\r\n?/g, "\n").split("\n\n");
+  if (blocks.pop()?.trim()) malformedCount += 1;
+  let finished = false;
+  for (const block of blocks) {
+    const payload = block
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice("data:".length).trimStart())
+      .join("\n");
+    if (payload.length === 0) continue;
+    if (finished) malformedCount += 1;
+    if (payload === "[DONE]") {
+      doneCount += 1;
+      finished = true;
+      continue;
+    }
+    const parsed = parseJsonEnvelope(payload);
+    if (parsed === null) malformedCount += 1;
+    else frames.push(parsed);
+  }
+  return { frames, doneCount, malformedCount };
+}
+
+function jsonContent(value: unknown): string | null {
+  if (typeof value === "string") return value;
+  return null;
+}
+
+/**
+ * 线协议用 snake_case；判卷把 `mist` 扩展的原始形状解析回归一化类型再比对，
+ * 这样「归一化对象自洽」骗不过「wire 字段名/结构被换掉」。
+ */
+function wireProjection(value: unknown): SurfaceProjection | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  const status = record.status;
+  if (status !== "native" && status !== "degraded" && status !== "blocked") return null;
+  const missing = Array.isArray(record.missing_capabilities) ? record.missing_capabilities : [];
+  const ids = Array.isArray(record.canonical_event_ids) ? record.canonical_event_ids : [];
+  return {
+    status,
+    missingCapabilities: missing.filter(
+      (item): item is ClientCapability => item === "attachments" || item === "interactions",
+    ),
+    canonicalEventIds: ids.filter((item): item is string => typeof item === "string"),
+  };
+}
+
+function wireAttachments(value: unknown): StructuredAttachment[] | null {
+  if (!Array.isArray(value)) return null;
+  const out: StructuredAttachment[] = [];
+  for (const item of value) {
+    if (typeof item !== "object" || item === null) return null;
+    const record = item as Record<string, unknown>;
+    if (
+      typeof record.attachment_id !== "string" ||
+      (record.kind !== "image" && record.kind !== "file") ||
+      typeof record.filename !== "string" ||
+      typeof record.media_type !== "string" ||
+      typeof record.size_bytes !== "number" ||
+      (record.source !== "inline" && record.source !== "opaque-ref")
+    ) {
+      return null;
+    }
+    out.push({
+      attachmentId: record.attachment_id,
+      kind: record.kind,
+      filename: record.filename,
+      mediaType: record.media_type,
+      sizeBytes: record.size_bytes,
+      source: record.source,
+    });
+  }
+  return out;
+}
+
+function wireInteraction(value: unknown): StructuredInteraction | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.interaction_id !== "string" ||
+    (record.kind !== "choice" && record.kind !== "approval" && record.kind !== "blocked") ||
+    typeof record.prompt !== "string" ||
+    record.blocking !== true ||
+    !Array.isArray(record.options)
+  ) {
+    return null;
+  }
+  const options: StructuredInteractionOption[] = [];
+  for (const option of record.options) {
+    if (typeof option !== "object" || option === null) return null;
+    const item = option as Record<string, unknown>;
+    if (
+      typeof item.option_id !== "string" ||
+      typeof item.label !== "string" ||
+      (item.description !== null && typeof item.description !== "string")
+    ) {
+      return null;
+    }
+    options.push({
+      optionId: item.option_id,
+      label: item.label,
+      description: item.description,
+    });
+  }
+  return {
+    interactionId: record.interaction_id,
+    kind: record.kind,
+    prompt: record.prompt,
+    blocking: true,
+    options,
+    reasonCode: typeof record.reason_code === "string" ? record.reason_code : null,
+  };
+}
+
+function sameAttachment(
+  left: StructuredAttachment | null | undefined,
+  right: StructuredAttachment,
+): boolean {
+  if (left === null || left === undefined) return false;
+  return (
+    left.attachmentId === right.attachmentId &&
+    left.kind === right.kind &&
+    left.filename === right.filename &&
+    left.mediaType === right.mediaType &&
+    left.sizeBytes === right.sizeBytes &&
+    left.source === right.source
+  );
+}
+
+/** 解析控制响应原始请求体，返回 snake_case 的 interaction_response（缺失返回 undefined）。 */
+function requestInteractionResponse(
+  raw: string,
+): { interaction_id: string; option_id: string } | "missing" | "malformed" {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return "malformed";
+  }
+  if (typeof parsed !== "object" || parsed === null) return "malformed";
+  const mist = (parsed as Record<string, unknown>).mist;
+  if (typeof mist !== "object" || mist === null) return "missing";
+  const response = (mist as Record<string, unknown>).interaction_response;
+  if (response === null || response === undefined) return "missing";
+  if (typeof response !== "object") return "malformed";
+  const record = response as Record<string, unknown>;
+  if (typeof record.interaction_id !== "string" || typeof record.option_id !== "string") {
+    return "malformed";
+  }
+  return { interaction_id: record.interaction_id, option_id: record.option_id };
+}
+
+interface RawRequestBodyShape {
+  messages?: Array<{ role?: string; content?: unknown }>;
+}
+
+/** 请求体末尾必须还是本次当前 user turn；解析失败返回 null。 */
+function lastRequestMessage(raw: string): { role?: string; content?: unknown } | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const messages = (parsed as RawRequestBodyShape).messages;
+  if (!Array.isArray(messages)) return null;
+  return messages.at(-1) ?? null;
 }
 
 const fe01: FrontendAdapterCheck = {
@@ -152,14 +419,21 @@ const fe02: FrontendAdapterCheck = {
     "seedCanonicalHistory",
     "queueResidentReply",
     "sendCompletion",
+    "readRawWire",
+    "readModelTurns",
     "readCanonicalEvents",
+    "readAttachmentWrites",
     "reset",
   ],
   async run(driver) {
     try {
       const target = await binding(driver, "fe02");
       await driver.seedCanonicalHistory(target.bindingId, ["seed:user", "seed:assistant"]);
-      await driver.queueResidentReply(target.bindingId, { kind: "text", text: "reply:plain" });
+      const seededCount = (await driver.readCanonicalEvents(target.bindingId)).length;
+
+      // —— 普通（非流式）往返 ——
+      const plainText = "reply:plain";
+      await driver.queueResidentReply(target.bindingId, { kind: "text", text: plainText });
       const plain = await driver.sendCompletion(
         target.bindingId,
         authorized(target),
@@ -168,14 +442,60 @@ const fe02: FrontendAdapterCheck = {
       const plainBody = bodyOf(plain);
       if (
         plainBody === null ||
-        plainBody.text !== "reply:plain" ||
+        plainBody.text !== plainText ||
         plainBody.model !== target.serverModel ||
         plainBody.streamId !== target.streamId
       ) {
         return fail(`普通往返不成立：${json(plain)}`);
       }
+      if (
+        plainBody.projection.status !== "native" ||
+        plainBody.projection.missingCapabilities.length !== 0 ||
+        plainBody.attachments.length !== 0 ||
+        plainBody.interaction !== null
+      ) {
+        return fail(`普通回复的投影/附件/交互形状不对：${json(plainBody)}`);
+      }
 
-      await driver.queueResidentReply(target.bindingId, { kind: "text", text: "reply:stream" });
+      const plainWire = (await driver.readRawWire(target.bindingId)).at(-1);
+      if (plainWire === undefined || plainWire.responseKind !== "json") {
+        return fail(`普通回复没有原始 JSON wire：${json(plainWire)}`);
+      }
+      const envelope = parseJsonEnvelope(plainWire.responseBody);
+      if (envelope === null || envelope.object !== "chat.completion") {
+        return fail(`普通回复不是标准 completion envelope：${plainWire.responseBody}`);
+      }
+      const choice = envelope.choices[0];
+      if (
+        envelope.id !== plainBody.id ||
+        envelope.model !== target.serverModel ||
+        envelope.choices.length !== 1 ||
+        choice?.index !== 0 ||
+        choice.message?.role !== "assistant" ||
+        jsonContent(choice.message?.content) !== plainBody.text ||
+        choice.finish_reason !== "stop"
+      ) {
+        return fail(
+          `归一化正文与 wire 不对应或 envelope/choices 形状不对：${plainWire.responseBody}`,
+        );
+      }
+      if (
+        envelope.mist.stream_id !== plainBody.streamId ||
+        envelope.mist.stream_id !== target.streamId ||
+        json(wireAttachments(envelope.mist.attachments)) !== json(plainBody.attachments) ||
+        envelope.mist.interaction !== null ||
+        json(wireProjection(envelope.mist.projection)) !== json(plainBody.projection)
+      ) {
+        return fail(`普通回复的 mist 扩展与归一化值不对应：${plainWire.responseBody}`);
+      }
+      const lastMessage = lastRequestMessage(plainWire.requestBody);
+      if (lastMessage?.role !== "user" || jsonContent(lastMessage.content) !== "turn:plain") {
+        return fail(`请求体末尾不是当前 user turn：${plainWire.requestBody}`);
+      }
+
+      // —— 流式往返 ——
+      const streamText = "reply:stream";
+      await driver.queueResidentReply(target.bindingId, { kind: "text", text: streamText });
       const streamed = await driver.sendCompletion(
         target.bindingId,
         authorized(target),
@@ -186,25 +506,115 @@ const fe02: FrontendAdapterCheck = {
       const doneCount = streamed.chunks.filter((chunk) => chunk.done).length;
       if (
         streamedBody === null ||
-        streamedBody.text !== "reply:stream" ||
-        reconstructed !== "reply:stream" ||
+        streamedBody.text !== streamText ||
+        reconstructed !== streamText ||
         doneCount !== 1
       ) {
         return fail(`流式投影没有重建同一完整回复：${json(streamed)}`);
       }
 
+      const streamWire = (await driver.readRawWire(target.bindingId)).at(-1);
+      if (streamWire === undefined || streamWire.responseKind !== "sse") {
+        return fail(`流式回复没有原始 SSE wire：${json(streamWire)}`);
+      }
+      const sse = parseSse(streamWire.responseBody);
+      if (sse.malformedCount !== 0 || sse.doneCount !== 1) {
+        return fail(`SSE 分词或 [DONE] 不唯一：${streamWire.responseBody}`);
+      }
+      const terminal = sse.frames.filter((frame) => frame.choices[0]?.finish_reason != null);
+      if (terminal.length !== 1 || terminal[0]?.choices[0]?.finish_reason !== "stop") {
+        return fail(`SSE 的 finish_reason 不是恰好一次 stop：${streamWire.responseBody}`);
+      }
+      const streamDelta = sse.frames
+        .map((frame) => jsonContent(frame.choices[0]?.delta?.content) ?? "")
+        .join("");
+      if (
+        streamDelta !== streamedBody.text ||
+        !sse.frames.some((frame) => frame.choices[0]?.delta?.role === "assistant") ||
+        terminal[0] !== sse.frames.at(-1) ||
+        sse.frames.some(
+          (frame) =>
+            frame.object !== "chat.completion.chunk" ||
+            frame.model !== target.serverModel ||
+            frame.id !== streamedBody.id ||
+            frame.choices.length !== 1 ||
+            frame.choices[0]?.index !== 0 ||
+            typeof frame.choices[0]?.delta !== "object" ||
+            frame.choices[0]?.delta === null ||
+            (frame.choices[0]?.delta?.role !== undefined &&
+              frame.choices[0]?.delta?.role !== "assistant"),
+        )
+      ) {
+        return fail(`SSE chunk 与归一化正文不对应或 envelope 形状不对：${streamWire.responseBody}`);
+      }
+      const mistFrames = sse.frames.filter((frame) => Object.keys(frame.mist).length > 0);
+      const terminalMist = mistFrames[0]?.mist;
+      if (
+        mistFrames.length !== 1 ||
+        terminalMist?.stream_id !== target.streamId ||
+        json(wireProjection(terminalMist.projection)) !== json(streamedBody.projection)
+      ) {
+        return fail(`流式 mist 扩展不是恰好一份且与归一化值不对应：${streamWire.responseBody}`);
+      }
+
+      // —— canonical：每个 turn 恰好一份，writer 唯一 ——
       const events = await driver.readCanonicalEvents(target.bindingId);
-      const texts = textEvents(events);
-      for (const expected of ["turn:plain", "reply:plain", "turn:stream", "reply:stream"]) {
+      const texts = textEvents(events.slice(seededCount));
+      for (const expected of ["turn:plain", plainText, "turn:stream", streamText]) {
         if (texts.filter((text) => text === expected).length !== 1) {
           return fail(`canonical stream 中 ${expected} 不是恰好一份：${json(texts)}`);
         }
+      }
+      if (texts.length !== 4) {
+        return fail(`本轮 user/assistant 事件总数不是 4：${json(texts)}`);
       }
       const wrongWriter = events.find((event) => event.writerId !== target.canonicalWriterId);
       if (wrongWriter !== undefined) {
         return fail(`adapter 绕过唯一 writer：${json(wrongWriter)}`);
       }
-      return pass("普通/流式回复同源，四个新事件各落一次且 writer 唯一");
+
+      // —— Open WebUI utility task：显式 task hint 只能用来拒绝 ——
+      const beforeUtility = {
+        turns: (await driver.readModelTurns(target.bindingId)).length,
+        events: (await driver.readCanonicalEvents(target.bindingId)).length,
+        attachments: (await driver.readAttachmentWrites()).count,
+      };
+      const utility = await driver.sendCompletion(
+        target.bindingId,
+        authorized(target),
+        request("__task__: generate a title", { taskKind: "title-generation" }),
+      );
+      if (utility.status === 200 || utility.error?.code !== "MIST_UTILITY_REQUEST_UNSUPPORTED") {
+        return fail(`utility task 没有被稳定拒绝：${json(utility)}`);
+      }
+      const afterUtility = {
+        turns: (await driver.readModelTurns(target.bindingId)).length,
+        events: (await driver.readCanonicalEvents(target.bindingId)).length,
+        attachments: (await driver.readAttachmentWrites()).count,
+      };
+      if (json(beforeUtility) !== json(afterUtility)) {
+        return fail(
+          `utility 拒绝仍产生 model/canonical/附件副作用：${json({ beforeUtility, afterUtility })}`,
+        );
+      }
+      const utilityWire = (await driver.readRawWire(target.bindingId)).at(-1);
+      if (
+        utilityWire === undefined ||
+        !utilityWire.responseBody.includes("MIST_UTILITY_REQUEST_UNSUPPORTED") ||
+        parseJsonEnvelope(utilityWire.responseBody) !== null
+      ) {
+        return fail(`utility 拒绝没有留下可扫的原始 wire：${json(utilityWire)}`);
+      }
+      const allWire = await driver.readRawWire(target.bindingId);
+      if (allWire.length !== 3) {
+        return fail(`本轮 wire 交换数不是 3（普通 + 流式 + utility 拒绝）：${allWire.length}`);
+      }
+      if (allWire[0]?.responseKind !== "json" || allWire[1]?.responseKind !== "sse") {
+        return fail("普通/流式 wire 的 responseKind 不对");
+      }
+      return pass(
+        "普通/流式同源、wire 与归一化互证、四事件各一份、writer 唯一、utility 拒绝零副作用",
+      );
     } finally {
       await driver.reset();
     }
@@ -253,7 +663,10 @@ const fe03: FrontendAdapterCheck = {
       ) {
         return fail(`模型输入没有逐字来自 canonical history + 当前 turn：${json(turn)}`);
       }
-      const observable = json({ turns, events: await driver.readCanonicalEvents(target.bindingId) });
+      const observable = json({
+        turns,
+        events: await driver.readCanonicalEvents(target.bindingId),
+      });
       const leaked = forged.find((marker) => observable.includes(marker));
       if (leaked !== undefined) return fail(`伪造历史进入可观察状态：${leaked}`);
       return pass("请求前缀历史被丢弃，模型只见 canonical history 与末尾当前 turn");
@@ -270,6 +683,7 @@ const fe04: FrontendAdapterCheck = {
     "provisionBinding",
     "queueResidentReply",
     "sendCompletion",
+    "readRawWire",
     "readModelTurns",
     "readCanonicalEvents",
     "reset",
@@ -309,6 +723,15 @@ const fe04: FrontendAdapterCheck = {
       ) {
         return fail(`客户端路由字段改变了服务端目标：${json({ first, second })}`);
       }
+      // 客户端 model 不许回显成真实路由：响应 wire 必须是 server-owned route。
+      for (const exchange of await driver.readRawWire(target.bindingId)) {
+        if (
+          exchange.responseBody.includes('"model-a"') ||
+          exchange.responseBody.includes('"model-b"')
+        ) {
+          return fail(`响应回显了客户端 model：${exchange.responseBody}`);
+        }
+      }
       const turns = await driver.readModelTurns(target.bindingId);
       if (
         turns.length !== 2 ||
@@ -338,13 +761,31 @@ const fe05: FrontendAdapterCheck = {
     "provisionBinding",
     "queueResidentReply",
     "sendCompletion",
+    "readRawWire",
     "readModelTurns",
     "readCanonicalEvents",
+    "readInteractions",
+    "readAttachmentWrites",
     "reset",
   ],
   async run(driver) {
     try {
       const target = await binding(driver, "fe05");
+      const other = await binding(driver, "fe05-other");
+
+      /** 本轮给定 canonical 事件必须全部归属 target 的 writer/resident/scope/stream。 */
+      const allOwned = (
+        events: Awaited<ReturnType<FrontendAdapterDriver["readCanonicalEvents"]>>,
+      ): boolean =>
+        events.every(
+          (event) =>
+            event.writerId === target.canonicalWriterId &&
+            event.residentId === target.residentId &&
+            event.scopeId === target.scopeId &&
+            event.streamId === target.streamId,
+        );
+
+      // —— native 附件：body / wire(json) / canonical / 附件面 四处完整结构互证 ——
       const outboundAttachment = attachment("outbound-native");
       await driver.queueResidentReply(target.bindingId, {
         kind: "attachment",
@@ -356,30 +797,105 @@ const fe05: FrontendAdapterCheck = {
         role: "user",
         content: [
           { type: "text", text: "attachment ingress" },
-          {
-            type: "file",
-            file: {
-              filename: "inbound.txt",
-              file_data: "aGVsbG8=",
-            },
-          },
+          { type: "file", file: { filename: "inbound.txt", file_data: "aGVsbG8=" } },
         ],
       };
+      const writesBefore = (await driver.readAttachmentWrites()).count;
       const native = await driver.sendCompletion(
         target.bindingId,
         authorized(target),
         nativeRequest,
       );
       const nativeBody = bodyOf(native);
+      const ingress = (await driver.readModelTurns(target.bindingId))[0]?.attachments[0];
+      if (
+        ingress === undefined ||
+        ingress.attachmentId.length === 0 ||
+        ingress.mediaType.length === 0
+      ) {
+        return fail("入站附件缺少宿主签发的 opaque id 或媒体类型");
+      }
+      const inboundAttachment: StructuredAttachment = {
+        attachmentId: ingress.attachmentId,
+        kind: "file",
+        filename: "inbound.txt",
+        mediaType: ingress.mediaType,
+        sizeBytes: 5,
+        source: "inline",
+      };
+      if (!sameAttachment(ingress, inboundAttachment)) return fail("入站附件元数据与原始内容不符");
       if (
         nativeBody === null ||
-        nativeBody.delivery.status !== "native" ||
+        nativeBody.projection.status !== "native" ||
         nativeBody.attachments.length !== 1 ||
-        nativeBody.attachments[0]?.attachmentId !== outboundAttachment.attachmentId
+        !sameAttachment(nativeBody.attachments[0], outboundAttachment)
       ) {
-        return fail(`支持附件的前端没有拿到结构化附件：${json(native)}`);
+        return fail(`支持附件的前端没有拿到完整结构化附件：${json(native)}`);
+      }
+      const nativeWire = (await driver.readRawWire(target.bindingId)).at(-1);
+      const nativeEnvelope =
+        nativeWire === undefined ? null : parseJsonEnvelope(nativeWire.responseBody);
+      if (
+        nativeWire === undefined ||
+        nativeEnvelope === null ||
+        json(wireAttachments(nativeEnvelope.mist.attachments)) !== json([outboundAttachment]) ||
+        nativeEnvelope.mist.interaction !== null
+      ) {
+        return fail(`native 附件 wire 扩展不完整或与归一化不符：${json(nativeWire)}`);
+      }
+      const writesAfterNative = await driver.readAttachmentWrites();
+      if (
+        writesAfterNative.count !== writesBefore + 2 ||
+        !writesAfterNative.records.some(
+          (record) =>
+            json(record) ===
+            json({ ...inboundAttachment, residentId: target.residentId, scopeId: target.scopeId }),
+        ) ||
+        !writesAfterNative.records.some(
+          (record) =>
+            json(record) ===
+            json({ ...outboundAttachment, residentId: target.residentId, scopeId: target.scopeId }),
+        )
+      ) {
+        return fail(`附件面写入记录与声明结构不符：${json(writesAfterNative)}`);
+      }
+      const afterNativeEvents = await driver.readCanonicalEvents(target.bindingId);
+      const ingressEvent = afterNativeEvents.find(
+        (event) =>
+          event.kind === "attachment" &&
+          event.attachment?.attachmentId === inboundAttachment.attachmentId,
+      );
+      const outboundEvent = afterNativeEvents.find(
+        (event) =>
+          event.kind === "attachment" &&
+          event.attachment?.attachmentId === outboundAttachment.attachmentId,
+      );
+      if (
+        !sameAttachment(ingressEvent?.attachment, inboundAttachment) ||
+        !sameAttachment(outboundEvent?.attachment, outboundAttachment) ||
+        !allOwned([ingressEvent, outboundEvent].filter((event) => event !== undefined))
+      ) {
+        return fail(`canonical 附件事件缺少完整结构或归属不对：${json(afterNativeEvents)}`);
+      }
+      if (nativeBody.projection.canonicalEventIds.length !== 2) {
+        return fail(
+          `native 投影 canonicalEventIds 没有关联本轮记录：${json(nativeBody.projection)}`,
+        );
+      }
+      const projectionIds = new Set(nativeBody.projection.canonicalEventIds);
+      if (
+        !afterNativeEvents.some((event) => json(event.projection) === json(nativeBody.projection))
+      ) {
+        return fail("native 投影决策没有关联到 canonical 记录");
+      }
+      for (const id of projectionIds) {
+        const event = afterNativeEvents.find((candidate) => candidate.eventId === id);
+        if (event === undefined || !allOwned([event])) {
+          return fail(`native 投影引用了不存在或不属于本轮的事件：${id}`);
+        }
       }
 
+      // —— degraded 附件：结构保留、投影降级、正文不冒充 ——
       const degradedAttachment = attachment("outbound-degraded");
       await driver.queueResidentReply(target.bindingId, {
         kind: "attachment",
@@ -394,16 +910,293 @@ const fe05: FrontendAdapterCheck = {
       const degradedBody = bodyOf(degraded);
       if (
         degradedBody === null ||
-        degradedBody.delivery.status !== "degraded" ||
-        !degradedBody.delivery.missingCapabilities.includes("attachments") ||
-        degradedBody.attachments[0]?.attachmentId !== degradedAttachment.attachmentId
+        degradedBody.projection.status !== "degraded" ||
+        !degradedBody.projection.missingCapabilities.includes("attachments") ||
+        !sameAttachment(degradedBody.attachments[0], degradedAttachment)
       ) {
-        return fail(`附件降级丢掉了结构或收据：${json(degraded)}`);
+        return fail(`附件降级丢掉了完整结构或收据：${json(degraded)}`);
+      }
+      const degradedWire = (await driver.readRawWire(target.bindingId)).at(-1);
+      const degradedEnvelope =
+        degradedWire === undefined ? null : parseJsonEnvelope(degradedWire.responseBody);
+      if (
+        degradedEnvelope === null ||
+        json(wireAttachments(degradedEnvelope.mist.attachments)) !== json([degradedAttachment]) ||
+        json(wireProjection(degradedEnvelope.mist.projection)) !== json(degradedBody.projection)
+      ) {
+        return fail(`degraded 附件 wire 扩展与归一化不符：${json(degradedWire)}`);
       }
       if (/data:|aGVsbG8=|\[attachment\]|!\[[^\]]*\]\(/i.test(degradedBody.text)) {
         return fail(`附件被伪装成正文标记或内联字节：${degradedBody.text}`);
       }
 
+      // —— native choice：结构完整、wire 完整、待决 ——
+      const nativeChoice = interaction("native-choice");
+      await driver.queueResidentReply(target.bindingId, {
+        kind: "interaction",
+        text: "Choose one to continue.",
+        interaction: nativeChoice,
+      });
+      const choiceResponse = await driver.sendCompletion(
+        target.bindingId,
+        authorized(target),
+        request("native choice surface", { capabilities: ["interactions"] }),
+      );
+      const choiceBody = bodyOf(choiceResponse);
+      if (
+        choiceBody === null ||
+        choiceBody.projection.status !== "native" ||
+        json(choiceBody.interaction) !== json(nativeChoice)
+      ) {
+        return fail(`native choice 没有保留完整交互结构：${json(choiceResponse)}`);
+      }
+      const choiceWire = (await driver.readRawWire(target.bindingId)).at(-1);
+      const choiceEnvelope =
+        choiceWire === undefined ? null : parseJsonEnvelope(choiceWire.responseBody);
+      if (
+        choiceEnvelope === null ||
+        json(wireInteraction(choiceEnvelope.mist.interaction)) !== json(nativeChoice)
+      ) {
+        return fail(`native choice wire 交互扩展不完整：${json(choiceWire)}`);
+      }
+      const choiceEvents = (await driver.readCanonicalEvents(target.bindingId)).filter(
+        (event) => event.interaction?.interactionId === nativeChoice.interactionId,
+      );
+      if (
+        choiceEvents.length !== 1 ||
+        json(choiceEvents[0]?.interaction) !== json(nativeChoice) ||
+        !allOwned(choiceEvents)
+      ) {
+        return fail(`native choice canonical 事件缺少完整结构或归属不对：${json(choiceEvents)}`);
+      }
+      const choiceReadback = (await driver.readInteractions(target.bindingId)).find(
+        (item) => item.interactionId === nativeChoice.interactionId,
+      );
+      if (
+        !sameInteraction(choiceReadback, nativeChoice) ||
+        choiceReadback?.status !== "pending" ||
+        choiceReadback.resolvedOptionId !== null ||
+        choiceReadback.resolutionEventId !== null
+      ) {
+        return fail(`native choice 初始状态不是待决：${json(choiceReadback)}`);
+      }
+
+      // —— 合法点击：原始请求 snake_case、不捏造 user turn、恰好一条可归属 resolution ——
+      const chosenOption = nativeChoice.options[1];
+      if (chosenOption === undefined) return fail("fixture 交互缺少第二个选项");
+      const beforeClickEvents = await driver.readCanonicalEvents(target.bindingId);
+      const turnsBeforeClick = (await driver.readModelTurns(target.bindingId)).length;
+      const clickRequest = request("submit legal click", {
+        capabilities: ["interactions"],
+        controlOnly: true,
+        interactionResponse: {
+          interactionId: nativeChoice.interactionId,
+          optionId: chosenOption.optionId,
+        },
+      });
+      const click = await driver.sendCompletion(target.bindingId, authorized(target), clickRequest);
+      if (bodyOf(click) === null) return fail(`合法点击被拒绝：${json(click)}`);
+      const clickWire = (await driver.readRawWire(target.bindingId)).at(-1);
+      const controlCommand =
+        clickWire === undefined ? "missing" : requestInteractionResponse(clickWire.requestBody);
+      if (
+        controlCommand === "missing" ||
+        controlCommand === "malformed" ||
+        controlCommand.interaction_id !== nativeChoice.interactionId ||
+        controlCommand.option_id !== chosenOption.optionId
+      ) {
+        return fail(`控制响应原始请求不是 snake_case interaction_response：${json(clickWire)}`);
+      }
+      const clickMessages = lastRequestMessage(clickWire?.requestBody ?? "");
+      void clickMessages;
+      let parsedClickRequest: { messages?: unknown[] } | null = null;
+      try {
+        parsedClickRequest = JSON.parse(clickWire?.requestBody ?? "") as { messages?: unknown[] };
+      } catch {
+        parsedClickRequest = null;
+      }
+      if (parsedClickRequest === null || (parsedClickRequest.messages?.length ?? -1) !== 0) {
+        return fail(`控制响应捏造了 user turn：${json(clickWire)}`);
+      }
+      const clickEvents = (await driver.readCanonicalEvents(target.bindingId)).slice(
+        beforeClickEvents.length,
+      );
+      if (
+        clickEvents.length !== 1 ||
+        clickEvents[0]?.kind !== "interaction" ||
+        clickEvents[0]?.interaction?.interactionId !== nativeChoice.interactionId ||
+        !allOwned(clickEvents) ||
+        (await driver.readModelTurns(target.bindingId)).length !== turnsBeforeClick
+      ) {
+        return fail(`合法点击没有恰好新增一条可归属 resolution：${json(clickEvents)}`);
+      }
+      const resolvedReadback = (await driver.readInteractions(target.bindingId)).find(
+        (item) => item.interactionId === nativeChoice.interactionId,
+      );
+      if (
+        resolvedReadback?.status !== "resolved" ||
+        resolvedReadback.resolvedOptionId !== chosenOption.optionId ||
+        resolvedReadback.resolutionEventId !== clickEvents[0]?.eventId ||
+        clickEvents[0]?.resolvedOptionId !== chosenOption.optionId
+      ) {
+        return fail(
+          `合法点击没有耐久地落到 resolved 且带明确 chosenOption：${json(resolvedReadback)}`,
+        );
+      }
+
+      // —— 负例：拒绝必须零副作用，且不许动任一 binding 的任何状态 ——
+      const wrongId = interaction("wrong-id");
+      await driver.queueResidentReply(target.bindingId, {
+        kind: "interaction",
+        text: "pending for wrong-id",
+        interaction: wrongId,
+      });
+      await driver.sendCompletion(
+        target.bindingId,
+        authorized(target),
+        request("pending wrong-id", { capabilities: ["interactions"] }),
+      );
+      const foreign = interaction("foreign-choice");
+      await driver.queueResidentReply(other.bindingId, {
+        kind: "interaction",
+        text: "pending on other binding",
+        interaction: foreign,
+      });
+      await driver.sendCompletion(
+        other.bindingId,
+        authorized(other),
+        request("pending other binding", { capabilities: ["interactions"] }),
+      );
+      /** 捕获两个 binding 的全部可观察状态，用于「拒绝零副作用」的严谨比对。 */
+      const snapshot = async () => ({
+        target: {
+          turns: await driver.readModelTurns(target.bindingId),
+          events: await driver.readCanonicalEvents(target.bindingId),
+          interactions: await driver.readInteractions(target.bindingId),
+        },
+        other: {
+          turns: await driver.readModelTurns(other.bindingId),
+          events: await driver.readCanonicalEvents(other.bindingId),
+          interactions: await driver.readInteractions(other.bindingId),
+        },
+        attachments: await driver.readAttachmentWrites(),
+      });
+      const refusals: Array<{ label: string; req: FrontendChatRequest }> = [
+        {
+          label: "wrong-interaction-id",
+          req: request("bad id", {
+            capabilities: ["interactions"],
+            controlOnly: true,
+            interactionResponse: {
+              interactionId: "interaction:nope",
+              optionId: wrongId.options[0]?.optionId ?? "x",
+            },
+          }),
+        },
+        {
+          label: "wrong-option",
+          req: request("bad option", {
+            capabilities: ["interactions"],
+            controlOnly: true,
+            interactionResponse: {
+              interactionId: wrongId.interactionId,
+              optionId: "not-an-option",
+            },
+          }),
+        },
+        {
+          label: "other-binding-response",
+          req: request("foreign response", {
+            capabilities: ["interactions"],
+            controlOnly: true,
+            interactionResponse: {
+              interactionId: foreign.interactionId,
+              optionId: foreign.options[0]?.optionId ?? "x",
+            },
+          }),
+        },
+      ];
+      for (const refusal of refusals) {
+        const before = await snapshot();
+        const denied = await driver.sendCompletion(
+          target.bindingId,
+          authorized(target),
+          refusal.req,
+        );
+        if (denied.status === 200 || denied.error?.code !== "MIST_INTERACTION_RESPONSE_INVALID") {
+          return fail(`${refusal.label} 没有被稳定拒绝：${json(denied)}`);
+        }
+        const after = await snapshot();
+        if (json(before) !== json(after)) {
+          return fail(`${refusal.label} 的拒绝改动了可观察状态：${json({ before, after })}`);
+        }
+      }
+      const wrongStillPending = (await driver.readInteractions(target.bindingId)).find(
+        (item) => item.interactionId === wrongId.interactionId,
+      );
+      if (wrongStillPending?.status !== "pending" || wrongStillPending.resolvedOptionId !== null) {
+        return fail(`错误响应改掉了待决交互：${json(wrongStillPending)}`);
+      }
+      const foreignStillPending = (await driver.readInteractions(other.bindingId)).find(
+        (item) => item.interactionId === foreign.interactionId,
+      );
+      if (foreignStillPending?.status !== "pending") {
+        return fail(`另一 binding 的响应被错认：${json(foreignStillPending)}`);
+      }
+
+      // —— 重复响应：解析后重提同一响应必须被拒，且不产生第二次 resolution ——
+      const beforeDuplicate = await snapshot();
+      const duplicate = await driver.sendCompletion(
+        target.bindingId,
+        authorized(target),
+        request("duplicate click", {
+          capabilities: ["interactions"],
+          controlOnly: true,
+          interactionResponse: {
+            interactionId: nativeChoice.interactionId,
+            optionId: chosenOption.optionId,
+          },
+        }),
+      );
+      if (
+        duplicate.status === 200 ||
+        duplicate.error?.code !== "MIST_INTERACTION_RESPONSE_INVALID"
+      ) {
+        return fail(`重复响应没有被拒绝：${json(duplicate)}`);
+      }
+      const afterDuplicate = await snapshot();
+      if (json(beforeDuplicate) !== json(afterDuplicate)) {
+        return fail(`重复响应的拒绝改动了可观察状态：${json({ beforeDuplicate, afterDuplicate })}`);
+      }
+      const afterDuplicateReadback = (await driver.readInteractions(target.bindingId)).find(
+        (item) => item.interactionId === nativeChoice.interactionId,
+      );
+      if (
+        afterDuplicateReadback?.status !== "resolved" ||
+        afterDuplicateReadback.resolvedOptionId !== chosenOption.optionId ||
+        afterDuplicateReadback.resolutionEventId !== resolvedReadback.resolutionEventId
+      ) {
+        return fail(`重复响应产生了第二次 resolution：${json(afterDuplicateReadback)}`);
+      }
+
+      // —— 普通文字仍可聊天，但不解决 pending ——
+      await driver.queueResidentReply(target.bindingId, { kind: "text", text: "plain chat" });
+      const plainTurn = await driver.sendCompletion(
+        target.bindingId,
+        authorized(target),
+        request("just chatting, not clicking", { capabilities: ["interactions"] }),
+      );
+      if (bodyOf(plainTurn)?.text !== "plain chat") {
+        return fail(`普通文字 turn 失败：${json(plainTurn)}`);
+      }
+      const afterPlain = (await driver.readInteractions(target.bindingId)).find(
+        (item) => item.interactionId === wrongId.interactionId,
+      );
+      if (afterPlain?.status !== "pending" || afterPlain.resolvedOptionId !== null) {
+        return fail(`普通文字被猜成了点击：${json(afterPlain)}`);
+      }
+
+      // —— generic surface：结构可见、投影 blocked、状态待决 ——
       const blockedInteraction = interaction("surface-choice");
       await driver.queueResidentReply(target.bindingId, {
         kind: "interaction",
@@ -418,9 +1211,9 @@ const fe05: FrontendAdapterCheck = {
       const blockedBody = bodyOf(blocked);
       if (
         blockedBody === null ||
-        blockedBody.delivery.status !== "blocked" ||
-        !blockedBody.delivery.missingCapabilities.includes("interactions") ||
-        blockedBody.interaction?.interactionId !== blockedInteraction.interactionId
+        blockedBody.projection.status !== "blocked" ||
+        !blockedBody.projection.missingCapabilities.includes("interactions") ||
+        json(blockedBody.interaction) !== json(blockedInteraction)
       ) {
         return fail(`阻断交互没有保留结构或 blocked 收据：${json(blocked)}`);
       }
@@ -434,35 +1227,140 @@ const fe05: FrontendAdapterCheck = {
       ) {
         return fail(`交互被摊平成正文选项：${blockedBody.text}`);
       }
+      const blockedReadback = (await driver.readInteractions(target.bindingId)).find(
+        (item) => item.interactionId === blockedInteraction.interactionId,
+      );
+      if (
+        !sameInteraction(blockedReadback, blockedInteraction) ||
+        blockedReadback?.status !== "pending"
+      ) {
+        return fail(`generic blocked 交互结构或待决状态丢失：${json(blockedReadback)}`);
+      }
+
+      // —— native approval：正对照 + 点击解决到 resolved ——
+      const nativeApproval = interaction("native-approval", "approval");
+      await driver.queueResidentReply(target.bindingId, {
+        kind: "interaction",
+        text: "Approve to continue.",
+        interaction: nativeApproval,
+      });
+      const approvalResponse = await driver.sendCompletion(
+        target.bindingId,
+        authorized(target),
+        request("native approval surface", { capabilities: ["interactions"] }),
+      );
+      const approvalBody = bodyOf(approvalResponse);
+      if (
+        approvalBody === null ||
+        approvalBody.projection.status !== "native" ||
+        json(approvalBody.interaction) !== json(nativeApproval)
+      ) {
+        return fail(`native approval 没有保留完整交互结构：${json(approvalResponse)}`);
+      }
+      const approvalReadback = (await driver.readInteractions(target.bindingId)).find(
+        (item) => item.interactionId === nativeApproval.interactionId,
+      );
+      if (
+        !sameInteraction(approvalReadback, nativeApproval) ||
+        approvalReadback?.status !== "pending"
+      ) {
+        return fail(`native approval 初始状态不是待决：${json(approvalReadback)}`);
+      }
+      const approveOption = nativeApproval.options[0];
+      if (approveOption === undefined) return fail("fixture approval 缺少选项");
+      const approveEventsBefore = (await driver.readCanonicalEvents(target.bindingId)).length;
+      const approve = await driver.sendCompletion(
+        target.bindingId,
+        authorized(target),
+        request("approve", {
+          capabilities: ["interactions"],
+          controlOnly: true,
+          interactionResponse: {
+            interactionId: nativeApproval.interactionId,
+            optionId: approveOption.optionId,
+          },
+        }),
+      );
+      if (bodyOf(approve) === null) return fail(`approval 合法点击被拒绝：${json(approve)}`);
+      const approveEvents = (await driver.readCanonicalEvents(target.bindingId)).slice(
+        approveEventsBefore,
+      );
+      const approvalResolved = (await driver.readInteractions(target.bindingId)).find(
+        (item) => item.interactionId === nativeApproval.interactionId,
+      );
+      if (
+        approveEvents.length !== 1 ||
+        approveEvents[0]?.kind !== "interaction" ||
+        approveEvents[0]?.resolvedOptionId !== approveOption.optionId ||
+        !allOwned(approveEvents) ||
+        approvalResolved?.status !== "resolved" ||
+        approvalResolved.resolvedOptionId !== approveOption.optionId
+      ) {
+        return fail(
+          `native approval 点击没有落到 resolved：${json({ approveEvents, approvalResolved })}`,
+        );
+      }
+
+      // —— 流式附件 + interaction 扩展：SSE 结构也要完整 ——
+      const streamAttachment = attachment("outbound-stream");
+      const streamChoice = interaction("stream-choice");
+      await driver.queueResidentReply(target.bindingId, {
+        kind: "attachment",
+        text: "stream attachment reply",
+        attachments: [streamAttachment],
+      });
+      const streamNative = await driver.sendCompletion(
+        target.bindingId,
+        authorized(target),
+        request("stream attachment surface", { stream: true, capabilities: ["attachments"] }),
+      );
+      const streamWire = (await driver.readRawWire(target.bindingId)).at(-1);
+      if (streamWire === undefined || streamWire.responseKind !== "sse") {
+        return fail(`流式附件没有 SSE wire：${json(streamWire)}`);
+      }
+      const streamMist = parseSse(streamWire.responseBody)
+        .frames.map((frame) => frame.mist)
+        .find((mist) => Object.keys(mist).length > 0);
+      if (
+        bodyOf(streamNative) === null ||
+        streamMist === undefined ||
+        json(wireAttachments(streamMist.attachments)) !== json([streamAttachment])
+      ) {
+        return fail(`SSE mist 附件扩展不完整或与归一化不符：${json(streamWire)}`);
+      }
+      void streamChoice;
 
       const turns = await driver.readModelTurns(target.bindingId);
-      const firstTurn = turns[0];
-      const genericTurns = turns.slice(1);
+      const firstTurn = turns.find((turn) => turn.currentText === "attachment ingress");
+      const genericTurns = turns.filter(
+        (turn) =>
+          turn.currentText === "generic attachment surface" ||
+          turn.currentText === "generic interaction surface",
+      );
       if (
-        firstTurn?.attachments.length !== 1 ||
+        firstTurn === undefined ||
+        !sameAttachment(firstTurn.attachments[0], inboundAttachment) ||
         !firstTurn.surfaceCapabilities.includes("attachments") ||
+        genericTurns.length !== 2 ||
         genericTurns.some((turn) => turn.surfaceCapabilities.length !== 0)
       ) {
-        return fail(`住户没有拿到真实 surface capability：${json(turns)}`);
+        return fail(`住户没有拿到真实 surface capability 或完整附件：${json(turns)}`);
       }
 
       const events = await driver.readCanonicalEvents(target.bindingId);
-      const observable = json(events);
-      if (observable.includes("aGVsbG8=")) return fail("附件原始字节进入 canonical stream");
-      if (!events.some((event) => event.kind === "attachment")) {
-        return fail("结构化附件没有 canonical event");
-      }
-      if (!events.some((event) => event.kind === "interaction")) {
-        return fail("结构化交互没有 canonical event");
-      }
+      if (json(events).includes("aGVsbG8=")) return fail("附件原始字节进入 canonical stream");
+      if (!allOwned(events))
+        return fail("canonical 事件归属不属于目标 writer/resident/scope/stream");
       if (
         !events.some(
-          (event) => event.kind === "surface-receipt" && event.delivery?.status === "blocked",
+          (event) => event.kind === "surface-projection" && event.projection?.status === "blocked",
         )
       ) {
-        return fail("住户侧没有可读的 blocked surface receipt");
+        return fail("住户侧没有可读的 blocked surface projection");
       }
-      return pass("附件/交互结构、能力读回与 native/degraded/blocked 收据同时成立");
+      return pass(
+        "附件/交互完整结构、wire(json+SSE)、canonical 归属、choice/approval resolved 与五类拒绝零副作用同时成立",
+      );
     } finally {
       await driver.reset();
     }
@@ -476,34 +1374,80 @@ const fe06: FrontendAdapterCheck = {
     "provisionBinding",
     "queueResidentReply",
     "sendCompletion",
+    "readRawWire",
     "readModelTurns",
     "readCanonicalEvents",
+    "readInteractions",
+    "readAttachmentWrites",
     "readSecurityAudit",
     "reset",
   ],
   async run(driver) {
     try {
       const target = await binding(driver, "fe06");
+      const wrongToken = "wrong-token";
+      const secrets = [target.token, wrongToken];
       const attempts = [
         { token: null, source: "remote" as const, expected: "AUTH_REQUIRED" },
-        { token: "wrong-token", source: "remote" as const, expected: "AUTH_INVALID" },
+        { token: wrongToken, source: "remote" as const, expected: "AUTH_INVALID" },
         { token: null, source: "loopback" as const, expected: "AUTH_REQUIRED" },
+        { token: wrongToken, source: "loopback" as const, expected: "AUTH_INVALID" },
       ];
       for (const attempt of attempts) {
+        const deniedRequest = request(`denied:${attempt.expected}`);
+        deniedRequest.messages[0] = {
+          role: "user",
+          content: [
+            { type: "text", text: `denied:${attempt.expected}` },
+            { type: "file", file: { filename: "denied.txt", file_data: "aGVsbG8=" } },
+          ],
+        };
         const denied = await driver.sendCompletion(
           target.bindingId,
           { token: attempt.token, source: attempt.source, conversationId: null },
-          request(`denied:${attempt.expected}`),
+          deniedRequest,
         );
         if (denied.status !== 401 || denied.error?.code !== attempt.expected) {
-          return fail(`鉴权失败没有稳定 401/code：${json({ attempt, denied })}`);
+          return fail(redact(`鉴权失败没有稳定 401/code：${json({ attempt, denied })}`, secrets));
+        }
+        // 完整扫描 denied 响应（含 error.message），token 原文不许出现。
+        if (json(denied).includes(target.token) || json(denied).includes(wrongToken)) {
+          return fail("鉴权失败响应泄漏 token");
         }
       }
+      // 401 也必须留下可扫的原始响应；不能因为「没落模型」就假设没有 wire。
+      const deniedWires = await driver.readRawWire(target.bindingId);
+      const sawAllDenied = attempts.every((attempt) =>
+        deniedWires.some((exchange) => exchange.responseBody.includes(attempt.expected)),
+      );
+      if (deniedWires.length !== attempts.length || !sawAllDenied) {
+        return fail(redact(`鉴权失败没有留下可扫的原始 wire：${json(deniedWires)}`, secrets));
+      }
+      for (const exchange of deniedWires) {
+        if (
+          exchange.requestBody.includes(target.token) ||
+          exchange.responseBody.includes(target.token) ||
+          exchange.responseBody.includes(wrongToken)
+        ) {
+          return fail(redact("鉴权原始 wire 泄漏 token", secrets));
+        }
+      }
+      const modelTurns = await driver.readModelTurns(target.bindingId);
+      const canonical = await driver.readCanonicalEvents(target.bindingId);
+      const controls = await driver.readInteractions(target.bindingId);
+      const attachments = await driver.readAttachmentWrites();
       if (
-        (await driver.readModelTurns(target.bindingId)).length !== 0 ||
-        (await driver.readCanonicalEvents(target.bindingId)).length !== 0
+        modelTurns.length !== 0 ||
+        canonical.length !== 0 ||
+        controls.length !== 0 ||
+        attachments.count !== 0
       ) {
-        return fail("鉴权失败仍触发模型或 canonical writer");
+        return fail(
+          `鉴权失败仍触发模型/账/控制/附件副作用：${redact(
+            json({ modelTurns, canonical, controls, attachments }),
+            secrets,
+          )}`,
+        );
       }
 
       await driver.queueResidentReply(target.bindingId, { kind: "text", text: "authorized" });
@@ -513,22 +1457,64 @@ const fe06: FrontendAdapterCheck = {
         request("authorized loopback"),
       );
       if (bodyOf(accepted)?.text !== "authorized") {
-        return fail(`带 token 的 loopback 正对照失败：${json(accepted)}`);
+        return fail(redact(`带 token 的 loopback 正对照失败：${json(accepted)}`, secrets));
+      }
+      // 成功流式响应也要能被扫：SSE 原文里不许混进 token。
+      await driver.queueResidentReply(target.bindingId, {
+        kind: "text",
+        text: "authorized stream",
+      });
+      const streamed = await driver.sendCompletion(
+        target.bindingId,
+        { token: target.token, source: "loopback", conversationId: null },
+        request("authorized loopback stream", { stream: true }),
+      );
+      if (bodyOf(streamed)?.text !== "authorized stream") {
+        return fail(redact(`带 token 的流式正对照失败：${json(streamed)}`, secrets));
       }
       const audit = await driver.readSecurityAudit();
-      if (audit.attempts !== 4 || audit.accepted !== 1) {
-        return fail(`鉴权审计计数不对：${json(audit)}`);
+      if (audit.attempts !== 6 || audit.accepted !== 2) {
+        return fail(redact(`鉴权审计计数不对：${json(audit)}`, secrets));
       }
-      const serialized = json(audit);
-      if (serialized.includes(target.token) || serialized.includes("wrong-token")) {
-        return fail("token 泄漏进日志或回执");
+
+      // 全量扫描：accepted 响应体/raw wire(含 SSE)/canonical/model/control/附件/audit 都不许含 token。
+      const observable = json({
+        accepted,
+        streamed,
+        wire: await driver.readRawWire(target.bindingId),
+        turns: await driver.readModelTurns(target.bindingId),
+        events: await driver.readCanonicalEvents(target.bindingId),
+        controls: await driver.readInteractions(target.bindingId),
+        attachments: await driver.readAttachmentWrites(),
+        audit,
+      });
+      for (const secret of secrets) {
+        if (observable.includes(secret)) {
+          return fail(redact("token 泄漏进响应/wire/回执/附件观察/审计", secrets));
+        }
       }
-      return pass("远端与 loopback 都先验 token；三次失败零副作用，审计不含 token");
+      return pass(
+        "远端与 loopback 都先验 token；失败零模型/账/控制/附件副作用，全表面回读与审计不含 token",
+      );
     } finally {
       await driver.reset();
     }
   },
 };
+
+function isLoopbackUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return (
+      (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+      (parsed.hostname === "127.0.0.1" ||
+        parsed.hostname === "localhost" ||
+        parsed.hostname === "[::1]")
+    );
+  } catch {
+    return false;
+  }
+}
 
 const fe07: FrontendAdapterCheck = {
   id: "FE-07",
@@ -539,7 +1525,10 @@ const fe07: FrontendAdapterCheck = {
     "readWebuiAudit",
     "queueResidentReply",
     "sendWebuiCompletion",
+    "readRawWire",
+    "readModelTurns",
     "readCanonicalEvents",
+    "readAttachmentWrites",
     "reset",
   ],
   async run(driver) {
@@ -578,9 +1567,11 @@ const fe07: FrontendAdapterCheck = {
         started.status !== "started" ||
         started.serviceId === null ||
         started.url === null ||
-        started.endpointId !== target.endpointId
+        started.url.includes(target.token) ||
+        started.endpointId !== target.endpointId ||
+        !isLoopbackUrl(started.url)
       ) {
-        return fail(`确认后没有经同一 endpoint 启服务：${json(started)}`);
+        return fail(`确认后没有经同一 endpoint 启本机服务：${json(started)}`);
       }
       audit = await driver.readWebuiAudit();
       if (
@@ -592,19 +1583,166 @@ const fe07: FrontendAdapterCheck = {
         return fail(`插件安装闸/服务审计不成立：${json(audit)}`);
       }
 
-      await driver.queueResidentReply(target.bindingId, { kind: "text", text: "from-webui" });
-      const response = await driver.sendWebuiCompletion(
-        started.serviceId,
-        request("through webui", { capabilities: ["attachments", "interactions"] }),
+      const serviceId = started.serviceId;
+      const context = {
+        token: target.token,
+        source: "loopback" as const,
+        conversationId: serviceId,
+      };
+      /** 全量可观察状态快照：拒绝后必须逐字不变。 */
+      const snapshot = async () => ({
+        turns: await driver.readModelTurns(target.bindingId),
+        events: await driver.readCanonicalEvents(target.bindingId),
+        attachments: await driver.readAttachmentWrites(),
+      });
+
+      // —— 带附件的 WebUI 往返：wire 扩展、canonical、附件面都对上同一主流 ——
+      const webuiAttachment = attachment("webui-outbound");
+      await driver.queueResidentReply(target.bindingId, {
+        kind: "attachment",
+        text: "from-webui",
+        attachments: [webuiAttachment],
+      });
+      const before = await driver.readCanonicalEvents(target.bindingId);
+      const webuiRequest = request("through webui", {
+        capabilities: ["attachments", "interactions"],
+      });
+      webuiRequest.messages[0] = {
+        role: "user",
+        content: [
+          { type: "text", text: "through webui" },
+          { type: "file", file: { filename: "webui-in.txt", file_data: "aGVsbG8=" } },
+        ],
+      };
+      const response = await driver.sendWebuiCompletion(serviceId, context, webuiRequest);
+      const responseBody = bodyOf(response);
+      if (
+        responseBody === null ||
+        responseBody.streamId !== target.streamId ||
+        responseBody.model !== target.serverModel ||
+        !sameAttachment(responseBody.attachments[0], webuiAttachment)
+      ) {
+        return fail(`Open WebUI 没有走 FE-02 同一主流或附件结构不对：${json(response)}`);
+      }
+      const after = await driver.readCanonicalEvents(target.bindingId);
+      const newEvents = after.slice(before.length);
+      if (
+        newEvents.length !== 4 ||
+        newEvents[0]?.kind !== "user" ||
+        newEvents[0]?.text !== "through webui" ||
+        newEvents[1]?.kind !== "attachment" ||
+        newEvents[2]?.kind !== "assistant" ||
+        newEvents[2]?.text !== "from-webui" ||
+        newEvents[3]?.kind !== "attachment" ||
+        !newEvents.some(
+          (event) => event.kind === "attachment" && event.attachment?.filename === "webui-in.txt",
+        ) ||
+        !newEvents.some(
+          (event) =>
+            event.kind === "attachment" &&
+            event.attachment?.attachmentId === webuiAttachment.attachmentId,
+        ) ||
+        newEvents.some(
+          (event) =>
+            event.residentId !== target.residentId ||
+            event.scopeId !== target.scopeId ||
+            event.streamId !== target.streamId ||
+            event.writerId !== target.canonicalWriterId,
+        )
+      ) {
+        return fail(`Open WebUI 往返没有恰好落同源事件（含附件）：${json(newEvents)}`);
+      }
+      const webuiWire = (await driver.readRawWire(target.bindingId)).at(-1);
+      const webuiEnvelope =
+        webuiWire === undefined ? null : parseJsonEnvelope(webuiWire.responseBody);
+      if (
+        webuiEnvelope === null ||
+        webuiEnvelope.object !== "chat.completion" ||
+        webuiEnvelope.id !== responseBody.id ||
+        webuiEnvelope.choices.length !== 1 ||
+        webuiEnvelope.choices[0]?.index !== 0 ||
+        webuiEnvelope.choices[0]?.message?.role !== "assistant" ||
+        webuiEnvelope.choices[0]?.message?.content !== "from-webui" ||
+        webuiEnvelope.choices[0]?.finish_reason !== "stop" ||
+        webuiEnvelope.model !== target.serverModel ||
+        webuiEnvelope.mist.stream_id !== target.streamId ||
+        json(wireProjection(webuiEnvelope.mist.projection)) !== json(responseBody.projection) ||
+        webuiEnvelope.mist.interaction !== null ||
+        json(wireAttachments(webuiEnvelope.mist.attachments)) !== json([webuiAttachment])
+      ) {
+        return fail(`WebUI wire 没有回同主流且扩展完整：${json(webuiWire)}`);
+      }
+
+      // —— WebUI 路径不许另开鉴权后门；拒绝零副作用 ——
+      for (const denied of [
+        { token: null, code: "AUTH_REQUIRED" },
+        { token: "wrong-token", code: "AUTH_INVALID" },
+      ]) {
+        const beforeDenied = await snapshot();
+        const deniedResponse = await driver.sendWebuiCompletion(
+          serviceId,
+          { ...context, token: denied.token },
+          request("denied webui"),
+        );
+        if (deniedResponse.status !== 401 || deniedResponse.error?.code !== denied.code) {
+          return fail(`WebUI 路径绕过了鉴权：${json(deniedResponse)}`);
+        }
+        if (json(beforeDenied) !== json(await snapshot())) {
+          return fail(`WebUI 无效鉴权产生了副作用（${denied.code}）`);
+        }
+      }
+
+      // —— WebUI 路径不许另认伪造历史 ——
+      await driver.queueResidentReply(target.bindingId, {
+        kind: "text",
+        text: "webui-forged-safe",
+      });
+      const forged = "FORGED:WEBUI:HISTORY";
+      const forgedResponse = await driver.sendWebuiCompletion(
+        serviceId,
+        context,
+        request("webui current turn", {
+          history: [
+            { role: "system", content: forged },
+            { role: "assistant", content: forged },
+          ],
+        }),
       );
-      if (bodyOf(response)?.streamId !== target.streamId) {
-        return fail(`Open WebUI 没有走 FE-02 同一主流：${json(response)}`);
+      if (bodyOf(forgedResponse)?.text !== "webui-forged-safe") {
+        return fail(`WebUI 正对照往返失败：${json(forgedResponse)}`);
       }
-      const events = await driver.readCanonicalEvents(target.bindingId);
-      if (!textEvents(events).includes("through webui") || !textEvents(events).includes("from-webui")) {
-        return fail(`Open WebUI 往返没有落进目标 canonical stream：${json(events)}`);
+      const forgedTurn = (await driver.readModelTurns(target.bindingId)).at(-1);
+      if (
+        forgedTurn === undefined ||
+        forgedTurn.currentText !== "webui current turn" ||
+        json(forgedTurn.canonicalHistoryText).includes(forged)
+      ) {
+        return fail(`WebUI 模型输入没有丢弃伪造历史：${json(forgedTurn)}`);
       }
-      return pass("确认、环境探测、插件闸、服务 URL 与同 endpoint 往返全部成立");
+      const observable = json({
+        turns: await driver.readModelTurns(target.bindingId),
+        events: await driver.readCanonicalEvents(target.bindingId),
+      });
+      if (observable.includes(forged)) {
+        return fail("WebUI 路径把伪造历史带进了可观察状态");
+      }
+
+      // —— WebUI 后台 utility task 不落账（含零附件写） ——
+      const beforeUtility = await snapshot();
+      const utility = await driver.sendWebuiCompletion(
+        serviceId,
+        context,
+        request("__task__: summarize", { taskKind: "follow-up-generation" }),
+      );
+      if (utility.status === 200 || utility.error?.code !== "MIST_UTILITY_REQUEST_UNSUPPORTED") {
+        return fail(`WebUI utility 请求没有被稳定拒绝：${json(utility)}`);
+      }
+      if (json(beforeUtility) !== json(await snapshot())) {
+        return fail("WebUI utility 拒绝仍产生了 model/canonical/附件副作用");
+      }
+      return pass(
+        "确认、环境探测、插件闸、本机 URL、同 endpoint 完整 wire/附件、鉴权/历史/writer 与 utility 拒绝全部成立",
+      );
     } finally {
       await driver.reset();
     }
@@ -621,6 +1759,41 @@ export const expectedFrontendAdapterCheckIds = [
   "FE-07",
 ] as const;
 
+/** 扫描保留原始证据；仅最终判卷 detail/异常脱敏，避免另一盏灯先输出泄漏的响应。 */
+function protectDiagnostics(check: FrontendAdapterCheck): FrontendAdapterCheck {
+  return {
+    ...check,
+    async run(driver) {
+      const secrets = new Set<string>();
+      const observed = new Proxy(driver, {
+        get(target, property) {
+          if (property === "provisionBinding") {
+            return async (input: Parameters<FrontendAdapterDriver["provisionBinding"]>[0]) => {
+              const result = await target.provisionBinding(input);
+              secrets.add(result.token);
+              return result;
+            };
+          }
+          if (property === "sendCompletion" || property === "sendWebuiCompletion") {
+            return (id: string, context: FrontendRequestContext, request: FrontendChatRequest) => {
+              if (context.token !== null) secrets.add(context.token);
+              return target[property](id, context, request);
+            };
+          }
+          const member = Reflect.get(target, property, target);
+          return typeof member === "function" ? member.bind(target) : member;
+        },
+      });
+      try {
+        const result = await check.run(observed);
+        return { ...result, detail: redact(result.detail, [...secrets]) };
+      } catch (error) {
+        throw new Error(redact(String(error), [...secrets]));
+      }
+    },
+  };
+}
+
 export const frontendAdapterChecks: FrontendAdapterCheck[] = [
   fe01,
   fe02,
@@ -629,4 +1802,4 @@ export const frontendAdapterChecks: FrontendAdapterCheck[] = [
   fe05,
   fe06,
   fe07,
-];
+].map(protectDiagnostics);

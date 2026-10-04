@@ -10,9 +10,10 @@
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { frontendAdapterChecks } from "./frontend-adapter-checks.ts";
-import type {
-  FrontendAdapterCheck,
-  FrontendAdapterDriver,
+import {
+  type FrontendAdapterCheck,
+  type FrontendAdapterDriver,
+  cloneFrontendAdapterDriverBoundary,
 } from "./frontend-adapter-driver.ts";
 
 const DRIVER_SPECIFIER = "../src/frontend-adapter-acceptance-driver.ts";
@@ -36,7 +37,10 @@ async function loadDriver(): Promise<LoadedDriver | null> {
     );
   }
   return {
-    driver: mod.createFrontendAdapterDriver() as FrontendAdapterDriver,
+    // D27 三：判卷在驱动边界统一深拷贝入参与返回值。
+    driver: cloneFrontendAdapterDriverBoundary(
+      mod.createFrontendAdapterDriver() as FrontendAdapterDriver,
+    ),
     stubbed: new Set<string>(Array.isArray(mod.STUBBED) ? mod.STUBBED : []),
   };
 }

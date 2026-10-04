@@ -33,8 +33,13 @@ npm run acceptance:frontend-adapter:strict
   不静默迁成 terminal 或 external。
 
 - [ ] **FE-02 OpenAI-compatible 往返与唯一 writer**：普通与 `stream: true` 各完成一次合成往返；
-  流式 chunks 能逐字重建同一完整回复。每个 user/assistant turn 在 canonical stream 恰好一份，
-  全部事件来自绑定的唯一 writer；响应 `model` 与 stream id 由服务端绑定给出。
+  驱动保留本轮实际进出的**原始 wire**（非流式标准 completion JSON、流式 `data:` SSE），判卷独立
+  解析它：envelope 的 `id`/`object`/`created`/`model`/`choices` message 或 delta、`finish_reason`、
+  空行分帧、末尾唯一 `[DONE]` 与 snake_case `mist` 扩展逐项核对，归一化正文必须与 wire 逐字对应——坏 choices/SSE 不能靠驱动
+  美化归一化值过灯。流式事件恰好一份，每个 user/assistant turn 在 canonical stream 恰好一份，
+  全部事件来自绑定的唯一 writer；响应 `model` 与 stream id 由服务端绑定给出。请求带显式
+  utility task hint（`mist.task_kind`）时返回稳定 `MIST_UTILITY_REQUEST_UNSUPPORTED` 且零
+  model/canonical/control/附件副作用。拒绝的原始 error 响应仍须可观察，不能把没有 wire 当成功拒绝的证明。
 
 - [ ] **FE-03 不认前端历史**：请求携带伪造 system/user/assistant 前缀时，模型输入的历史与
   canonical stream 逐字一致，只额外接数组末尾的当前 user turn；伪造字节不进模型、不落账、
@@ -47,16 +52,32 @@ npm run acceptance:frontend-adapter:strict
 - [ ] **FE-05 附件与选项/阻断不退化**：支持 capability 的 surface 收到结构化附件；generic
   surface 仍保留结构化附件/interaction，并得到 `degraded` / `blocked` 投影决策。附件字节不进
   canonical 正文，interaction 选项不摊成 `[option]`、编号列表或可被普通 user 文本冒充的点击。
-  住户的模型输入能读到本轮 client 声明的 surface capabilities；后续 canonical 读口能读到
-  adapter 采取了哪种投影。该记录不冒充浏览器实际渲染确认。
+  附件的 id、kind、filename、媒体类型、实际字节数和来源在模型/私有附件面/canonical/JSON/SSE 中保持一致；
+  入站 id 由宿主签发，不规定 fixture 的固定命名。canonical interaction 完整保留选项与 prompt，
+  投影的 event ids 关联本轮且归属正确，native 决策也留 canonical 记录。
+  native choice 与 native approval 正对照保留完整结构和待决状态；合法点击（
+  `mist.interaction_response`）必须耐久落到 `resolved`，对应一条同 writer 的 append-only
+  canonical 记录，保留实际选中的 option；原始控制请求只带 `mist.interaction_response`，不捏造 user turn。
+  错误 interaction id、错误 option、另一 binding/resident 的响应与重复响应都被拒绝，
+  返回稳定 `MIST_INTERACTION_RESPONSE_INVALID` 且零 model/writer/control/附件副作用。
+  普通文字可继续聊天，却不能代替点击或解决 pending。住户的模型
+  输入能读到本轮 client 声明的 surface capabilities；canonical 读口能读到 adapter 采取了哪种
+  投影。该记录不冒充浏览器实际渲染确认。
 
-- [ ] **FE-06 鉴权默认强制**：缺 token、错 token、loopback 缺 token 都返回 401 与稳定 code，
-  且模型调用和 canonical 写入均为零；带正确 token 的 loopback 正对照可通过。日志和回执不含
-  正确或错误 token 原文。
+- [ ] **FE-06 鉴权默认强制**：remote/loopback 的缺 token、错 token 都返回 401 与稳定 code，
+  且模型调用、canonical/control/附件写入为零；附件副作用由独立 `readAttachmentWrites` 读口核验，
+  不用 event 数替代。带正确 token 的 loopback 普通与流式正对照可通过。
+  401 本身仍有实际原始 wire；判卷完整扫描 denied/accepted 响应体（含 `error.message`）、
+  普通/SSE raw wire、canonical/model/control/附件元数据读回与审计，任何一处出现正确或错误 token 原文即判红。
+  只对最终 detail/异常脱敏，不修改被扫描的证据；另一盏灯先失败也不能把 token 打印出来。
 
 - [ ] **FE-07 `/webui` 按需安装**：未确认不安装；Docker/Python 均缺时只报缺项，不动系统；
-  确认且环境满足后恰好走一次 `frontend` 插件安装闸，启动服务、返回本机 URL。Open WebUI 的
-  合成请求复用 FE-02 同一 endpoint 与 canonical stream，不另开 auth/history/writer 后门。
+  确认且环境满足后恰好走一次 `frontend` 插件安装闸，启动服务、返回本机（loopback）URL。
+  Open WebUI 的合成请求复用 FE-02 同一 endpoint 与 canonical stream：本轮恰好新增一对
+  同 resident/scope/stream/writer 的 user/assistant 事件及两条入出站附件记录，并核完整 wire 回复。
+  无效鉴权 401 且零模型/账/附件副作用，伪造历史
+  不进模型也不落账，`mist.task_kind` 的 utility 请求稳定拒绝且不落账——不另开
+  auth/history/writer 后门。
 
 ## 判卷边界
 
@@ -66,4 +87,8 @@ npm run acceptance:frontend-adapter:strict
   本机观察记录。
 - FE-07 公开 CI 用安装替身证明确认、环境探测和插件闸；真实 Open WebUI 安装只在隔离本机做，
   不进公共 CI，也不能用「进程起来了」替代一次经同 endpoint 的真实往返。
+- 驱动边界按 D27 统一深拷贝入参与返回值。canonical 事件 `kind: "surface-projection"` 与响应、
+  流式 chunk 的 `projection` 字段是**投影决策**（native/degraded/blocked + 缺失能力 + 关联事件
+  id），不冒充浏览器或 Pipe Function 的真实渲染回执；早期 PR1 的
+  `DeliveryReceipt`/`delivery`/`surface-receipt` 命名与兼容别名已删除，未发布不留 fallback。
 - 施工席与独立验收席分开。合成判卷器自检、作者自测与正式落章是三件事。

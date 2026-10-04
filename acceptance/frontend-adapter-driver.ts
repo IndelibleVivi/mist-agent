@@ -46,6 +46,13 @@ export interface FrontendChatRequest {
       interactionId: string;
       optionId: string;
     };
+    /**
+     * Open WebUI 等前端会把 title / tag / follow-up 之类的后台 utility task 发给当前聊天模型；
+     * 这类请求形状与普通单条 `role: "user"` completion 无法区分。前端必须用一个显式 task hint
+     * 标出来；契约只把这个 hint 用来 **拒绝**，不许它改变身份、授权，也不许它开第二条模型路由。
+     * 线上 snake_case 写 `task_kind`；空串或缺失按「不是 utility 请求」处理。
+     */
+    taskKind?: string;
   };
 }
 
@@ -92,9 +99,6 @@ export interface SurfaceProjection {
   canonicalEventIds: string[];
 }
 
-/** @deprecated 名字保留给 PR1 的早期判卷形状；语义以 SurfaceProjection 为准。 */
-export type DeliveryReceipt = SurfaceProjection;
-
 export interface FrontendError {
   code: string;
   type: string;
@@ -109,15 +113,67 @@ export interface FrontendCompletionBody {
   text: string;
   attachments: StructuredAttachment[];
   interaction: StructuredInteraction | null;
-  delivery: SurfaceProjection;
+  projection: SurfaceProjection;
 }
 
 export interface FrontendStreamChunk {
   textDelta: string;
   attachments: StructuredAttachment[];
   interaction: StructuredInteraction | null;
-  delivery: SurfaceProjection | null;
+  projection: SurfaceProjection | null;
   done: boolean;
+}
+
+/**
+ * 合成 transport 上实际进出的原始字节。不做任何归一化：非流式响应是标准 Chat Completions
+ * JSON 文本，流式响应是 `data: ...` 的 SSE 文本。判卷独立解析它，用来核「归一化值与 wire 互相对应」，
+ * 而不是拿归一化对象自证。
+ */
+export interface RawWireExchange {
+  /** 请求体原文（线协议字节）。 */
+  requestBody: string;
+  /** 响应体原文；非流式为 JSON 文本，流式为 SSE 文本。 */
+  responseBody: string;
+  responseKind: "json" | "sse";
+}
+
+/**
+ * 交互（choice / approval / blocked）的耐久状态读回口。
+ *
+ * `status` 是服务端按 interaction id、现行住户/scope、未解决状态与 option id 逐项核验后的
+ * 权威状态；`resolutionEventId` 指向这条交互在 canonical stream 里的追加记录（append-only），
+ * pending 时为 null。它不是浏览器渲染回执。
+ */
+export interface InteractionReadback {
+  interactionId: string;
+  kind: "choice" | "approval" | "blocked";
+  prompt: string;
+  blocking: true;
+  options: StructuredInteractionOption[];
+  reasonCode: string | null;
+  status: "pending" | "resolved";
+  resolvedOptionId: string | null;
+  resolutionEventId: string | null;
+}
+
+/**
+ * 私有附件面的写入读回。只回 opaque 元数据与计数，**不回字节**——
+ * 判卷用它证明「鉴权/utility 失败没有先落附件字节再靠 canonical 数为零冒充零副作用」。
+ */
+export interface AttachmentWriteRecord {
+  attachmentId: string;
+  kind: "image" | "file";
+  filename: string;
+  mediaType: string;
+  sizeBytes: number;
+  source: "inline" | "opaque-ref";
+  residentId: string;
+  scopeId: string;
+}
+
+export interface AttachmentWriteReadback {
+  count: number;
+  records: AttachmentWriteRecord[];
 }
 
 export interface FrontendResponse {
@@ -159,20 +215,23 @@ export interface CanonicalEventReadback {
   scopeId: string;
   streamId: string;
   writerId: string;
-  /** `surface-receipt` 只收录 adapter 投影决策，不代表 client 已确认渲染。 */
-  kind: "user" | "assistant" | "attachment" | "interaction" | "surface-receipt";
+  /** `surface-projection` 只收录 adapter 投影决策，不代表 client 已确认渲染。 */
+  kind: "user" | "assistant" | "attachment" | "interaction" | "surface-projection";
   text: string | null;
   attachment: StructuredAttachment | null;
   interaction: StructuredInteraction | null;
-  delivery: SurfaceProjection | null;
+  projection: SurfaceProjection | null;
+  /**
+   * 仅交互 resolution 事件非 null：这次控制实际选了哪个 option。它让「选了什么」可归属到
+   * canonical 记录本身，而不是只能靠 readback 自称的 eventId 反查。
+   */
+  resolvedOptionId: string | null;
 }
 
 export interface InstallerRunReadback {
   committed: boolean;
   defaulted: boolean;
-  frontend:
-    | { kind: "terminal" }
-    | { kind: "external"; integration: "openai-compatible" };
+  frontend: { kind: "terminal" } | { kind: "external"; integration: "openai-compatible" };
 }
 
 export interface LegacyFrontendReadback {
@@ -229,8 +288,18 @@ export interface FrontendAdapterDriver {
     context: FrontendRequestContext,
     request: FrontendChatRequest,
   ): Promise<FrontendResponse>;
+  /**
+   * 本轮进出的原始 wire（请求体 + 响应体原文），判卷独立解析，不拿归一化对象自证。
+   * 成功响应、鉴权失败与 utility 拒绝都必须留下原始记录：401/400 的响应原文也要能被扫，
+   * 不能因为「没落模型」就假设没有 wire。请求记录不得携带 `Authorization` 或 token 原文。
+   */
+  readRawWire(bindingId: string): Promise<RawWireExchange[]>;
   readModelTurns(bindingId: string): Promise<ModelTurnReadback[]>;
   readCanonicalEvents(bindingId: string): Promise<CanonicalEventReadback[]>;
+  /** 交互的耐久 pending / resolved 状态；拒绝必须不改变既有状态，也不产生新 effect。 */
+  readInteractions(bindingId: string): Promise<InteractionReadback[]>;
+  /** 私有附件面写入读回（opaque 元数据 + 计数，无字节），用于证明失败路径零附件副作用。 */
+  readAttachmentWrites(): Promise<AttachmentWriteReadback>;
   readSecurityAudit(): Promise<SecurityAuditReadback>;
 
   runWebuiCommand(
@@ -239,6 +308,7 @@ export interface FrontendAdapterDriver {
   ): Promise<WebuiCommandReadback>;
   sendWebuiCompletion(
     serviceId: string,
+    context: FrontendRequestContext,
     request: FrontendChatRequest,
   ): Promise<FrontendResponse>;
   readWebuiAudit(): Promise<WebuiAuditReadback>;
@@ -254,4 +324,26 @@ export interface FrontendAdapterCheck {
   title: string;
   uses: Array<keyof FrontendAdapterDriver>;
   run(driver: FrontendAdapterDriver): Promise<FrontendAdapterCheckResult>;
+}
+
+/**
+ * D27 三：判卷在驱动边界统一深拷贝入参与返回值，一次消掉别名类问题，
+ * 不在每个调用点逐一冻结。
+ *
+ * 验收灯面向**非对抗驱动**：假定驱动如实回读自己的状态。这层代理挡的是
+ * 「无心写成别名」，不是「存心在两次观察之间作弊」——后者归代码评审与验收席。
+ */
+export function cloneFrontendAdapterDriverBoundary(
+  driver: FrontendAdapterDriver,
+): FrontendAdapterDriver {
+  return new Proxy(driver, {
+    get(target, property) {
+      const member = Reflect.get(target, property, target);
+      if (typeof member !== "function") return member;
+      return async (...args: unknown[]) => {
+        const result = await Reflect.apply(member, target, structuredClone(args));
+        return structuredClone(result);
+      };
+    },
+  });
 }
