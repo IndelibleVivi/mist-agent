@@ -36,7 +36,10 @@ npm run acceptance:frontend-adapter:strict
   驱动保留本轮实际进出的**原始 wire**（非流式标准 completion JSON、流式 `data:` SSE），判卷独立
   解析它：envelope 的 `id`/`object`/`created`/`model`/`choices` message 或 delta、`finish_reason`、
   空行分帧、末尾唯一 `[DONE]` 与 snake_case `mist` 扩展逐项核对，归一化正文必须与 wire 逐字对应——坏 choices/SSE 不能靠驱动
-  美化归一化值过灯。流式事件恰好一份，每个 user/assistant turn 在 canonical stream 恰好一份，
+  美化归一化值过灯。单份 SSE `mist` 的 stream_id、projection、attachments、interaction 必须与
+  归一化完整结构对应；空附件/null interaction 的纯文本及非空附件/choice 正例都要成立。
+  普通和流式两回合的文本事件按 user→assistant→user→assistant 核 kind、正文和顺序，
+  各恰好一份；允许合法的非文本辅助事件，
   全部事件来自绑定的唯一 writer；响应 `model` 与 stream id 由服务端绑定给出。请求带显式
   utility task hint（`mist.task_kind`）时返回稳定 `MIST_UTILITY_REQUEST_UNSUPPORTED` 且零
   model/canonical/control/附件副作用；utility 请求即使带 inline `file_data` 附件，adapter 也必须
@@ -45,7 +48,7 @@ npm run acceptance:frontend-adapter:strict
   model/canonical/control/私有附件完整读回的 before/after。拒绝的原始 error 响应仍须可观察，
   不能把没有 wire 当成功拒绝的证明。
 
-- [ ] **FE-03 不认前端历史**：请求携带伪造 system/user/assistant 前缀时，模型输入的历史与
+- [ ] **FE-03 不认前端历史**：请求携带伪造 system/user/assistant/developer/tool 前缀时，模型输入的历史与
   canonical stream 逐字一致，只额外接数组末尾的当前 user turn；伪造字节不进模型、不落账、
   不进可观察回执。空 `messages`、末尾不是 `role: "user"`、当前 user content 不可解析三种
   形状均返回稳定 `MIST_INVALID_TURN_SHAPE`，且 model/canonical/control/附件零副作用；
@@ -53,20 +56,26 @@ npm run acceptance:frontend-adapter:strict
 
 - [ ] **FE-04 一条主流**：用不同 `model`、`user`、metadata 与 frontend conversation id 发两次
   请求，仍落到同一 resident、scope 与 stream；不能出现第二条主流，也不能把客户端 model
-  回显成真实路由。
+  回显成真实路由。按两次请求各自前后新增的 canonical 事件核 resident/scope/stream/writer、
+  user→assistant 正文与顺序；本次 model turn 的 currentText 分别为 turn:a/turn:b。
+  总 turn 数或全流 streamId 集合不能替代两次分别落账。
 
 - [ ] **FE-05 附件与选项/阻断不退化**：支持 capability 的 surface 收到结构化附件；generic
   surface 仍保留结构化附件/interaction，并得到 `degraded` / `blocked` 投影决策。附件字节不进
   canonical 正文，interaction 选项不摊成 `[option]`、编号列表或可被普通 user 文本冒充的点击。
   附件的 id、kind、filename、媒体类型、实际字节数和来源在模型/私有附件面/canonical/JSON/SSE 中保持一致；
   入站 id 由宿主签发，不规定 fixture 的固定命名。canonical interaction 完整保留选项与 prompt，
-  投影的 event ids 关联本轮且归属正确，native 决策也留 canonical 记录。
+  投影的 event ids 是本轮新增事件的非空子集，归属正确且覆盖本次实际呈现的附件/interaction；
+  不要求每条 user/assistant 都被引用，不固定引用条数（合法三条引用可通过）。native 决策也留本轮 canonical 记录，
+  旧回合记录不能顶替本轮。
   图纸 §4.1 的 SSRF 边界也要可执行：带 `http(s)` 远程 `image_url` 的请求返回稳定
   `MIST_REMOTE_URL_UNSUPPORTED`，`readNetworkAttempts` 读口逐字显示**零真实抓取尝试**，
   拒绝后 network/model/canonical/control/附件零副作用，原始 wire 不回显 URL 原文或查询串。
   native choice 与 native approval 正对照保留完整结构和待决状态；合法点击（
   `mist.interaction_response`）必须耐久落到 `resolved`，对应一条同 writer 的 append-only
-  canonical 记录，保留实际选中的 option；原始控制请求只带 `mist.interaction_response`，不捏造 user turn。
+  canonical 记录，保留实际选中的 option；choice 与 approval 的 resolutionEventId 都指向本次
+  新增的同一 interaction/option/归属解除记录，控制不得新增模型调用或聊天事件。
+  原始控制请求只带 `mist.interaction_response`，不捏造 user turn。
   错误 interaction id、错误 option、另一 binding/resident 的响应与重复响应都被拒绝，
   返回稳定 `MIST_INTERACTION_RESPONSE_INVALID` 且零 model/writer/control/附件副作用。
   普通文字可继续聊天，却不能代替点击或解决 pending。住户的模型
@@ -78,7 +87,10 @@ npm run acceptance:frontend-adapter:strict
 
 - [ ] **FE-06 鉴权默认强制**：remote/loopback 的缺 token、错 token 都返回 401 与稳定 code，
   且模型调用、canonical/control/附件写入为零；附件副作用由独立 `readAttachmentWrites` 读口核验，
-  不用 event 数替代。带正确 token 的 loopback 普通与流式正对照可通过。
+  count 与 records 均为零且一致，不用 event 数替代。带正确 token 的 loopback 普通与流式
+  纯文本正对照可通过，不要求附件写入。readSecurityAudit 的有序 entries 逐请求核 source、
+  result 与 code（AUTH_REQUIRED / AUTH_INVALID / AUTH_ACCEPTED），并与 attempts/accepted
+  汇总互证；accepted 表示鉴权通过，不等于 completion 成功。只给总数不能通过。
   401 本身仍有实际原始 wire；判卷完整扫描 denied/accepted 响应体（含 `error.message`）、
   普通/SSE raw wire、canonical/model/control/附件元数据读回与审计，任何一处出现正确或错误 token 原文即判红。
   只对最终 detail/异常脱敏，不修改被扫描的证据；另一盏灯先失败也不能把 token 打印出来。

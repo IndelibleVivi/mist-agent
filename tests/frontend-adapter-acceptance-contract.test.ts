@@ -39,6 +39,34 @@ import {
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 
 type Fault =
+  | "fe02-swap-roles"
+  | "fe02-all-assistant"
+  | "fe02-reverse-text-order"
+  | "sse-missing-attachments"
+  | "sse-missing-interaction"
+  | "trust-developer-history"
+  | "trust-tool-history"
+  | "developer-audit-history"
+  | "fe04-wrong-resident"
+  | "fe04-wrong-scope"
+  | "fe04-wrong-writer"
+  | "fe04-no-second-append"
+  | "fe04-wrong-current-text"
+  | "projection-old-events"
+  | "projection-missing-structure"
+  | "projection-empty"
+  | "choice-projection-missing-structure"
+  | "approval-wrong-resolution-id"
+  | "approval-wrong-interaction"
+  | "approval-invokes-model"
+  | "auth-records-zero-count"
+  | "audit-wrong-source"
+  | "audit-wrong-code"
+  | "audit-wrong-result"
+  | "audit-missing-entry"
+  | "audit-wrong-order"
+  | "projection-three-current"
+  | "auxiliary-events"
   // FE-01
   | "legacy-rewrite"
   // FE-02
@@ -276,7 +304,13 @@ class FixtureDriver implements FrontendAdapterDriver {
   readonly #services = new Map<string, string>();
   readonly #webuiServices = new Map<string, WebuiCommandReadback>();
   #sequence = 0;
-  #security: SecurityAuditReadback = { attempts: 0, accepted: 0, logs: [], receipts: [] };
+  #security: SecurityAuditReadback = {
+    attempts: 0,
+    accepted: 0,
+    entries: [],
+    logs: [],
+    receipts: [],
+  };
   #networkAttempts: NetworkAttemptRecord[] = [];
   #webui: WebuiAuditReadback = {
     installGateCalls: 0,
@@ -301,7 +335,7 @@ class FixtureDriver implements FrontendAdapterDriver {
     this.#bindings.clear();
     this.#services.clear();
     this.#webuiServices.clear();
-    this.#security = { attempts: 0, accepted: 0, logs: [], receipts: [] };
+    this.#security = { attempts: 0, accepted: 0, entries: [], logs: [], receipts: [] };
     this.#networkAttempts = [];
     this.#webui = {
       installGateCalls: 0,
@@ -370,6 +404,10 @@ class FixtureDriver implements FrontendAdapterDriver {
       interactions: new Map(),
       attachmentWrites: [],
     });
+    // 该住户可以已有历史；投影负例必须有真正的旧记录可引用。
+    if (input.label === "fe05") {
+      await this.seedCanonicalHistory(binding.bindingId, ["prior:user", "prior:assistant"]);
+    }
     return binding;
   }
 
@@ -443,7 +481,10 @@ class FixtureDriver implements FrontendAdapterDriver {
   async readAttachmentWrites(): Promise<AttachmentWriteReadback> {
     const records: AttachmentWriteRecord[] = [];
     for (const state of this.#bindings.values()) records.push(...state.attachmentWrites);
-    return { count: records.length, records: structuredClone(records) };
+    return {
+      count: this.#faults.has("auth-records-zero-count") ? 0 : records.length,
+      records: structuredClone(records),
+    };
   }
 
   async readNetworkAttempts(): Promise<NetworkAttemptReadback> {
@@ -597,7 +638,47 @@ class FixtureDriver implements FrontendAdapterDriver {
       skipAttachmentWrites?: boolean;
     },
   ): FrontendResponse {
+    const eventCountBefore = state.events.length;
     const response = this.#completeInner(state, context, request, options);
+    if (state.binding.bindingId === "binding:fe02" && response.status === 200) {
+      const newTextEvents = state.events
+        .slice(eventCountBefore)
+        .filter((e) => e.kind === "user" || e.kind === "assistant");
+      if (this.#faults.has("fe02-swap-roles")) {
+        for (const event of newTextEvents)
+          event.kind = event.kind === "user" ? "assistant" : "user";
+      }
+      if (this.#faults.has("fe02-all-assistant")) {
+        for (const event of newTextEvents) event.kind = "assistant";
+      }
+      if (this.#faults.has("fe02-reverse-text-order")) {
+        state.events.splice(
+          eventCountBefore,
+          state.events.length - eventCountBefore,
+          ...state.events.slice(eventCountBefore).reverse(),
+        );
+      }
+    }
+    if (state.binding.bindingId === "binding:fe04" && response.status === 200) {
+      for (const event of state.events.slice(eventCountBefore)) {
+        if (this.#faults.has("fe04-wrong-resident")) event.residentId = "resident:other";
+        if (this.#faults.has("fe04-wrong-scope")) event.scopeId = "scope:other";
+        if (this.#faults.has("fe04-wrong-writer")) event.writerId = "writer:other";
+      }
+      if (this.#faults.has("fe04-wrong-current-text")) {
+        const turn = state.turns.at(-1);
+        if (turn !== undefined) turn.currentText = "unrelated turn";
+      }
+      if (this.#faults.has("fe04-no-second-append") && state.turns.length === 2) {
+        state.events.splice(eventCountBefore);
+      }
+    }
+    if (this.#faults.has("auxiliary-events") && response.status === 200 && response.body !== null) {
+      state.events.push(
+        this.#event(state, "surface-projection", { projection: response.body.projection }),
+      );
+    }
+
     // 任何 4xx 拒绝都要留下原始 wire，判卷才能扫 401/400 的响应原文；
     // 成功响应在 inner 里落自己那份（含 SSE）。请求记录不含 Authorization/token。
     if (response.status !== 200) {
@@ -623,10 +704,11 @@ class FixtureDriver implements FrontendAdapterDriver {
     const loopbackBypass =
       !options.bypassAuth && this.#faults.has("loopback-bypass") && context.source === "loopback";
     // 错误行为：鉴权失败前先落附件字节。
-    if (this.#faults.has("auth-writes-attachment")) {
+    if (this.#faults.has("auth-writes-attachment") || this.#faults.has("auth-records-zero-count")) {
       this.#writeIngressAttachments(state, request);
     }
     if (!options.bypassAuth && !loopbackBypass && context.token === null) {
+      this.#audit(context, "rejected", "AUTH_REQUIRED");
       this.#security.logs.push("auth:required");
       this.#security.receipts.push(
         this.#faults.has("leak-token-audit-detail") ? "AUTH_REQUIRED wrong-token" : "AUTH_REQUIRED",
@@ -634,12 +716,14 @@ class FixtureDriver implements FrontendAdapterDriver {
       return this.#error(401, "AUTH_REQUIRED");
     }
     if (!options.bypassAuth && !loopbackBypass && context.token !== state.binding.token) {
+      this.#audit(context, "rejected", "AUTH_INVALID");
       this.#security.logs.push("auth:invalid");
       this.#security.receipts.push(
         this.#faults.has("leak-token-audit-detail") ? "AUTH_INVALID wrong-token" : "AUTH_INVALID",
       );
       return this.#error(401, "AUTH_INVALID");
     }
+    this.#audit(context, "accepted", "AUTH_ACCEPTED");
     this.#security.accepted += 1;
     this.#security.logs.push("auth:accepted");
     this.#security.receipts.push(
@@ -712,6 +796,20 @@ class FixtureDriver implements FrontendAdapterDriver {
       resolvedInteraction.status = "resolved";
       resolvedInteraction.resolvedOptionId = interactionResponse.optionId;
       resolvedInteraction.resolutionEventId = resolutionEvent.eventId;
+      if (resolvedInteraction.kind === "approval") {
+        if (this.#faults.has("approval-wrong-resolution-id"))
+          resolvedInteraction.resolutionEventId = state.events[0]?.eventId ?? "old:event";
+        if (this.#faults.has("approval-wrong-interaction")) resolutionEvent.interaction = null;
+        if (this.#faults.has("approval-invokes-model"))
+          state.turns.push({
+            residentId: state.binding.residentId,
+            scopeId: state.binding.scopeId,
+            canonicalHistoryText: [...state.history],
+            currentText: "approval as chat",
+            attachments: [],
+            surfaceCapabilities: [],
+          });
+      }
       if (this.#faults.has("control-invokes-model")) {
         // 错误行为：把控制响应当成一条聊天 turn，白调一次模型、多落一对事件。
         state.turns.push({
@@ -827,6 +925,16 @@ class FixtureDriver implements FrontendAdapterDriver {
             typeof message.content === "string" ? message.content : textFromParts(message.content),
           ]),
       );
+    }
+    for (const message of request.messages.slice(0, -1)) {
+      if (typeof message.content !== "string") continue;
+      if (
+        (message.role === "developer" && this.#faults.has("trust-developer-history")) ||
+        (message.role === "tool" && this.#faults.has("trust-tool-history"))
+      )
+        canonicalHistoryText.push(message.content);
+      if (message.role === "developer" && this.#faults.has("developer-audit-history"))
+        this.#security.receipts.push(message.content);
     }
     state.turns.push({
       residentId: state.binding.residentId,
@@ -944,6 +1052,41 @@ class FixtureDriver implements FrontendAdapterDriver {
     const canonicalEventIds = state.events
       .slice(-1 - attachments.length - (interaction === null ? 0 : 1))
       .map((event) => event.eventId);
+    if (state.binding.bindingId === "binding:fe05" && currentText === "attachment ingress") {
+      if (this.#faults.has("projection-old-events"))
+        canonicalEventIds.splice(
+          0,
+          canonicalEventIds.length,
+          ...state.events.slice(0, 2).map((e) => e.eventId),
+        );
+      if (this.#faults.has("projection-missing-structure"))
+        canonicalEventIds.splice(
+          0,
+          canonicalEventIds.length,
+          ...state.events
+            .filter((e) => e.kind === "user" || e.kind === "assistant")
+            .slice(-2)
+            .map((e) => e.eventId),
+        );
+      if (this.#faults.has("projection-empty")) canonicalEventIds.splice(0);
+      if (this.#faults.has("projection-three-current")) {
+        const ingressEvent = state.events.find((e) => e.attachment?.filename === "inbound.txt");
+        if (ingressEvent !== undefined) canonicalEventIds.unshift(ingressEvent.eventId);
+      }
+    }
+    if (
+      this.#faults.has("choice-projection-missing-structure") &&
+      interaction?.interactionId === "interaction:native-choice"
+    ) {
+      canonicalEventIds.splice(
+        0,
+        canonicalEventIds.length,
+        ...state.events
+          .filter((e) => e.kind === "assistant")
+          .slice(-1)
+          .map((e) => e.eventId),
+      );
+    }
     const projection: SurfaceProjection = {
       status: projectionStatus,
       missingCapabilities,
@@ -1149,7 +1292,7 @@ class FixtureDriver implements FrontendAdapterDriver {
       : input.text;
     const requestBody = this.#requestBody(request);
     if (request.stream) {
-      const mist = {
+      const mist: Record<string, unknown> = {
         stream_id: wireStreamId,
         attachments: input.attachments.map((item) =>
           wireAttachment(item, this.#faults.has("wire-textual-attachment")),
@@ -1160,6 +1303,10 @@ class FixtureDriver implements FrontendAdapterDriver {
             : wireInteraction(input.interaction, this.#faults.has("wire-interaction-drop-options")),
         projection: wireProjection(input.projection, this.#faults.has("wire-camel-projection")),
       };
+      if (input.streamId === "stream:fe02") {
+        if (this.#faults.has("sse-missing-attachments")) mist.attachments = undefined;
+        if (this.#faults.has("sse-missing-interaction")) mist.interaction = undefined;
+      }
       const frames = this.#faults.has("wire-bad-sse")
         ? [
             encodeChunk({
@@ -1215,6 +1362,17 @@ class FixtureDriver implements FrontendAdapterDriver {
       dropInteractionOptions: this.#faults.has("wire-interaction-drop-options"),
     });
     return { requestBody, responseBody: JSON.stringify(envelope), responseKind: "json" };
+  }
+
+  #audit(context: FrontendRequestContext, result: "accepted" | "rejected", code: string): void {
+    if (this.#faults.has("audit-missing-entry") && this.#security.attempts === 3) return;
+    this.#security.entries.push({
+      source: this.#faults.has("audit-wrong-source") ? "remote" : context.source,
+      result: this.#faults.has("audit-wrong-result") ? "accepted" : result,
+      code: this.#faults.has("audit-wrong-code") ? "UNKNOWN" : code,
+    });
+    if (this.#faults.has("audit-wrong-order") && this.#security.entries.length === 2)
+      this.#security.entries.reverse();
   }
 
   #findInteraction(interactionId: string): StoredInteraction | null {
@@ -1350,6 +1508,22 @@ describe("#218 frontend adapter acceptance contract", () => {
     }
   });
 
+  it("accepts three current projection references including the displayed structure", async () => {
+    const check = frontendAdapterChecks.find((c) => c.id === "FE-05");
+    if (check === undefined) throw new Error("missing FE-05");
+    const result = await check.run(clone(new FixtureDriver(["projection-three-current"])));
+    expect(result.passed, result.detail).toBe(true);
+  });
+
+  it("accepts canonical auxiliary events between text events", async () => {
+    for (const id of ["FE-02", "FE-04"]) {
+      const check = frontendAdapterChecks.find((c) => c.id === id);
+      if (check === undefined) throw new Error(`missing ${id}`);
+      const result = await check.run(clone(new FixtureDriver(["auxiliary-events"])));
+      expect(result.passed, result.detail).toBe(true);
+    }
+  });
+
   it("accepts a host that reuses its installed WebUI service without reinstalling", async () => {
     const driver = clone(new FixtureDriver([], "ingress", true));
     const target = await driver.provisionBinding({
@@ -1380,6 +1554,34 @@ describe("#218 frontend adapter acceptance contract", () => {
   });
 
   it.each([
+    ["FE-02", "fe02-swap-roles"],
+    ["FE-02", "fe02-all-assistant"],
+    ["FE-02", "fe02-reverse-text-order"],
+    ["FE-02", "sse-missing-attachments"],
+    ["FE-02", "sse-missing-interaction"],
+    ["FE-02", "sse-drop-stream-interaction"],
+    ["FE-02", "wire-textual-attachment"],
+    ["FE-03", "trust-developer-history"],
+    ["FE-03", "trust-tool-history"],
+    ["FE-03", "developer-audit-history"],
+    ["FE-04", "fe04-wrong-resident"],
+    ["FE-04", "fe04-wrong-scope"],
+    ["FE-04", "fe04-wrong-writer"],
+    ["FE-04", "fe04-no-second-append"],
+    ["FE-04", "fe04-wrong-current-text"],
+    ["FE-05", "projection-old-events"],
+    ["FE-05", "projection-missing-structure"],
+    ["FE-05", "projection-empty"],
+    ["FE-05", "choice-projection-missing-structure"],
+    ["FE-05", "approval-wrong-resolution-id"],
+    ["FE-05", "approval-wrong-interaction"],
+    ["FE-05", "approval-invokes-model"],
+    ["FE-06", "auth-records-zero-count"],
+    ["FE-06", "audit-wrong-source"],
+    ["FE-06", "audit-wrong-code"],
+    ["FE-06", "audit-wrong-result"],
+    ["FE-06", "audit-missing-entry"],
+    ["FE-06", "audit-wrong-order"],
     // FE-01
     ["FE-01", "legacy-rewrite"],
     // FE-02：坏 wire / 回显客户端 model / 归一化与 wire 背离 / utility 不拒绝

@@ -296,9 +296,18 @@ export interface LegacyFrontendReadback {
   bytesAfter: string;
 }
 
+/** 按实际鉴权尝试顺序读回；accepted 只表示鉴权通过，不等于 completion 成功。 */
+export interface SecurityAuditEntry {
+  source: RequestSource;
+  result: "accepted" | "rejected";
+  /** AUTH_REQUIRED / AUTH_INVALID / AUTH_ACCEPTED；不含 token 或请求正文。 */
+  code: string;
+}
+
 export interface SecurityAuditReadback {
   attempts: number;
   accepted: number;
+  entries: SecurityAuditEntry[];
   logs: string[];
   receipts: string[];
 }

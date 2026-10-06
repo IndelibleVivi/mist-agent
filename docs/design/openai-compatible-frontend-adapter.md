@@ -3,7 +3,7 @@
 状态：**图纸候选，先供主笔评审；功能驱动尚未落地，FE-01～FE-07 应保持全红。**
 
 本候选新增的观测面（远程 URL 网络尝试审计、流式 interaction、`/webui` 提案↔实装关联、
-私有附件写入 delta）也只是**判卷图纸**：合成 fixture 正例只证明判卷器能识别正确形状，
+私有附件写入 delta、逐请求鉴权 entries）也只是**判卷图纸**：合成 fixture 正例只证明判卷器能识别正确形状，
 不代表生产 adapter 已实现，也不替代真实宿主与独立验收席。
 
 关联：D31 / #218；D9 一窗流；D11 第二、三、四条；#49 鉴权；D30 删除旧 DSH webui。
@@ -300,6 +300,11 @@ adapter 在组装本轮模型输入时，加入「本轮 client 声明了哪些 
 canonical 事件。下一轮住户可以知道 adapter 当时采取了哪种投影、为什么降级或阻断，不必从
 前端重放历史里猜。
 
+`canonical_event_ids` 是本轮新追加事件的非空子集，须覆盖响应实际呈现的附件/interaction，
+且这些事件归属当前绑定的 resident/scope/stream/writer。可以引用一条、两条或三条等本轮记录，
+不要求把每条 user/assistant 都列入；旧回合的任意已有记录不能替代。native 投影决策也关联本轮
+canonical 记录。代价：判卷须在每次请求前后读回事件并比较 id，不能用全流累计数或固定条数替代。
+
 这条记录**不能证明浏览器最终真的渲染成功**。Chat Completions 响应没有客户端确认通道；把
 capability claim 或「响应已经写出 socket」叫成 UI delivery receipt，会越过实际证据。若以后
 Open WebUI Pipe Function 要回传真实呈现结果，必须另立带 request/event id 的 acknowledgment，
@@ -332,7 +337,16 @@ token 原文不进日志、投影记录、响应 id/body/error、原始 JSON/SSE
 判卷同时扫描普通及 SSE 成功响应、401 原始响应、模型与 canonical/交互/附件元数据读回和审计；
 失败诊断同样不打印已发现的 token。raw transport 的请求观察只保留 body，不复制 Authorization。
 鉴权审计只记请求 id、来源类别、结果 code 与时间。带附件的未认证请求也必须先拒绝，
-附件私有面不能先落字节再靠 canonical event 数为零冒充“零副作用”。
+附件私有面不能先落字节再靠 canonical event 数为零冒充“零副作用”。独立附件读回的 count
+与 records 长度须一致，拒绝后二者都为零；纯文本成功无需附件写入。
+
+候选 `readSecurityAudit` 增加按实际鉴权尝试顺序读回的 `entries`，每项为
+`{ source, result, code }`：source 为 remote/loopback，result 为 accepted/rejected，code 为
+AUTH_REQUIRED / AUTH_INVALID / AUTH_ACCEPTED。AUTH_ACCEPTED 与 accepted 汇总只证明鉴权
+通过；例如已认证 utility 请求仍可被 completion 拒绝。FE-06 逐项核四次拒绝与两次 loopback
+正对照，并与 attempts/accepted 汇总互证。生产审计的请求 id/时间不因此变成新的网络请求
+identity/replay/concurrency 契约。代价：驱动要提供这组结构化鉴权观察，不能仅返回总数；
+既有 logs/receipts 仍保留并参与 token 扫描，不解析自由文本来推断来源或 code。
 
 ## 8. `/webui` 的接缝
 
@@ -373,11 +387,11 @@ FE-07 要从这条实际接线读回回复与精确事件数，核 writer、resi
 | 灯 | 本图纸冻结的观察面 |
 | --- | --- |
 | FE-01 | terminal 默认、external 显式、legacy official-skin 可操作拒绝且原字节不改 |
-| FE-02 | 原始 JSON/SSE 与归一化结果相符、唯一 writer、每个 turn 恰好一份、识别 utility 后在附件解析/持久化前拒绝 |
-| FE-03 | 请求前缀历史不进模型、不落账；空 messages / 末尾非 user / 不可解析 content 稳定拒绝 |
-| FE-04 | model/user/conversation id 不改变 resident/scope/stream/server route |
-| FE-05 | 完整附件/interaction 结构、远程 URL SSRF 拒绝、流式 interaction、generic 降级、native choice/approval 闭环与负例 |
-| FE-06 | 同一 Bearer 闸、失败零模型/账/附件副作用、响应与读回全表面 token 零泄漏 |
+| FE-02 | 原始 JSON/SSE 完整结构与归一化相符、文本事件 kind/正文/顺序、唯一 writer、utility 在附件解析/持久化前拒绝 |
+| FE-03 | 含 developer/tool 的请求前缀历史不进模型/账/可观察回执；空 messages / 末尾非 user / 不可解析 content 稳定拒绝 |
+| FE-04 | 两请求各自新增事件的归属、writer、正文/顺序及 model currentText；客户端字段不改变 server route |
+| FE-05 | 完整结构、本轮非空投影子集、远程 URL SSRF 拒绝、流式 interaction、generic 降级、choice/approval 同次 resolution 绑定与负例 |
+| FE-06 | 同一 Bearer 闸、失败零模型/账/控制/附件 count+records、逐来源/result/code 鉴权审计、全表面 token 零泄漏 |
 | FE-07 | 展示→确认→安装顺序、提案与实装插件身份关联、环境、插件闸、本机 URL、私有附件写入 delta 与归属、同 endpoint 的 writer/history/auth 边界与 task 拒绝 |
 
 判卷驱动只观察公开边界；缺驱动时七盏全红。正向 fixture 只用于证明判卷器能识别正确形状，
