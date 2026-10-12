@@ -28,6 +28,8 @@
   [回合恢复补充回归](acceptance/resident-runtime.md#回合恢复补充回归)。
 - 改动 `say()`、账确认或 TUI 重试时跑 `tests/resident-turn-recovery.test.ts`、
   `tests/resident-tui.test.ts`、`tests/resident-runtime-host-boundary.test.ts`，并同步该说明与 README。
+- TUI 只记最近失败回合；后续补账消息须经 `tui.submit()` 验证，成功的普通回合不能清掉
+  待恢复锚。只有原回合恢复成功才清除，新的失败回合接替它；CLI 错误须实际显示在画面。
 
 ## 写文档的规矩
 

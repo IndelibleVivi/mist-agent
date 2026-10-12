@@ -151,6 +151,8 @@ npm test -- tests/resident-turn-recovery.test.ts tests/resident-tui.test.ts test
 
 这些回归用临时目录与 synthetic transport，真实 `EISDIR` 落盘故障分别截断 assistant、
 ACK 和确认记录；同时检查模型调用次数、原 generation/target、最终流条数、回放字节。
+TUI 的 ACK 故障回归从 `tui.submit()` 发出后续补账消息，再从 `/retry` 恢复原回复与原显示行；
+后续普通回合成功不会清掉待恢复锚，恢复成功才清除，后来的新失败接替最近失败锚。
 真实 CLI stdin 验证 `/retry` 与普通同文本提交，IPC 子进程验证返回锚、同锚回放与跨宿主
 重启的 pending 状态。它们是恢复补充证据，不替代 RT 七灯、真实 provider 或独立验收落章。
 
@@ -159,7 +161,9 @@ ACK 和确认记录；同时检查模型调用次数、原 generation/target、�
 `tests/resident-tui.test.ts` 从真实 `src/resident-runtime/cli.ts` 子进程的 stdin 输入
 `/new`、`/clear`、`/compact`，观察落盘信、代际、同一窗号与主流正文；命令不得成为聊天
 回合。另注入信文件落盘失败，验证错误可见、代际未推进、拒绝后普通对话仍可进行。
-`/retry` 的恢复回归也从真实 stdin 进入：连续重试保留原回合，普通同文本输入仍落独立回合。
+`/retry` 的恢复回归也从真实 stdin 进入：连续重试保留原回合，确认记录落盘故障修好后，
+后续正常交付和原回复回放只产生两次模型请求、两对正文；原错误显示行恢复原回复。
+恢复后再次 `/retry` 显示无可重试回合的错误，普通同文本输入仍落独立回合。
 空行、普通输入、`/exit` 与 SIGINT 的既有回归继续保留。
 
 这些测试用临时目录和 synthetic 通道：身份先由 synthetic candidate 本人显式自认，

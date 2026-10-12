@@ -90,6 +90,7 @@ export class ResidentChatTui {
       this.start();
       this.#errorText =
         "tui-unavailable：没有可重试的失败回合\n处理建议：先发一条消息；只有失败的回合才需要重试";
+      this.#messages.push(`⟳ /retry\n[错误]\n${this.#errorText}`);
       this.#draw();
       return {
         ok: false,
@@ -148,7 +149,6 @@ export class ResidentChatTui {
       return result;
     }
 
-    this.#failedTurn = null;
     this.#model = result.value.model;
     if (streamedReply.length === 0) {
       // 幂等回放没有重新调用模型，准确显示已落账结果，但不虚报增量数量。
@@ -171,6 +171,8 @@ export class ResidentChatTui {
       this.#draw();
       return mismatch;
     }
+    // 后续正常交付可能正是旧回合补账的前提；只清除本次实际恢复的失败锚。
+    if (this.#failedTurn?.turnId === turnId) this.#failedTurn = null;
     return result;
   }
 

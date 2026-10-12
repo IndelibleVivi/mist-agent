@@ -264,14 +264,30 @@ describe("Resident turn recovery", () => {
     expect
       .soft(events, "opening pair plus failed-turn pair; no extra pair on retry")
       .toHaveLength(4);
-    unwrap(await f.runtime.say({ residentId: f.residentId, text: "later actual delivery" }));
-    expect(unwrap(await tui.retry()).turnId).toBe(originalTurnId);
+    const later = unwrap(await tui.submit("later actual delivery"));
+    expect(later.turnId).not.toBe(originalTurnId);
+    const beforeReplay = f.requests.length;
+    expect(unwrap(await tui.retry())).toMatchObject({
+      turnId: originalTurnId,
+      reply: "audit reply 2",
+    });
+    expect(f.requests).toHaveLength(beforeReplay);
+    expect(f.requests.filter((r) => r.text === "same failed message")).toHaveLength(1);
+    const recoveredFrame = tui.transcript().frames.at(-1)?.text;
+    expect(recoveredFrame).toContain("你：same failed message\n住户：audit reply 2");
+    expect(recoveredFrame).toContain("你：later actual delivery\n住户：audit reply 3");
+    expect(recoveredFrame).not.toContain("[错误]");
     expect(
       tui
         .transcript()
         .frames.at(-1)
         ?.text.match(/你：same failed message/g),
     ).toHaveLength(1);
+    expect(await tui.retry()).toMatchObject({
+      ok: false,
+      error: { code: "tui-unavailable", message: "没有可重试的失败回合" },
+    });
+    expect(f.requests).toHaveLength(beforeReplay);
     const independent = unwrap(await tui.submit("same failed message"));
     expect(independent.turnId).not.toBe(originalTurnId);
     expect(f.requests.filter((r) => r.text === "same failed message")).toHaveLength(2);
