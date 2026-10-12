@@ -54,6 +54,25 @@ mist 是一个个人 agent harness（建造中）。它的设计从一句话长�
 解析或条目结构无法读出时，在调用模型前报 `letter-invalid`。旧代原始对话保留在流水里，
 不自动塞回新一代上下文。
 
+模型请求把身份、交接信与固定权威说明放在 system prompt，本代历史保持 user / assistant 角色与顺序；
+承诺、记忆和现行事实每轮从真源重读，放在历史之后、本轮用户输入之前。pi 使用回合私有
+临时 session 载入这些消息，结束、失败或取消后删除；一窗流仍是唯一持久对话真源。
+
+成功完成的聊天回合会向 `logs/<residentId>.usage.jsonl` 追加运行读数，默认合成通道的读数
+为未知。真实 pi 终态报告的 input、output、cacheRead、cacheWrite、totalTokens 与 costTotal
+按字段保留，未报告的字段省略；不保存 prompt、历史、凭证或上游 raw payload。
+嵌入方用 `runtime.turnUsage({ residentId })` 读取逐回合记录、日志中已报告值的累计和字段
+覆盖数；这些累计不是当前窗口占用，也不是完整账单。`costTotal` 是 pi 报告的成本估算。
+pi / bridge 可能用默认 0 表示未收到计数，因此报告的 0 不证明实测零或缓存未命中。
+写日志失败不改变聊天与 ACK 结果，读口报告不可读日志或本进程已知的 `logError`。
+本次不承诺缓存节省比例；实际收益需真实 provider usage 验证。
+
+真实 pi 通道要求外部 `@earendil-works/pi-coding-agent` ≥0.86.1；所核 0.86.1 / 1.1.0 包
+要求 Node ≥22.19，Claude 订阅另装 `pi-claude-bridge`。不随 Mist 内置这些上游包。
+Claude 路由只显式载入 `pi install npm:pi-claude-bridge` 的用户级安装，其他扩展仍禁用；
+非标准安装用 `MIST_PI_BRIDGE_EXTENSION` 指向已安装的本地扩展，缺包拒绝调用，
+不替用户下载。路径与 pi 配置根的说明见 [运行时配置](docs/runtime-config.md)。
+
 现状限制：交接信 `intent` 半仍是确定性装配，当刻亲笔（D8）按主笔
 排期单列；旧字符串承诺的确认/迁移工具另单，本运行时只做 fail-closed 拒绝并给出宿主 API
 入口，不做自动迁移。住户入住先经过 #182 的 candidate / self-attestation 生产闸，只有 active 身份物化 room 与账；

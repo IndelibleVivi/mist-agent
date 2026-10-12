@@ -93,6 +93,21 @@ RT-05 判的是渲染输入的结构（帧、增量、状态栏字段、错误�
 
 ## 模型输入的补充回归
 
+`#227` 第 1/2 项沿现有输入读口：system prompt 保留身份、原交接信与固定权威说明，本代历史按原
+user/assistant 角色进入私有 Pi session，动态承诺/记忆/currentFacts 放在历史之后、当前
+user 之前。历史 assistant 使用合法 content 数组，导入 metadata/零计数只用于上游 schema，
+不作为实测或本轮 usage；session 与 prompt 回合后删除。没有改一窗流、事实账和信档的口径。
+
+Usage 定向回归覆盖终态存在/缺失/部分/显式零/非法数字、重复事件、失败/取消；真实 runtime
+回调到 `logs/<residentId>.usage.jsonl` 与 `turnUsage()` 的链路、字段 allowlist、身份隔离和
+写日志失败后的正常正文/ACK。累计只针对已记录且上游报告的字段，附覆盖数，不是 context
+占用或完整账单；上游默认零可能没有真实读数，不能宣称缓存已命中或节省费用。
+代价：每回合生成、删除私有 session 投影并追加诊断日志；日志可能遗漏，正式 provider
+缓存收益仍需实测。自动换气与亲笔交接信仍归第 3/4 项另单，本项不施工。
+
+上游格式依据为 `@earendil-works/pi-coding-agent` 0.86.1 / 1.1.0 的 session v3 与 RPC，
+bridge 0.9.2 文本转换器；这些 pi 包要求 Node ≥22.19，外部通道不随主仓安装。
+
 `bootPack()` 诊断读口和 `say()` 的模型请求共用 runtime 装配路径：从现役存储读身份、
 承诺、记忆、可选现行事实和最新交接信。无信为 `null`；信档无法解析或条目结构无法读出
 时，两处均报 `letter-invalid`，模型不被调用、既有一窗流不变。

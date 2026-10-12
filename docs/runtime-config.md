@@ -16,6 +16,8 @@
 |---|---|---|---|
 | `MIST_DATA_DIR` | `src/installer/cli.ts`、`src/resident-runtime/cli.ts` | `~/.mist` | 安装器与终端的数据根；各入口的 `--data-dir` 优先。共用根目录不表示安装快照已接到 runtime |
 | `MIST_RESIDENT_RUNTIME_TRANSPORT` | `src/resident-runtime/channels.ts` | `synthetic`（未设或空字符串） | `synthetic` 为确定性合成通道；`pi` 经外部 pi CLI 调真实模型。其他值拒绝启动；设为 pi 不自动完成通道配置 |
+| `MIST_PI_BRIDGE_EXTENSION` | `src/resident-runtime/pi-transport.ts` | pi 用户级 npm 安装目录中的 `pi-claude-bridge` | 仅 Claude bridge 路由读取；可指定已安装扩展的绝对路径或 `~/` 路径（文件或 package 目录），供非标准安装使用。缺包拒绝调用，不下载或安装 |
+| `PI_CODING_AGENT_DIR`（pi 上游变量） | `src/resident-runtime/pi-transport.ts`、外部 pi CLI | `~/.pi/agent` | 沿用 pi 的用户配置根；未设 bridge 路径时查找 `<agentDir>/npm/node_modules/pi-claude-bridge`，即 pi ≥0.86.1 的用户级 npm 安装位置。不读取其中的凭证或配置内容 |
 | `MIST_RESIDENT_RUNTIME_DIR` | `src/resident-runtime/host-process.ts` | 无；缺失拒绝启动 | runtime IPC 宿主的落盘根，判卷 adapter 显式注入。普通 `npm run resident` 的数据根仍走 `--data-dir` / `MIST_DATA_DIR` |
 | `MIST_GROUP_CHAT_DATA_ROOT` | `src/group-chat/host-process.ts` | 无；缺失拒绝启动 | 群聊 IPC 宿主的落盘根，由群聊判卷 adapter（`src/group-chat-acceptance-driver.ts`）显式注入 |
 | `MIST_WINDOW_ARCHIVE_PATH` | `tests/fixtures/session-registry-host.ts` | 空 = 纯内存 | 窗生命周期 JSONL 归档路径（`window_opened` / `window_archived` 追加写）。不设则不持久化，供无持久化需求的嵌入方 |
@@ -63,6 +65,23 @@ CLI 与宿主子进程共用 `src/resident-runtime/assembly.ts`，沿用现役
 嵌入方可选 `ledger: { dataDir }` 接认证宿主，或
 `factLedger` 接已有账的只读视图；两者互斥，都不传则 `currentFacts` 缺席。
 交接信的 `commitment` 只保存 seq 指针和短引用，不复印正文；现行正文随 `currentFacts`
-进入启动包，Pi 系统提示按 `[#seq] 正文` 渲染，供信里的指针定位。
+进入启动包，Pi 的本轮尾部 context 消息按 `[#seq] 正文` 渲染，供信里的指针定位。
 宿主维护经 `AuthenticatedLedgerHost.system(senderId).append`，新承诺用 `active_rule`；
 住户写入仍须经过已认证 ingress 和现役 `forDispatch(...).append`，没有新增终端立承诺命令。
+
+Pi 模型输入布局：system prompt 放身份、原交接信与固定权威说明；本代 history 按 user/assistant
+角色载入回合私有 session；当前承诺、记忆、可选现行事实放在 history 之后，当前 user
+仍经 RPC `prompt` 只发一次。session 文件与 prompt 共用 0700 临时目录、文件 0600，
+回合结束或取消后删除，不形成第二份持久聊天史。真实通道的外部包已迁至
+`@earendil-works/pi-coding-agent`，要求 pi ≥0.86.1；核过的 0.86.1 / 1.1.0 要求 Node ≥22.19。
+Claude 路由保留 `--no-extensions` 禁用自动发现，同时以 `--extension <本地路径>`
+只显式载入已安装 bridge。默认位置对应 `pi install npm:pi-claude-bridge`；全局 npm、
+项目级或其他安装位置用 `MIST_PI_BRIDGE_EXTENSION` 指向现有扩展。API-key 路由不加载它。
+
+Usage 无新增环境变量：成功回合追加到 `dataDir/logs/<residentId>.usage.jsonl`，文件 0600。
+只记录 turnId、代际、模型、adapter、时间及有效的 reported 数值；缺失字段省略，合成通道
+不造读数。`runtime.turnUsage()` 走身份读闸，可用 candidateId 解析已激活住户；按字段累计
+附 `cumulativeCoverage`，其 `totalTurns` 仅计已记录回合，不涵盖丢失日志或失败模型调用。
+`costTotal` 是上游报告的估算，不是账单；默认 0 可能来自上游归零，不能据此判定缓存。
+写日志失败不会回滚完成的聊天/ACK；本进程的 `logError` 保留已知遗漏，重启后不重建它。
+读盘失败/坏记录报 `writer-unavailable`，不回显原文。累计不是 context 占用，换气估算门不变。
