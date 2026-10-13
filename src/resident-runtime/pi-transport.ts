@@ -429,6 +429,12 @@ export function splitModelId(model: string): { provider: string; model: string }
   return { provider: model.slice(0, slash), model: model.slice(slash + 1) };
 }
 
+/** 这个 `provider/model` 能不能走 pi 的 API key 通道：provider 必须在上面那张密钥变量表里。 */
+export function piApiKeyModelSupported(model: string): boolean {
+  const { provider } = splitModelId(model);
+  return provider.length > 0 && Object.hasOwn(PROVIDER_SECRET_ENV, provider);
+}
+
 /**
  * 把完整启动包 + 本代历史渲染进系统提示。currentFacts 缺席 = 没接账；空数组 = 权威事实账为空。
  * 交接信（D8 补记三）：null 或既有请求省略字段时没有交接信分区；

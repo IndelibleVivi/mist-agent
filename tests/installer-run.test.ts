@@ -1,17 +1,27 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { InstallerController } from "../src/installer/controller.ts";
 import { FileMemoryLibrary } from "../src/installer/memory-library.ts";
 import type { OAuthLoginPort } from "../src/installer/pi-login.ts";
 import type { PromptPort } from "../src/installer/prompt-port.ts";
-import { PROVIDERS } from "../src/installer/providers.ts";
+import { PROVIDERS, credentialTypeFor, providerById } from "../src/installer/providers.ts";
 import { runInstaller } from "../src/installer/run.ts";
 import { InstallerStateStore } from "../src/installer/state-store.ts";
 import { ResidentIdentityStore } from "../src/resident-continuity/identity-store.ts";
+import type { ModelCompletionRequest, ModelTransport } from "../src/resident-runtime/channels.ts";
+import { main as residentMain } from "../src/resident-runtime/cli.ts";
 import { ResidentRuntime } from "../src/resident-runtime/runtime.ts";
 
 const temporaryDirectories: string[] = [];
@@ -237,6 +247,54 @@ it("keeps Grok OAuth out of the v0 installer acquisition catalog", () => {
 
   expect(grok?.piAuthKey).toBe("xai");
   expect(grok?.methods).toEqual(["api-key"]);
+});
+
+it("offers OpenRouter and Kimi Code by API key only, under pi's provider names", () => {
+  const openrouter = providerById("openrouter");
+  const kimi = providerById("kimi");
+
+  expect(openrouter.piAuthKey).toBe("openrouter");
+  expect(kimi.piAuthKey).toBe("kimi-coding");
+  expect(openrouter.methods).toEqual(["api-key"]);
+  expect(kimi.methods).toEqual(["api-key"]);
+  expect(credentialTypeFor(openrouter, "api-key")).toBe("api_key");
+  expect(() => credentialTypeFor(kimi, "oauth")).toThrow(/no OAuth credential type/);
+});
+
+it("defaults the frontend step to the choice that can be saved today", async () => {
+  const directory = freshDirectory();
+  const memoryPath = join(directory, "memory");
+  mkdirSync(memoryPath);
+  const store = new InstallerStateStore(directory);
+  const defaults = new Map<string, string | undefined>();
+  class RecordingPrompt extends ScriptedPrompt {
+    override async select<Value extends string>(options?: {
+      message: string;
+      default?: Value;
+    }): Promise<Value> {
+      if (options !== undefined) defaults.set(options.message, options.default);
+      return super.select<Value>();
+    }
+  }
+  const prompt = new RecordingPrompt({
+    selects: ["openrouter", "api-key", "openrouter-key", "external", "existing"],
+    inputs: ["openrouter-key", memoryPath],
+    secrets: ["synthetic-frontend-default-secret"],
+    confirms: [false, false, true],
+  });
+
+  const result = await runInstaller({
+    residentId: "resident-1",
+    dataDir: directory,
+    controller: new InstallerController(store),
+    store,
+    prompt,
+    oauth: noOAuth,
+    memoryLibraries: new FileMemoryLibrary(),
+  });
+
+  expect(result.status).toBe("committed");
+  expect(defaults.get("Step 3/4 · Frontend")).toBe("external");
 });
 
 it("replaces a credential when the user enters the same name twice", async () => {
@@ -1062,4 +1120,129 @@ it("does not send a committed installer user back through setup or silently acti
   expect(readFileSync(join(directory, "current.json"), "utf8")).toBe(currentBefore);
   expect(readFileSync(configPath, "utf8")).toBe(configBefore);
   expect(store.readCredentialSecret("codex-key")).toBe(secret);
+});
+
+/** 录下每次请求，按顺序吐出预设回答。 */
+class ScriptedTransport implements ModelTransport {
+  readonly requests: ModelCompletionRequest[] = [];
+  readonly #replies: string[];
+  constructor(replies: string[]) {
+    this.#replies = [...replies];
+  }
+  async *complete(request: ModelCompletionRequest): AsyncIterable<string> {
+    this.requests.push(structuredClone(request));
+    const reply = this.#replies.shift() ?? "";
+    yield reply.slice(0, 1);
+    yield reply.slice(1);
+  }
+}
+
+async function* scriptedLines(lines: readonly string[]): AsyncGenerator<string> {
+  yield* lines;
+}
+
+/** 在本进程里跑一次 `npm run resident`，收下它写给终端的全部文字。 */
+async function runResident(
+  args: string[],
+  transport: ModelTransport,
+  lines: readonly string[],
+): Promise<{ exitCode: number; output: string }> {
+  const output: string[] = [];
+  const capture = (chunk: unknown): boolean => {
+    output.push(String(chunk));
+    return true;
+  };
+  const stdout = vi.spyOn(process.stdout, "write").mockImplementation(capture);
+  const stderr = vi.spyOn(process.stderr, "write").mockImplementation(capture);
+  const before = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    await residentMain(args, { transport, lines: scriptedLines(lines) });
+    return { exitCode: Number(process.exitCode ?? 0), output: output.join("") };
+  } finally {
+    process.exitCode = before;
+    stdout.mockRestore();
+    stderr.mockRestore();
+  }
+}
+
+it("goes from a committed setup to chat only after the resident itself accepts the persona", async () => {
+  const directory = freshDirectory();
+  const memoryPath = join(directory, "memory");
+  mkdirSync(memoryPath);
+  const store = new InstallerStateStore(directory);
+  const secret = "synthetic-setup-to-chat-secret";
+  const model = "openrouter/test-vendor/test-model";
+  const prompt = new ScriptedPrompt({
+    selects: ["openrouter", "api-key", "openrouter-key", "external", "existing"],
+    inputs: ["openrouter-key", memoryPath],
+    secrets: [secret],
+    confirms: [false, false, true],
+  });
+  const installed = await runInstaller({
+    residentId: "resident-1",
+    dataDir: directory,
+    controller: new InstallerController(store),
+    store,
+    prompt,
+    oauth: noOAuth,
+    memoryLibraries: new FileMemoryLibrary(),
+  });
+  if (installed.status !== "committed") throw new Error("installer did not commit");
+  prompt.expectExhausted();
+  const firstPersona = join(directory, "first.md");
+  const secondPersona = join(directory, "second.md");
+  writeFileSync(firstPersona, "TEST-PERSONA-ONE");
+  writeFileSync(secondPersona, "TEST-PERSONA-TWO");
+  const credentialsManifest = join(directory, "credentials", "manifest.json");
+  const streamPath = join(directory, "streams", "resident-1.stream.json");
+
+  // —— 负例：住户自己说不认。安装和人都不能替它认，什么都不开门 ——
+  const refusing = new ScriptedTransport(["不认\n这不是我。"]);
+  const refused = await runResident(
+    ["--data-dir", directory, "--persona", firstPersona, "--model", model],
+    refusing,
+    ["你好", "/exit"],
+  );
+  expect(refused.exitCode).toBe(1);
+  expect(refused.output).toContain("candidate-rejected");
+  expect(refusing.requests).toHaveLength(1);
+  expect(refusing.requests[0]?.bootPack.identity).toBe("TEST-PERSONA-ONE");
+  expect(existsSync(credentialsManifest)).toBe(false);
+  expect(existsSync(streamPath)).toBe(false);
+  expect(readdirSync(join(directory, "residents"))).toEqual([]);
+
+  // —— 正对照：换一份人格稿，住户第一行写「认」，同一次启动接着进聊天 ——
+  const accepting = new ScriptedTransport(["认\n这份像我。", "你好，我在。"]);
+  const accepted = await runResident(
+    ["--data-dir", directory, "--persona", secondPersona, "--model", model],
+    accepting,
+    ["你好", "/exit"],
+  );
+  expect(accepted.exitCode, accepted.output).toBe(0);
+  expect(accepting.requests.map((request) => request.text.slice(0, 2))).toEqual(["在你", "你好"]);
+  expect(accepting.requests.every((request) => request.credentialSecret === secret)).toBe(true);
+  expect(accepting.requests[1]?.residentId).toBe("resident-1");
+  expect(accepting.requests[1]?.bootPack.identity).toContain("TEST-PERSONA-TWO");
+
+  const reopened = new ResidentRuntime({ dataDir: directory });
+  try {
+    const stream = reopened.readStream({ residentId: "resident-1" });
+    expect(stream.ok && stream.value.events.map((event) => [event.kind, event.text])).toEqual([
+      ["user", "你好"],
+      ["assistant", "你好，我在。"],
+    ]);
+  } finally {
+    await reopened.close();
+  }
+  expect(JSON.parse(readFileSync(credentialsManifest, "utf8")).credentials).toMatchObject([
+    { residentId: "resident-1", model, credentialKind: "api-key", status: "ready" },
+  ]);
+  // 不泄露：密钥只在安装快照和 runtime 凭证面，终端输出、一窗流、住户档案里都没有。
+  expect(refused.output + accepted.output).not.toContain(secret);
+  expect(readFileSync(streamPath, "utf8")).not.toContain(secret);
+  for (const file of readdirSync(join(directory, "residents"))) {
+    expect(readFileSync(join(directory, "residents", file), "utf8")).not.toContain(secret);
+  }
+  expect(store.readCredentialSecret("openrouter-key")).toBe(secret);
 });

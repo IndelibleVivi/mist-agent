@@ -216,9 +216,14 @@ async function collectFrontend(options: RunInstallerOptions): Promise<void> {
     message: "Step 3/4 · Frontend",
     choices: [
       { value: "official-skin", name: "Install the official Mist skin" },
-      { value: "external", name: "Connect my own frontend" },
+      {
+        value: "external",
+        name: "No skin for now: chat in the terminal (npm run resident) or connect my own frontend",
+      },
     ],
-    default: "official-skin",
+    // The official skin is still pending (#49, #51) and cannot be saved, so the default is the
+    // choice that lets setup finish and the terminal chat start.
+    default: "external",
   });
   if (kind === "official-skin") {
     options.prompt.info(

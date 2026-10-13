@@ -72,6 +72,9 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   });
   if (result.status === "committed") {
     prompt.info(`Setup saved as ${result.receipt.snapshotId}.`);
+    prompt.info(
+      "Next: run `npm run resident`. The first start asks for a persona file and a model, lets the resident accept or decline the persona itself, then opens the chat.",
+    );
   } else if (result.status === "paused") {
     prompt.info("Setup paused. Run the same command to continue.");
   } else if (result.status === "dependency-pending") {

@@ -57,7 +57,7 @@ mist 是一个个人 agent harness（建造中）。它的设计从一句话长�
 现状限制：交接信 `intent` 半仍是确定性装配，当刻亲笔（D8）按主笔
 排期单列；旧字符串承诺的确认/迁移工具另单，本运行时只做 fail-closed 拒绝并给出宿主 API
 入口，不做自动迁移。住户入住先经过 #182 的 candidate / self-attestation 生产闸，只有 active 身份物化 room 与账；
-通道配置不代签身份。setup 到聊天尚待桥接，#213 仅修诊断。
+通道配置不代签身份。装完到聊天怎么接，见下面[装完就能聊](#装完就能聊182)。
 
 ## 仓库地图
 
@@ -92,8 +92,8 @@ mist 是一个个人 agent harness（建造中）。它的设计从一句话长�
 npm run resident -- --resident <residentId> --data-dir <dataDir>
 ```
 
-默认使用合成传输；真实 pi 通道与所需凭证见 [runtime 配置](docs/runtime-config.md)。
-`npm run setup` 的安装快照尚未接到该入口，不能将上面命令作为 setup 后即能聊天的教程。
+带 `--resident` 时默认使用合成传输；真实 pi 通道与所需凭证见 [runtime 配置](docs/runtime-config.md)。
+从安装开始聊，用不带 `--resident` 的 `npm run resident`，见[装完就能聊](#装完就能聊182)。
 
 在聊天框输入 `/new`、`/clear` 或 `/compact`，都会请求现役 `breathe` 流程：
 先封缄并落盘交接信，再开始下一代；三个命令保留同一窗号和旧流水，不清空历史。
@@ -136,17 +136,39 @@ npm run resident -- --resident <residentId> --data-dir <dataDir>
 
 全量版带代价和推论，见 `docs/principles.md`。
 
-## 安装状态与终端入口的边界
+## 装完就能聊（#182）
 
-`npm run setup -- --resident <residentId> --data-dir <dataDir>` 保存安装器配置与私有凭证，
-通过 `current.json` 指向安装快照。`npm run resident -- --resident <residentId> --data-dir <dataDir>`
-读取另一个 runtime 凭证面与住户档案；当前尚未消费安装快照。因此 setup 成功后，
-即使使用同一个数据根，终端仍不能据此直接开始对话，重复 setup 也不会补齐 runtime 状态。
+终端经 pi 调模型，机器上要有 `pi` 命令（npm 包 `@earendil-works/pi-coding-agent`；旧名
+`@mariozechner/pi-coding-agent` 已停更）。然后：
 
-runtime 会明确显示这条边界，保留 `credential-missing` / `credential-invalid` /
-`resident-not-found` 的机器区分。已有宿主嵌入路径可通过 `provisionChannel()` 显式配置模型
-和通道；这不是终端首次入住的替代流程。完整交接还需接入 D22 的住户自认（[#182](https://github.com/mist-agent-harness/mist-agent/issues/182)）
-与明确的模型/provider 路由；安装器不能自动激活默认身份。隔离复现和验证范围见
+```bash
+npm run setup      # 存一把 API key（OpenRouter、Kimi Code、Claude、Codex、Grok 都行），前端选不装皮肤
+npm run resident   # 第一次：给人格稿、选模型，住户自己决定认不认，认了就进聊天
+```
+
+第一次启动依次做这几件事（`src/resident-runtime/onboarding.ts`）：
+
+1. 读当前安装（`current.json` 指向的快照）；没装过就提示先跑 setup，什么都不建。
+2. 人格稿由你递：`--persona <文件>`，或者按提示给路径。它只是候选（D22 一），mist 不预置默认人格。
+3. 选模型：`--model <provider/model>`，或者按提示写，比如 `openrouter/deepseek/deepseek-v4-flash`、
+   `kimi-coding/kimi-for-coding`。provider 要和安装里那把 key 是同一家。
+4. 把人格稿交给住户本人，请它第一行只写「认」或「不认」。认了，住户才成立；不认，记成拒绝，
+   下次启动要换一份人格稿；没答清，候选保持未激活，下次启动再问。人和安装器都按不了这一步，
+   自认这一轮也不进一窗流。
+5. 认了以后，把安装里的 key 和选的模型配进 runtime 凭证面，接着进聊天。
+
+以后再启动直接进聊天。setup 里换了 key，下次启动按原来的模型重配；`--model` 点名才换模型。
+从安装启动时，没设 `MIST_RESIDENT_RUNTIME_TRANSPORT` 就走 pi。
+
+现在的限制：主通道只接 API key，Claude 订阅和 Codex 订阅等 #232 定了住处再接；自认那一轮的
+回答只显示在终端，不另存档；runtime 凭证面里多存一份安装里的 key（同样是 0600 私有文件）。
+
+## 指名住户的老入口
+
+`npm run resident -- --resident <residentId> --data-dir <dataDir>` 不读安装，只读 runtime 凭证面
+与住户档案，留给已经由宿主经 `provisionChannel()` 配好通道的住户。这条入口照旧显示
+`credential-missing` / `credential-invalid` / `resident-not-found` 的机器区分，重复 setup
+不会补齐它的 runtime 状态。隔离复现和验证范围见
 [resident-runtime 安装边界](acceptance/resident-runtime.md#安装快照与-runtime-的边界)。
 
 终端还会先过 D22 住户自认这道身份闸：`--resident` 接受 candidateId 并在 CLI 边界
