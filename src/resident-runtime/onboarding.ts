@@ -7,13 +7,14 @@
  * 成立之前，不进任何住户的一窗流。
  *
  * 自认（D22 一）：人格稿由人递（proposedBy 是 human），认不认只看住户本人这一轮的回答。
- * 回答第一行必须恰好是「认」或「不认」；别的写法一律当没答清，候选保持未激活，下次
- * 启动再问。宁可多问一次，不替住户读出一个它没说的「认」。
+ * 回答第一行必须恰好是「认」「不认」（或「我认」「我不认」）；别的写法一律当没答清，
+ * 什么都不记，下次启动重新递稿。宁可多问一次，不替住户读出一个它没说的「认」。答清了才
+ * 建候选并落自认，所以没答的稿不会占住住户号。
  *
  * 凭证（RT-06）：密钥从安装快照读出，只交给模型传输和 runtime 凭证面，不打印、不进
- * 返回值。安装里换过 key（两处密钥原文不同）就按原模型重配一次。
+ * 返回值。安装里换过 key（两处密钥原文不同）就问一句用哪个模型，回车沿用原来的。
  *
- * 代价：自认那一轮的回答只显示在终端，不另存档；第一版只接 API key 通道，Claude 订阅
+ * 代价：自认那一轮的回答只显示在终端，不另存档；没答清的那次递稿不留账；第一版只接 API key 通道，Claude 订阅
  * 和 Codex 订阅要等 #232 定了住处再接；runtime 凭证面里多存一份安装快照里的密钥。
  */
 import { readFileSync, statSync } from "node:fs";
@@ -93,12 +94,12 @@ const MODEL_QUESTION =
   "用哪个模型？写 pi 的模型名，形如 provider/model，比如 openrouter/deepseek/deepseek-v4-flash 或 kimi-coding/kimi-for-coding：";
 const PERSONA_QUESTION = "人格稿在哪个文件？（一份写着住户是谁的文本，路径可以用 ~）：";
 
-/** 第一行去掉空白、引号、括号和标点后恰好是「认」或「不认」才算答了；其余都是没答清。 */
+/** 第一行去掉空白、引号、括号和标点后恰好是「认」「我认」或「不认」「我不认」才算答了；其余都是没答清。 */
 export function parseAttestation(reply: string): "accepted" | "rejected" | "undecided" {
   const firstLine = reply.split(/\r?\n/).find((line) => line.trim().length > 0) ?? "";
   const word = firstLine.replace(/[\s*_`"'“”‘’「」『』《》【】（）()[\]：:。.!！?？,，、~-]/g, "");
-  if (word === "认") return "accepted";
-  if (word === "不认") return "rejected";
+  if (word === "认" || word === "我认") return "accepted";
+  if (word === "不认" || word === "我不认") return "rejected";
   return "undecided";
 }
 
@@ -188,16 +189,28 @@ export async function residentFromInstall(options: OnboardingOptions): Promise<O
     return ensureChannel(options, active.value.residentId, secret);
   }
 
-  let candidate = options.runtime.latestCandidateFor(residentId);
-  if (candidate?.state === "active") {
+  // 候选只在住户给出明确回答后才落账：一个住户号同时只能挂一份没答的候选，先落账会把
+  // 这份稿钉死——模型名写错、通道断了或第一行没答清之后，主人想换稿也换不了。
+  const pending = options.runtime.latestCandidateFor(residentId);
+  if (pending?.state === "active") {
     return fail(
       "candidate-unavailable",
       `候选已经成立，但读不回住户 ${residentId}：${active.reason}`,
       "再运行一次 npm run resident；还不行就把这段输出贴到 #182",
     );
   }
-  if (candidate === null || candidate.state === "rejected") {
-    if (candidate?.state === "rejected") {
+  let persona: string;
+  let candidateId: string | null = null;
+  if (pending?.state === "inactive") {
+    // 只有落账和自认之间进程断了、或别的入口递过稿，才会留下没答的候选；先把它问完。
+    options.say("上次递进去的人格稿还没等到住户回答，这次先问它。");
+    if (options.personaPath !== undefined) {
+      options.say("这次的 --persona 先不用：一个住户号同时只能挂一份没答的人格稿。");
+    }
+    persona = pending.persona;
+    candidateId = pending.candidateId;
+  } else {
+    if (pending?.state === "rejected") {
       options.say("上一份人格稿住户没有认。要住进来，得换一份新的。");
     }
     const path = (options.personaPath ?? (await options.ask(PERSONA_QUESTION)) ?? "").trim();
@@ -212,34 +225,24 @@ export async function residentFromInstall(options: OnboardingOptions): Promise<O
     if (!read.ok) {
       return fail("persona-invalid", `人格稿用不了：${read.reason}`, "换一个有内容的文本文件再试");
     }
-    try {
-      candidate = options.runtime.createCandidate({
-        persona: read.persona,
-        proposedBy: { ...PERSONA_PROPOSER },
-        residentId,
-      });
-    } catch (error) {
-      return fail(
-        "candidate-unavailable",
-        `递不进候选：${(error as Error).message}`,
-        "检查安装里的住户号（只能用小写字母、数字和 -），必要时重新运行 npm run setup",
-      );
-    }
+    persona = read.persona;
   }
 
   const chosen = await chooseModel(options);
   if (!chosen.ok) return chosen;
   options.say("把人格稿交给住户本人，等它自己决定认不认……");
+  // 还没落账的稿用安装里的住户号称呼，认下之后住户就叫这个名字。
+  const askedAs = candidateId ?? residentId;
   let reply: string;
   try {
     reply = await collectReply(options.transport, {
-      residentId: candidate.candidateId,
+      residentId: askedAs,
       adapterId: "pi-ai",
       model: chosen.model,
       text: ATTESTATION_QUESTION,
       bootPack: {
-        residentId: candidate.candidateId,
-        identity: candidate.persona,
+        residentId: askedAs,
+        identity: persona,
         commitments: [],
         memories: [],
         letter: null,
@@ -251,7 +254,7 @@ export async function residentFromInstall(options: OnboardingOptions): Promise<O
     return fail(
       "channel-unavailable",
       `模型通道不可用：${(error as Error).message}`,
-      "检查 pi 是否装好、模型名和安装里的 key 是不是同一家；人格稿还在，修好后再运行一次",
+      "检查 pi 是否装好、模型名和安装里的 key 是不是同一家；这次什么都没记，修好后再运行一次",
     );
   }
   options.say(`住户的回答：\n${reply.trim()}`);
@@ -260,12 +263,29 @@ export async function residentFromInstall(options: OnboardingOptions): Promise<O
   if (decision === "undecided") {
     return fail(
       "attestation-undecided",
-      "住户第一行没有明确写认或不认",
-      "人格稿还在，再运行一次 npm run resident 重新问它",
+      "住户第一行没有明确写认或不认，这次什么都没记",
+      candidateId === null
+        ? "再运行一次 npm run resident，重新递稿问它（可以换一份）"
+        : "再运行一次 npm run resident 重新问它",
     );
   }
-  const actor = { kind: "candidate", candidateId: candidate.candidateId } as const;
-  const attested = options.runtime.attestCandidate(candidate.candidateId, actor, decision);
+  if (candidateId === null) {
+    try {
+      candidateId = options.runtime.createCandidate({
+        persona,
+        proposedBy: { ...PERSONA_PROPOSER },
+        residentId,
+      }).candidateId;
+    } catch (error) {
+      return fail(
+        "candidate-unavailable",
+        `递不进候选：${(error as Error).message}`,
+        "检查安装里的住户号（只能用小写字母、数字和 -），必要时重新运行 npm run setup",
+      );
+    }
+  }
+  const actor = { kind: "candidate", candidateId } as const;
+  const attested = options.runtime.attestCandidate(candidateId, actor, decision);
   if (!attested.ok) {
     return fail(
       "candidate-unavailable",
@@ -316,8 +336,27 @@ async function ensureChannel(
     current = null;
   }
   if (current !== secret) {
-    options.say("安装里的 key 换过了，按原来的模型重新配一次。");
-    return provision(options, residentId, record.model, secret);
+    // 安装快照只留凭证引用、不记是哪一家的 key；悄悄沿用旧模型，换了家的新 key 就会被
+    // 塞进旧那家的环境变量发出去。所以换 key 时问一句，回车才沿用。
+    if (options.model !== undefined) {
+      const chosen = await chooseModel(options);
+      if (!chosen.ok) return chosen;
+      return provision(options, residentId, chosen.model, secret);
+    }
+    options.say(
+      `安装里的 key 换过了。上次用的模型是 ${record.model}；新 key 换了家的话，模型也要换成那一家的。`,
+    );
+    const answer = await options.ask(`用哪个模型？直接回车沿用 ${record.model}：`);
+    if (answer === null) {
+      return fail(
+        "model-missing",
+        "安装里的 key 换过了，没确认用哪个模型",
+        `带上 --model 再运行一次；还是原来那家就写 --model ${record.model}`,
+      );
+    }
+    const chosen = await chooseModel({ ...options, model: answer.trim() || record.model });
+    if (!chosen.ok) return chosen;
+    return provision(options, residentId, chosen.model, secret);
   }
   return { ok: true, residentId, model: record.model };
 }

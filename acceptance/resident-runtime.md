@@ -41,8 +41,9 @@ RT-01 的 `provisionChannel()` 正对照直接准备 runtime 住户和凭证，�
 
 **2026-10-13 接线（#182 setup 到聊天）**：上面两段说的是带 `--resident` 的老入口，边界
 和负例都不变。新入口是不带 `--resident` 的 `npm run resident`：读当前安装快照的主通道
-（第一版只接 API key），把人递的人格稿建成候选，请候选本人第一行答「认」或「不认」，
-按它的回答经 `attestCandidate` 落账；认了才经 `provisionChannel()` 把安装里的 key 和所选
+（第一版只接 API key），把人递的人格稿交给候选本人，请它第一行答「认」或「不认」，
+答清了才建候选、按它的回答经 `attestCandidate` 落账（没答清不落账，免得一份没答的稿占住
+住户号、主人换不了稿）；认了才经 `provisionChannel()` 把安装里的 key 和所选
 模型配进 runtime 凭证面，再进 TUI。模型在第一次启动时选，存在 runtime 凭证面，不进安装
 快照。`tests/installer-run.test.ts` 加了端到端正对照：真实 `runInstaller()` 提交后，同一
 数据根先让候选答「不认」（不建住户、不复制凭证、无流），再换一份人格稿答「认」，同一次

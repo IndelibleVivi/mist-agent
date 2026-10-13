@@ -137,12 +137,14 @@ function harness(replies: string[], dataDir = freshDirectory()): Harness {
 }
 
 describe("parseAttestation", () => {
-  it("reads only an exact 认 or 不认 on the first non-empty line", () => {
+  it("reads only an exact 认 / 我认 or 不认 / 我不认 on the first non-empty line", () => {
     expect(parseAttestation("认\n我喜欢这份人格。")).toBe("accepted");
     expect(parseAttestation("\n  **认。**  \n理由")).toBe("accepted");
+    expect(parseAttestation("我认。\n理由")).toBe("accepted");
     expect(parseAttestation("「不认」\n不像我")).toBe("rejected");
     expect(parseAttestation("不认")).toBe("rejected");
-    expect(parseAttestation("我认")).toBe("undecided");
+    expect(parseAttestation("我不认\n不像我")).toBe("rejected");
+    expect(parseAttestation("我认为可以")).toBe("undecided");
     expect(parseAttestation("认 但是有条件")).toBe("undecided");
     expect(parseAttestation("我还在想")).toBe("undecided");
     expect(parseAttestation("")).toBe("undecided");
@@ -161,7 +163,10 @@ describe("residentFromInstall", () => {
     const [request] = h.transport.requests;
     const candidate = h.runtime.latestCandidateFor("resident-1");
     expect(candidate?.state).toBe("active");
-    expect(request?.residentId).toBe(candidate?.candidateId);
+    expect(candidate?.persona).toBe(PERSONA);
+    // 还没落账的稿用安装里的住户号称呼。
+    expect(request?.residentId).toBe("resident-1");
+    expect(request?.bootPack.residentId).toBe("resident-1");
     expect(request?.bootPack.identity).toBe(PERSONA);
     expect(request?.text).toBe(ATTESTATION_QUESTION);
     expect(request?.history).toEqual([]);
@@ -186,29 +191,46 @@ describe("residentFromInstall", () => {
     expect(h.said.join("\n")).not.toContain(KEY);
   });
 
-  it("keeps the candidate inactive when the first line is not a clear answer, and asks again next start", async () => {
+  it("records nothing when the first line is not a clear answer, so the next start can hand over another persona", async () => {
     const h = harness(["我愿意认下它。\n大概吧。", "认\n想好了。"]);
     install(h.dataDir);
 
     const unclear = await h.run({}, [personaFile(h.dataDir), MODEL]);
 
     expect(unclear).toMatchObject({ ok: false, code: "attestation-undecided" });
-    const pending = h.runtime.latestCandidateFor("resident-1");
-    expect(pending?.state).toBe("inactive");
-    expect(h.runtime.requireActiveResident(pending?.candidateId ?? "")).toEqual({
-      ok: false,
-      reason: "candidate-pending",
-    });
+    expect(h.runtime.latestCandidateFor("resident-1")).toBeNull();
+    expect(h.runtime.requireActiveResident("resident-1")).toMatchObject({ ok: false });
     expect(new CredentialStore(join(h.dataDir, "credentials")).find("resident-1")).toBeNull();
 
-    const pendingId = pending?.candidateId;
     h.questions.length = 0;
-    const second = await h.run({}, [MODEL]);
+    const second = await h.run({}, [personaFile(h.dataDir, "TEST-PERSONA-2：改过的稿。"), MODEL]);
 
     expect(second).toEqual({ ok: true, residentId: "resident-1", model: MODEL });
-    // 人格稿还在：第二次只问模型，同一份候选被认下。
-    expect(h.questions).toHaveLength(1);
-    expect(h.runtime.latestCandidateFor("resident-1")?.candidateId).toBe(pendingId);
+    // 没答清什么都没记：第二次照常问人格稿和模型，认下的是这次递的稿。
+    expect(h.questions).toHaveLength(2);
+    expect(h.runtime.latestCandidateFor("resident-1")?.persona).toBe("TEST-PERSONA-2：改过的稿。");
+    expect(h.transport.requests[1]?.bootPack.identity).toBe("TEST-PERSONA-2：改过的稿。");
+  });
+
+  it("asks a persona left unanswered by an interrupted start before taking a new one", async () => {
+    const h = harness(["认"]);
+    install(h.dataDir);
+    // 落账和自认之间断掉留下的候选（或别的入口递的）：住户号已被它占着。
+    const leftover = h.runtime.createCandidate({
+      persona: "TEST-PERSONA-LEFTOVER",
+      proposedBy: { kind: "human", id: "terminal-owner" },
+      residentId: "resident-1",
+    });
+
+    const result = await h.run({ personaPath: personaFile(h.dataDir), model: MODEL });
+
+    expect(result).toEqual({ ok: true, residentId: "resident-1", model: MODEL });
+    expect(h.transport.requests[0]?.residentId).toBe(leftover.candidateId);
+    expect(h.transport.requests[0]?.bootPack.identity).toBe("TEST-PERSONA-LEFTOVER");
+    expect(h.runtime.latestCandidateFor("resident-1")?.candidateId).toBe(leftover.candidateId);
+    const narration = h.said.join("\n");
+    expect(narration).toContain("上次递进去的人格稿还没等到住户回答");
+    expect(narration).toContain("这次的 --persona 先不用");
   });
 
   it("records the resident's refusal and asks for a new persona on the next start", async () => {
@@ -255,17 +277,28 @@ describe("residentFromInstall", () => {
     expect(h.runtime.latestCandidateFor("resident-1")).toBeNull();
   });
 
-  it("refuses a model pi cannot route with an API key without calling the model", async () => {
+  it("refuses a model pi cannot route with an API key without calling the model or pinning the persona", async () => {
     const h = harness(["认"]);
     install(h.dataDir);
 
     const bare = await h.run({ personaPath: personaFile(h.dataDir), model: "test-model" });
-    const unknown = await h.run({ model: "no-such-provider/test-model" });
+    const unknown = await h.run({
+      personaPath: personaFile(h.dataDir),
+      model: "no-such-provider/x",
+    });
 
     expect(bare).toMatchObject({ ok: false, code: "model-unsupported" });
     expect(unknown).toMatchObject({ ok: false, code: "model-unsupported" });
     expect(h.transport.requests).toHaveLength(0);
-    expect(h.runtime.latestCandidateFor("resident-1")?.state).toBe("inactive");
+    expect(h.runtime.latestCandidateFor("resident-1")).toBeNull();
+
+    // 模型名写错之后换一份稿：认下的是这次递的，不是第一次那份。
+    const fixed = await h.run({
+      personaPath: personaFile(h.dataDir, "TEST-PERSONA-2：对的那份。"),
+      model: MODEL,
+    });
+    expect(fixed).toEqual({ ok: true, residentId: "resident-1", model: MODEL });
+    expect(h.runtime.latestCandidateFor("resident-1")?.persona).toBe("TEST-PERSONA-2：对的那份。");
   });
 
   it("refuses an empty persona file and a missing answer without creating a candidate", async () => {
@@ -281,20 +314,50 @@ describe("residentFromInstall", () => {
     expect(h.transport.requests).toHaveLength(0);
   });
 
-  it("re-provisions with the same model when setup saved a new key, and switches model only on request", async () => {
+  it("asks which model to use when setup saved a new key, and switches model only on request", async () => {
     const h = harness(["认"]);
     install(h.dataDir);
     await h.run({ personaPath: personaFile(h.dataDir), model: MODEL });
     const credentials = new CredentialStore(join(h.dataDir, "credentials"));
+    const savedKey = () =>
+      credentials.readSecret(credentials.find("resident-1")?.credentialRef ?? "");
 
+    h.questions.length = 0;
     const unchanged = await h.run({}, []);
     expect(unchanged).toEqual({ ok: true, residentId: "resident-1", model: MODEL });
+    expect(h.questions).toEqual([]);
 
+    // 换了 key 又没回答：什么都不改，旧 key 不会被新 key 顶掉。
     install(h.dataDir, { secret: "TEST-INSTALL-KEY-0002" });
-    const rekeyed = await h.run({}, []);
-    expect(rekeyed).toEqual({ ok: true, residentId: "resident-1", model: MODEL });
-    const record = credentials.find("resident-1");
-    expect(credentials.readSecret(record?.credentialRef ?? "")).toBe("TEST-INSTALL-KEY-0002");
+    const unanswered = await h.run({}, []);
+    expect(unanswered).toMatchObject({ ok: false, code: "model-missing" });
+    expect(savedKey()).toBe(KEY);
+
+    // 回车沿用原来的模型。
+    h.questions.length = 0;
+    const kept = await h.run({}, [""]);
+    expect(kept).toEqual({ ok: true, residentId: "resident-1", model: MODEL });
+    expect(h.questions).toHaveLength(1);
+    expect(h.questions[0]).toContain(MODEL);
+    expect(savedKey()).toBe("TEST-INSTALL-KEY-0002");
+
+    // 换了家的 key：答新那家的模型，key 和模型一起换。
+    install(h.dataDir, { secret: "TEST-INSTALL-KEY-0003" });
+    const moved = await h.run({}, ["kimi-coding/kimi-for-coding"]);
+    expect(moved).toEqual({
+      ok: true,
+      residentId: "resident-1",
+      model: "kimi-coding/kimi-for-coding",
+    });
+    expect(savedKey()).toBe("TEST-INSTALL-KEY-0003");
+
+    // 换 key 时带了 --model：不再问。
+    install(h.dataDir, { secret: "TEST-INSTALL-KEY-0004" });
+    h.questions.length = 0;
+    const named = await h.run({ model: MODEL }, []);
+    expect(named).toEqual({ ok: true, residentId: "resident-1", model: MODEL });
+    expect(h.questions).toEqual([]);
+    expect(savedKey()).toBe("TEST-INSTALL-KEY-0004");
 
     const switched = await h.run({ model: "kimi-coding/kimi-for-coding" }, []);
     expect(switched).toEqual({
@@ -306,6 +369,7 @@ describe("residentFromInstall", () => {
     // 住户成立之后不再问认不认、不再调模型。
     expect(h.transport.requests).toHaveLength(1);
     expect(h.said.join("\n")).not.toContain("TEST-INSTALL-KEY");
+    expect(h.questions.join("\n")).not.toContain("TEST-INSTALL-KEY");
   });
 });
 
