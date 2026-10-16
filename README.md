@@ -160,8 +160,8 @@ npm run resident   # 第一次：给人格稿、选模型，住户自己决定�
 
 以后再启动直接进聊天。setup 里换了 key，下次启动会问一句用哪个模型（回车沿用原来的）：安装
 快照不记 key 是哪一家的，新 key 换了家就要写那一家的模型。`--model` 点名就不问，直接换。
-从安装启动时，没设 `MIST_RESIDENT_RUNTIME_TRANSPORT` 就走 pi。setup 装在别的目录（`--data-dir`）时，存完
-打印的下一步命令会带上同一个 `--data-dir`。哪一步失败都会打出错误码和处理建议，比如人格稿读不了是
+从安装启动时，没设 `MIST_RESIDENT_RUNTIME_TRANSPORT` 就走 pi。setup 存完打印的下一步命令总是带上这次的
+`--data-dir`，照着粘贴就不会被 `MIST_DATA_DIR` 带去别的安装。哪一步失败都会打出错误码和处理建议，比如人格稿读不了是
 `persona-invalid`，安装快照或 key 读不出来是 `install-unreadable`。
 
 现在的限制：主通道只接 API key，Claude 订阅和 Codex 订阅等 #232 定了住处再接；自认那一轮的

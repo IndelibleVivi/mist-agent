@@ -1249,23 +1249,34 @@ it("goes from a committed setup to chat only after the resident itself accepts t
 });
 
 describe("setup's next-step command", () => {
-  it("carries a custom data directory, spaces and quotes included, through to the resident's arguments", () => {
-    const dataDir = join(freshDirectory(), "my mist's data");
-    const command = residentCommand(dataDir, join(freshDirectory(), "default"));
+  /** 让真 shell 拆下一步命令里 `--` 之后的词，拆出来的参数原样交给 resident 的参数解析。 */
+  function residentArgumentsOf(command: string): string[] {
     const prefix = "npm run resident -- ";
-    expect(command.startsWith(`${prefix}--data-dir `)).toBe(true);
-
-    // 让真 shell 拆词，拆出来的参数原样交给 resident 的参数解析。
-    const words = execFileSync("bash", ["-c", `printf '%s\\0' ${command.slice(prefix.length)}`])
+    expect(command.startsWith(prefix)).toBe(true);
+    return execFileSync("bash", ["-c", `printf '%s\\0' ${command.slice(prefix.length)}`])
       .toString("utf8")
       .split("\0")
       .filter((word) => word.length > 0);
+  }
+
+  it("carries a custom data directory, spaces and quotes included, through to the resident's arguments", () => {
+    const dataDir = join(freshDirectory(), "my mist's data");
+
+    const words = residentArgumentsOf(residentCommand(dataDir));
+
     expect(words).toEqual(["--data-dir", resolve(dataDir)]);
     expect(parseResidentCliArguments(words).dataDir).toBe(resolve(dataDir));
   });
 
-  it("stays the bare command for the default directory", () => {
-    expect(residentCommand(join(homedir(), ".mist"))).toBe("npm run resident");
+  it("names the default directory too, so MIST_DATA_DIR pointing elsewhere cannot redirect the resident", () => {
+    const defaultDir = join(homedir(), ".mist");
+    vi.stubEnv("MIST_DATA_DIR", join(freshDirectory(), "another-install"));
+    try {
+      const words = residentArgumentsOf(residentCommand(defaultDir));
+      expect(parseResidentCliArguments(words).dataDir).toBe(defaultDir);
+    } finally {
+      vi.unstubAllEnvs();
+    }
     expect(residentCommand("/srv/mist")).toBe("npm run resident -- --data-dir /srv/mist");
   });
 });

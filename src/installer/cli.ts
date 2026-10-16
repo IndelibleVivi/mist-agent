@@ -56,13 +56,11 @@ function shellWord(value: string): string {
 }
 
 /**
- * 装完的下一步命令。数据目录不是默认的 ~/.mist 就带上 --data-dir：resident 自己只会回落到
- * MIST_DATA_DIR 或 ~/.mist，换个终端、没带环境变量，就会读不到刚存的安装。
+ * 装完的下一步命令，总是带上这次的 --data-dir：resident 自己会先吃 MIST_DATA_DIR、再回落
+ * ~/.mist，哪怕这次装的就是 ~/.mist，环境变量指着别处也会进错安装。
  */
-export function residentCommand(dataDir: string, defaultDir = join(homedir(), ".mist")): string {
-  const absolute = resolve(dataDir);
-  if (absolute === resolve(defaultDir)) return "npm run resident";
-  return `npm run resident -- --data-dir ${shellWord(absolute)}`;
+export function residentCommand(dataDir: string): string {
+  return `npm run resident -- --data-dir ${shellWord(resolve(dataDir))}`;
 }
 
 export async function main(args = process.argv.slice(2)): Promise<void> {
