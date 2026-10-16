@@ -305,6 +305,8 @@ describe("Resident turn recovery", () => {
     const retried = await f.runtime.say(request);
     expect(retried).toMatchObject({ ok: true, value: { reply: "audit reply 2", generation: 1 } });
     expect(f.requests).toHaveLength(2);
+    expect(f.requests[1]?.text).toBe(request.text);
+    expect(f.requests[1]?.history).toEqual([]);
     expect(stream(f).events).toHaveLength(2);
   });
 
@@ -487,6 +489,108 @@ describe("Resident turn recovery", () => {
     expect(f.requests).toHaveLength(1);
     expect(stream(f).events).toHaveLength(1);
   });
+  it.each(["truncated", "directory"])(
+    "blocks fresh turns before side effects when confirmation storage is %s",
+    async (mode) => {
+      const f = make(true, "r-preflight");
+      unwrap(await f.runtime.say({ residentId: f.residentId, text: "first" }));
+      const path = join(f.dataDir, "turns", `${f.residentId}.turns.json`);
+      if (mode === "truncated") writeFileSync(path, "{ truncated");
+      else {
+        rmSync(path);
+        mkdirSync(path);
+      }
+      const bodies = stream(f);
+      const ledger = book(f);
+      const breath = readFileSync(join(f.dataDir, "sessions", "breath.json"), "utf8");
+      for (const text of ["fresh second", "fresh third"]) {
+        const result = await f.runtime.say({ residentId: f.residentId, text });
+        expect(result).toMatchObject({ ok: false, error: { code: "writer-unavailable" } });
+        if (result.ok) throw new Error("expected storage failure");
+        expect(result.error.remedy).toMatch(/人工/);
+      }
+      expect(f.requests).toHaveLength(1);
+      expect(stream(f)).toEqual(bodies);
+      expect(book(f)).toEqual(ledger);
+      expect(readFileSync(join(f.dataDir, "sessions", "breath.json"), "utf8")).toBe(breath);
+      if (mode === "truncated") expect(readFileSync(path, "utf8")).toBe("{ truncated");
+    },
+  );
+
+  it.each(["ack", "receipt"])(
+    "keeps the reply and D8 threshold accounting through a late %s failure",
+    async (boundary) => {
+      const f = make(true, `r-late-${boundary}`);
+      unwrap(
+        f.runtime.setBreathThreshold({
+          residentId: f.residentId,
+          windowId: "review-window",
+          generation: 1,
+          thresholdTokens: 5,
+          authority: "window",
+        }),
+      );
+      const tui = new ResidentChatTui(f.runtime, {
+        residentId: f.residentId,
+        model: "audit-model",
+      });
+      unwrap(await tui.submit("open"));
+      addFact(f.runtime, f.residentId, "synthetic rule after opening");
+      if (boundary === "ack") f.armAckFailure();
+      else f.armReceiptFailure();
+      const failed = await tui.submit("this message crosses the threshold");
+      expect(failed).toMatchObject({ ok: false, error: { code: "writer-unavailable" } });
+      expect(tui.transcript().frames.at(-1)?.text).toContain("住户：audit reply 2");
+      expect(tui.transcript().frames.at(-1)?.text).toContain("[错误]");
+      const events = stream(f).events;
+      expect(events).toHaveLength(4);
+      expect(await tui.retry()).toMatchObject({
+        ok: false,
+        error: { code: "reconciliation-needed" },
+      });
+      expect(tui.transcript().frames.at(-1)?.text).toContain("住户：audit reply 2");
+      expect(f.requests).toHaveLength(2);
+      if (boundary === "ack") f.repairAck();
+      else f.repairReceipt();
+      const next = unwrap(await tui.submit("next"));
+      expect(next.generation).toBe(2);
+      expect(stream(f).events.map((e) => e.origin.viewport.generation)).toEqual([1, 1, 1, 1, 2, 2]);
+    },
+  );
+
+  it.each([false, true])(
+    "refuses orphan A retry after B without reordering canonical events (ledger=%s)",
+    async (ledger) => {
+      const f = make(ledger, "r-orphan-order");
+      const tui = new ResidentChatTui(f.runtime, {
+        residentId: f.residentId,
+        model: "audit-model",
+      });
+      const repair = blockAssistantAfterUser(f);
+      expect(await tui.submit("orphan A")).toMatchObject({
+        ok: false,
+        error: { code: "writer-unavailable" },
+      });
+      const anchor = stream(f).events[0]?.payload.turnId;
+      repair();
+      unwrap(await tui.submit("later B"));
+      const before = stream(f);
+      expect(await tui.retry()).toMatchObject({
+        ok: false,
+        error: { code: "reconciliation-needed", turnId: anchor },
+      });
+      expect(f.requests).toHaveLength(2);
+      expect(stream(f)).toEqual(before);
+      expect(stream(f).events.map((e) => [e.payload.role, e.payload.text])).toEqual([
+        ["user", "orphan A"],
+        ["user", "later B"],
+        ["assistant", "audit reply 2"],
+      ]);
+      expect(tui.transcript().frames.at(-1)?.text).toContain("reconciliation-needed");
+      expect(tui.transcript().frames.at(-1)?.text).toContain("你：later B\n住户：audit reply 2");
+    },
+  );
+
   it("unreadable confirmation evidence fails before model dispatch and the new surface is scanned by resident", async () => {
     const f = make(true, "r-broken-receipt");
     const request = {

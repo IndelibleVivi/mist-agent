@@ -51,6 +51,11 @@ export function readTurnLedgerTarget(value: unknown): TurnLedgerTarget {
 export class TurnReceiptStore {
   constructor(readonly directory: string) {}
 
+  /** 开新认证回合前核已有确认材料；缺文件是首轮，坏文件不自动重建。 */
+  assertReadable(residentId: string): void {
+    this.#read(residentId);
+  }
+
   #read(residentId: string): ConfirmedTurn[] {
     let raw: string;
     try {

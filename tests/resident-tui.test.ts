@@ -247,12 +247,12 @@ await main(process.argv.slice(2), { transport: { async *complete(request) {
       expect(result.output).toContain("writer-unavailable");
       expect(result.output).toContain("reconciliation-needed");
       const frames = result.output.split(`住户：${residentId}　模型：openai/test-model`);
-      const recovered = frames.find(
-        (frame) =>
-          frame.includes("你：original failure\n住户：recorded reply 1") &&
-          frame.includes("你：later actual delivery\n住户：recorded reply 2"),
-      );
+      // 只看动作完成后已回到输入提示的帧。保留失败回复后，B 成功时也会同时显示两段正文；
+      // 倒数第二个已完成动作才是成功 /retry，末个是「没有可重试回合」。
+      const recovered = frames.filter((frame) => frame.includes("\n你> ")).at(-2);
       expect(recovered).toBeDefined();
+      expect(recovered).toContain("你：original failure\n住户：recorded reply 1");
+      expect(recovered).toContain("你：later actual delivery\n住户：recorded reply 2");
       expect(recovered).not.toContain("[错误]");
       expect(frames.at(-1)).toContain("没有可重试的失败回合");
       expect(JSON.parse(readFileSync(recordedRequests, "utf8"))).toEqual([

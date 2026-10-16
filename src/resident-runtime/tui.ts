@@ -61,6 +61,8 @@ export class ResidentChatTui {
     readonly turnId: string;
     readonly text: string;
     readonly messageIndex: number;
+    /** 错误不抹掉已显示的回复；重试在模型前被拦时仍保留它。 */
+    readonly reply: string;
   } | null = null;
 
   constructor(runtime: ChatTurnPort, options: ResidentChatTuiOptions) {
@@ -102,14 +104,19 @@ export class ResidentChatTui {
         },
       };
     }
-    return this.#turn(failed.text, failed.turnId, failed.messageIndex);
+    return this.#turn(failed.text, failed.turnId, failed.messageIndex, failed.reply);
   }
 
-  async #turn(text: string, turnId: string, previousIndex?: number): Promise<Result<TurnResult>> {
+  async #turn(
+    text: string,
+    turnId: string,
+    previousIndex?: number,
+    previousReply = "",
+  ): Promise<Result<TurnResult>> {
     this.start();
     this.#errorText = null;
     const messageIndex = previousIndex ?? this.#messages.length;
-    this.#messages[messageIndex] = `你：${text}\n住户：`;
+    this.#messages[messageIndex] = `你：${text}\n住户：${previousReply}`;
     this.#draw();
 
     let streamedReply = "";
@@ -142,9 +149,11 @@ export class ResidentChatTui {
     }
 
     if (!result.ok) {
-      this.#failedTurn = { turnId: result.error.turnId ?? turnId, text, messageIndex };
+      const reply = streamedReply || previousReply;
+      this.#failedTurn = { turnId: result.error.turnId ?? turnId, text, messageIndex, reply };
       this.#errorText = `${result.error.code}：${result.error.message}\n处理建议：${result.error.remedy}`;
-      this.#messages[messageIndex] = `你：${text}\n[错误]\n${this.#errorText}`;
+      this.#messages[messageIndex] =
+        `你：${text}${reply ? `\n住户：${reply}` : ""}\n[错误]\n${this.#errorText}`;
       this.#draw();
       return result;
     }
@@ -165,9 +174,15 @@ export class ResidentChatTui {
           residentId: this.#residentId,
         },
       };
-      this.#failedTurn = { turnId: result.value.turnId, text, messageIndex };
+      this.#failedTurn = {
+        turnId: result.value.turnId,
+        text,
+        messageIndex,
+        reply: result.value.reply,
+      };
       this.#errorText = `${mismatch.error.code}：${mismatch.error.message}\n处理建议：${mismatch.error.remedy}`;
-      this.#messages[messageIndex] = `你：${text}\n[错误]\n${this.#errorText}`;
+      this.#messages[messageIndex] =
+        `你：${text}\n住户：${result.value.reply}\n[错误]\n${this.#errorText}`;
       this.#draw();
       return mismatch;
     }

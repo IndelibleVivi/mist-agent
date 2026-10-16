@@ -169,7 +169,7 @@ function fail<T>(
 type TurnAnchorState =
   | { kind: "complete"; result: TurnResult }
   | { kind: "pending" }
-  | { kind: "partial"; windowId: string; generation: number }
+  | { kind: "partial"; windowId: string; generation: number; followed: boolean }
   | { kind: "mismatch" }
   | { kind: "open" };
 
@@ -485,6 +485,26 @@ export class ResidentRuntime {
         input.residentId,
       );
     }
+    if (state.kind === "partial" && state.followed) {
+      return fail(
+        "reconciliation-needed",
+        "孤立 user 之后已有同窗同代事件，不能在流尾补写旧回复",
+        "保留原 turnId 和孤立 user，交给宿主协调；后续事件不改序，重试不再次调用模型",
+        input.residentId,
+      );
+    }
+    if (this.#ledgerAuthority !== null) {
+      try {
+        this.#turnReceipts.assertReadable(input.residentId);
+      } catch {
+        return fail(
+          "writer-unavailable",
+          "回合确认存储损坏或不可读取，尚未调用模型",
+          "人工检查 turns/ 下本户确认文件及权限，并从可靠备份恢复损坏记录；不要覆盖或自动重建确认材料，修好后保留原锚重试",
+          input.residentId,
+        );
+      }
+    }
     const credential = this.#credentials.find(input.residentId);
     if (credential === null) {
       return fail(
@@ -579,7 +599,7 @@ export class ResidentRuntime {
     // 当前一窗流上下文随请求进模型（验收席意见 1）：本代此前回合的 user/assistant
     // 消息按流序送进模型，第二轮起不是失忆的单轮调用。按**代界**划定（D8 三）：
     // 猝死那代的原始流水不自动进继任者上下文，接续靠交接信 + 归档查询。
-    const history = this.#streamHistory(input.residentId, window.generation);
+    const history = this.#streamHistory(input.residentId, window.generation, turnId);
     // 密钥原文只在这一刻解析、只进传输层；此后任何地方都不许再出现（RT-06）。
     // find 与 readSecret 之间的 revoke 窗口（验收席观察 A）也落成结构化失败，
     // 不许异常冲出 say()。
@@ -684,21 +704,30 @@ export class ResidentRuntime {
         input.residentId,
       );
     }
-    // 回复已交付且落流后确认账；必须在换代前消费旧代回执。
+    // 正文耐久后立即计入 D8；后续 ACK/确认落盘失败也不能漏计或跳过到线换气。
+    const config = this.#breathState.update(input.residentId, (state) => {
+      state.accumulated += estimateTokens(input.text);
+    });
+    let confirmationFailure: Extract<Result<TurnResult>, { ok: false }> | null = null;
+    // 回复已交付且落流后确认账；必须在换代前尝试消费原代回执。
     if (ledgerTurn !== null) {
       try {
         this.#settleAuthenticatedTurn(ledgerTurn);
       } catch (error) {
-        return fail(
-          "writer-unavailable",
-          `回复已落流，但事实账交付确认失败：${(error as Error).message}`,
-          "修复权威事实账的落盘目录后再说话；未确认的账缺口会在下一回合重新交付，已落流的回复保留",
-          input.residentId,
-        );
+        confirmationFailure = {
+          ok: false,
+          error: {
+            code: "writer-unavailable",
+            message: `回复已落流，但事实账交付确认失败：${(error as Error).message}`,
+            remedy:
+              "修复权威事实账的落盘目录后再说话；未确认的账缺口会在下一回合重新交付，已落流的回复保留",
+            residentId: input.residentId,
+          },
+        };
       }
       // ACK 耐久成功后才发布确认元数据；失败不能吞掉，否则成功结果无法跨重启证明。
       try {
-        if (ledgerTarget !== null)
+        if (confirmationFailure === null && ledgerTarget !== null)
           this.#turnReceipts.record(input.residentId, {
             turnId,
             assistantEventId: assistantReceipt.eventId,
@@ -706,32 +735,36 @@ export class ResidentRuntime {
             target: ledgerTarget,
           });
       } catch (error) {
-        return fail(
-          "writer-unavailable",
-          `事实账已确认，但回合确认记录落盘失败：${(error as Error).message}`,
-          "修复 turns/ 的落盘目录；原正文和 ACK 保留，同 turnId 重试不重新生成。后续同身份合法交付可以补足确认依据",
-          input.residentId,
-        );
+        confirmationFailure = {
+          ok: false,
+          error: {
+            code: "writer-unavailable",
+            message: `事实账已确认，但回合确认记录落盘失败：${(error as Error).message}`,
+            remedy:
+              "人工检查 turns/ 的写入权限与确认材料；原正文和 ACK 保留，同 turnId 重试不重新生成。同代后续合法交付可补确认依据，已换代则由宿主协调",
+            residentId: input.residentId,
+          },
+        };
       }
     }
     // 到线换气（D8 一）：本回合落账后按累积 token 判线，到线就亲笔写信换代。
     // 累积按 estimateTokens（handover-letter 的保守估算，同尺子量到底）。
-    const config = this.#breathState.update(input.residentId, (state) => {
-      state.accumulated += estimateTokens(input.text);
-    });
     if (config.accumulated >= config.current) {
       // 直呼内芯：#runTurn 本身就在住户级串行域里，再排队会自锁。
       const breathed = await this.#breatheNow({ residentId: input.residentId, via: "new" });
       if (!breathed.ok) {
         // 回合已完整落账，但到线没换成代——如实报换气的结构化失败，不粉饰。
         return fail(
-          breathed.error.code,
-          `回合到线但换气失败：${breathed.error.message}`,
-          breathed.error.remedy,
+          confirmationFailure?.error.code ?? breathed.error.code,
+          [confirmationFailure?.error.message, `回合到线但换气失败：${breathed.error.message}`]
+            .filter(Boolean)
+            .join("\n"),
+          [confirmationFailure?.error.remedy, breathed.error.remedy].filter(Boolean).join("\n"),
           input.residentId,
         );
       }
     }
+    if (confirmationFailure !== null) return confirmationFailure;
     return ok({
       residentId: input.residentId,
       model: route.model,
@@ -1213,11 +1246,13 @@ export class ResidentRuntime {
   #streamHistory(
     residentId: string,
     generation: number,
+    excludeTurnId?: string,
   ): { role: "user" | "assistant"; text: string }[] {
     if (!this.#streams.has(residentId)) return [];
     return this.#streams
       .eventsAfter(residentId, 0)
       .filter((event) => event.origin.viewport?.generation === generation)
+      .filter((event) => event.payload.turnId !== excludeTurnId)
       .map(toStreamEventView)
       .map((view) => ({ role: view.kind, text: view.text }));
   }
@@ -1225,16 +1260,25 @@ export class ResidentRuntime {
   /** 完成取原流与真实确认元数据；不从当前 latestSeq 或登记 baseline 推导。 */
   #turnState(residentId: string, turnId: string, text: string): TurnAnchorState {
     if (!this.#streams.has(residentId)) return { kind: "open" };
-    const events = this.#streams
-      .eventsAfter(residentId, 0)
-      .filter((event) => event.payload.turnId === turnId);
+    const allEvents = this.#streams.eventsAfter(residentId, 0);
+    const events = allEvents.filter((event) => event.payload.turnId === turnId);
     const user = events.find((event) => event.payload.role === "user");
     const assistant = events.find((event) => event.payload.role === "assistant");
     if (user !== undefined && user.payload.text !== text) return { kind: "mismatch" };
     if (user === undefined) return { kind: "open" };
     const origin = user.origin.viewport;
     if (origin === null) throw new Error("turn user has no viewport identity");
-    if (assistant === undefined) return { kind: "partial", ...origin };
+    if (assistant === undefined)
+      return {
+        kind: "partial",
+        ...origin,
+        followed: allEvents.some(
+          (event) =>
+            event.streamSeq > user.streamSeq &&
+            event.origin.viewport?.windowId === origin.windowId &&
+            event.origin.viewport.generation === origin.generation,
+        ),
+      };
     if (
       assistant.origin.viewport?.windowId !== origin.windowId ||
       assistant.origin.viewport.generation !== origin.generation

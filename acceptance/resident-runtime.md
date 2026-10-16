@@ -122,7 +122,9 @@ npm test -- tests/resident-runtime.test.ts tests/pi-transport.test.ts
 `turn-id-conflict`。已完成回合回放原 assistant 的 reply/model/generation/streamed，
 不新调模型、不新写 user/assistant。
 
-认证回合按顺序写两条正文、消费 SessionRegistry 的真实 settlement、提交 FactLedger ACK，
+认证新回合先读确认存储；损坏或不可读时在模型、写流和账交付之前报 `writer-unavailable`。
+文件须人工检查权限或从可靠备份恢复，不自动覆盖损坏记录。认证回合按顺序写两条正文、
+立即计入 D8、消费 SessionRegistry 的真实 settlement、提交 FactLedger ACK，
 最后发布耐久确认元数据。assistant 的 `ledgerDelivery` 保存原 resident/scope/window/generation、
 dispatchId 与 targetSeq；`turns/<residentId>.turns.json` 只保存确认元数据和原 assistant 指针，
 不复制对话或事实正文，不恢复旧 dispatch authority。原确认回执或**后续**同身份的真实交付
@@ -130,18 +132,23 @@ dispatchId 与 targetSeq；`turns/<residentId>.turns.json` 只保存确认元数
 新增目录纳入 `secretScan()` 的按户扫描，凭证仍只落专属私有凭证面。
 
 ACK 或确认记录写失败时保留真实正文与已经发生的 ACK，并返回 `writer-unavailable`。
+晚失败不跳过到线换气；旧代回执在换代前尝试结算，错误仍如实返回。TUI 在已显示回复后附上
+错误；同锚重试等待协调时也不抹掉该回复，错误不代表已取得确认。
 此后同锚重试在模型调用前返回 `reconciliation-needed`，直到有合法确认依据；它不重开
 已落流回复，也不尝试消费失效的旧回执。修好落盘后，同代后续正常交付可以覆盖原 target；
 跨代未确认回合须宿主协调，新代 baseline 不补确认。
 
-只有 user 腿耐久时，同窗同代修好 writer 后可以重新调用模型，去重 user 并补 assistant；
+只有 user 腿耐久且仍是同窗同代最后一条事件时，修好 writer 后可以重新调用模型，
+请求历史去掉本条 user，当前输入仅一次；去重 user 并补 assistant。后面已有同窗同代事件则
+报 `reconciliation-needed`，在模型和写流前拒绝补写，不把旧 assistant 插到后来回合之后；
 原模型输出尚未耐久保存，因此不能保证回复逐字相同。重启、换气或猝死后若已跨窗/跨代，
 保留孤立 user，返回 `reconciliation-needed`，在模型调用前阻断，不冒写旧代。
 旧 assistant 缺少 `ledgerDelivery` 时，认证装配不能重建原交付身份，明确等待协调；
 无认证账的 legacy 嵌入继续按完整正文回放。新回合用 `ledgerDelivery: null` 明示创建时无认证交付，
 以后启用账也不会给它补造 ACK；已有认证 target 则不能通过关闭账选项降级成成功。
 
-代价：认证回合多一次本地原子写入与 fsync，确认文件故障会使已完成正文等待协调；
+代价：认证回合多一次本地原子写入与 fsync；确认记录保留各回合，数量增长，每回合整文件
+读改写，不做压缩。确认文件损坏须人工处理，会使新回合停在模型调用前、已完成正文等待协调；
 恢复材料须随 runtime 数据一起保留。旧认证回合缺材料不会自动迁移或重算，跨代半回合
 本轮只准确阻断，不提供丢失输出的重建或宿主协调工具。
 
@@ -151,6 +158,8 @@ npm test -- tests/resident-turn-recovery.test.ts tests/resident-tui.test.ts test
 
 这些回归用临时目录与 synthetic transport，真实 `EISDIR` 落盘故障分别截断 assistant、
 ACK 和确认记录；同时检查模型调用次数、原 generation/target、最终流条数、回放字节。
+新增回归覆盖截断/不可读确认文件的零副作用、ACK/确认记录晚失败仍触发 D8 换代、TUI 保留
+回复与可见错误、立即孤立 user 重试仅输入一次，以及隔着 B 后重试 A 拒绝且流序逐项不变。
 TUI 的 ACK 故障回归从 `tui.submit()` 发出后续补账消息，再从 `/retry` 恢复原回复与原显示行；
 后续普通回合成功不会清掉待恢复锚，恢复成功才清除，后来的新失败接替最近失败锚。
 真实 CLI stdin 验证 `/retry` 与普通同文本提交，IPC 子进程验证返回锚、同锚回放与跨宿主
