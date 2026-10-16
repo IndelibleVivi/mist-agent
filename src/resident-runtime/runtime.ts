@@ -735,7 +735,7 @@ export class ResidentRuntime {
    * **不产出**后者（上下文占用由换气估算门另管，本读口与它无涉）。
    */
   turnUsage(input: { residentId: string }): Result<TurnUsageView> {
-    const active = this.#identities.requireActiveResident(input.residentId);
+    const active = this.#identities.requireResident(input.residentId);
     if (!active.ok) return identityFailure(active.reason, input.residentId);
     try {
       return ok(this.#usageLog.read(active.value.residentId));

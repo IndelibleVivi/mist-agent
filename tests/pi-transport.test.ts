@@ -2,10 +2,18 @@
  * pi 通道传输单元测试：假 pi 回放 `--mode rpc` 事件形状，零网络、零真实凭据。
  * 钉住路由、密钥隔离、错误 fail-closed、流式增量、子进程生命周期和启动包渲染。
  */
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type ModelCompletionRequest,
   createModelTransport,
@@ -17,6 +25,7 @@ import {
   renderSystemPrompt,
   splitModelId,
 } from "../src/resident-runtime/pi-transport.ts";
+import { ResidentRuntime } from "../src/resident-runtime/runtime.ts";
 
 /** 假 pi 记录下来的一个请求现场。 */
 interface FakeRecord {
@@ -31,6 +40,8 @@ interface FakeRecord {
   sessionMode: number | null;
   sessionDirMode: number | null;
   sessionRaw: string | null;
+  agentDir: string;
+  agentSettings: { compaction?: { enabled?: boolean }; reviewSetting?: string } | null;
 }
 
 interface SessionEntry {
@@ -88,20 +99,12 @@ function tempDir(): string {
   return dir;
 }
 
-/** pi 用户级 npm 安装的公共路径形状，不读取机器上的真实 pi 配置。 */
-function fakeInstalledBridge(): { agentDir: string; extension: string } {
-  const agentDir = tempDir();
-  const extension = join(agentDir, "npm", "node_modules", "pi-claude-bridge");
-  mkdirSync(join(extension, "src"), { recursive: true });
-  writeFileSync(
-    join(extension, "package.json"),
-    JSON.stringify({ name: "pi-claude-bridge", pi: { extensions: ["./src/index.ts"] } }),
-  );
-  writeFileSync(join(extension, "src", "index.ts"), "export default () => {};\n");
-  return { agentDir, extension };
-}
+beforeEach(() => {
+  vi.stubEnv("PI_CODING_AGENT_DIR", tempDir());
+});
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
     if (dir !== undefined) rmSync(dir, { recursive: true, force: true });
@@ -123,13 +126,15 @@ const fs = require("fs");
 const args = process.argv.slice(2);
 const mode = process.env.FAKE_PI_MODE ?? "ok";
 const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
-let input = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => {
-  input += chunk;
-  const newline = input.indexOf("\\n");
-  if (newline === -1) return;
-  const command = JSON.parse(input.slice(0, newline));
+const commands = [];
+require("readline").createInterface({input:process.stdin}).on("line", (line) => {
+  const command = JSON.parse(line);
+  commands.push(command.type);
+  if (command.type === "get_state") {
+    emit({type:"response", id:command.id, command:"get_state", success:true,
+      data: {autoCompactionEnabled: process.env.FAKE_PI_POLICY_ENABLED === "1"}});
+    return;
+  }
   const promptPath = args[args.indexOf("--system-prompt") + 1];
   const recordPath = process.env.FAKE_PI_RECORD;
   const sessionFlag = args.indexOf("--session");
@@ -146,6 +151,10 @@ process.stdin.on("data", (chunk) => {
     sessionMode: sessionPath ? (fs.statSync(sessionPath).mode & 0o777) : null,
     sessionDirMode: sessionPath ? (fs.statSync(require("path").dirname(sessionPath)).mode & 0o777) : null,
     sessionRaw: sessionPath ? fs.readFileSync(sessionPath, "utf8") : null,
+    agentDir: process.env.PI_CODING_AGENT_DIR,
+    agentSettings: fs.existsSync(require("path").join(process.env.PI_CODING_AGENT_DIR,"settings.json"))
+      ? JSON.parse(fs.readFileSync(require("path").join(process.env.PI_CODING_AGENT_DIR,"settings.json"),"utf8")) : null,
+    commands,
     secretEnvs: { ${envRecord} },
   }));
   if (mode === "crash") {
@@ -164,6 +173,9 @@ process.stdin.on("data", (chunk) => {
     return;
   }
   emit({ type: "response", id: "mist-prompt", command: "prompt", success: true });
+  if (mode.startsWith("compact-")) {
+    emit({ type: mode === "compact-start" ? "auto_compaction_start" : "auto_compaction_end", reason:"threshold" });
+  }
   if (mode === "malformed") {
     process.stdout.write("{\\"type\\":\\"message_update\\"\\n");
     return;
@@ -369,7 +381,6 @@ describe("PiCliTransport", () => {
 
   it("Claude 订阅按 adapter 路由 bridge，清除父环境里的 provider keys", async () => {
     const { bin, recordPath } = fakePi();
-    const bridge = fakeInstalledBridge();
     const transport = new PiCliTransport({
       piBin: bin,
       extraEnv: {
@@ -377,8 +388,6 @@ describe("PiCliTransport", () => {
         ANTHROPIC_API_KEY: "ambient-anthropic-key",
         OPENAI_API_KEY: "ambient-openai-key",
         PI_API_KEY: "ambient-generic-key",
-        PI_CODING_AGENT_DIR: bridge.agentDir,
-        MIST_PI_BRIDGE_EXTENSION: "",
       },
     });
     await collect(
@@ -391,75 +400,9 @@ describe("PiCliTransport", () => {
     expect(record.args[record.args.indexOf("--provider") + 1]).toBe("claude-bridge");
     expect(record.args[record.args.indexOf("--model") + 1]).toBe("claude-sonnet-4-5");
     expect(record.args).toContain("--no-extensions");
-    expect(record.args[record.args.indexOf("--extension") + 1]).toBe(bridge.extension);
+    expect(record.args).not.toContain("--extension");
     for (const name of RECORDED_SECRET_ENVS) expect(record.secretEnvs[name]).toBeNull();
     expect(record.args.join(" ")).not.toContain("sk-canary-pi-1");
-  });
-
-  it("非标准安装只显式载入指定的本地 bridge，不使用 npm 临时安装 source", async () => {
-    const { bin, recordPath } = fakePi();
-    const bridge = fakeInstalledBridge();
-    const extension = join(bridge.extension, "src", "index.ts");
-    await collect(
-      new PiCliTransport({
-        piBin: bin,
-        extraEnv: {
-          FAKE_PI_RECORD: recordPath,
-          PI_CODING_AGENT_DIR: join(tempDir(), "missing"),
-          MIST_PI_BRIDGE_EXTENSION: extension,
-        },
-      }).complete(request({ adapterId: "pi-claude-bridge" })),
-    );
-    const record = JSON.parse(readFileSync(recordPath, "utf8")) as FakeRecord;
-    expect(record.args[record.args.indexOf("--extension") + 1]).toBe(extension);
-    expect(record.args.filter((arg) => arg === "--extension")).toHaveLength(1);
-    expect(record.args).toContain("--no-extensions");
-    expect(record.args.some((arg) => arg.startsWith("npm:"))).toBe(false);
-  });
-
-  it("bridge 缺包在调用 pi 前拒绝，错误不给出私有路径", async () => {
-    const { bin, recordPath } = fakePi();
-    const transport = new PiCliTransport({
-      piBin: bin,
-      extraEnv: {
-        FAKE_PI_RECORD: recordPath,
-        PI_CODING_AGENT_DIR: join(tempDir(), "private-path-canary"),
-        MIST_PI_BRIDGE_EXTENSION: "",
-      },
-    });
-    await expect(
-      collect(transport.complete(request({ adapterId: "pi-claude-bridge" }))),
-    ).rejects.toThrow(/^pi-claude-bridge 未找到；先运行 pi install npm:pi-claude-bridge/);
-    expect(() => readFileSync(recordPath, "utf8")).toThrow();
-  });
-
-  it.each(["./relative-extension.ts", "npm:pi-claude-bridge"])(
-    "bridge 拒绝非绝对本地路径 %s，不启动安装或模型",
-    async (extension) => {
-      const { bin, recordPath } = fakePi();
-      await expect(
-        collect(
-          new PiCliTransport({
-            piBin: bin,
-            extraEnv: { FAKE_PI_RECORD: recordPath, MIST_PI_BRIDGE_EXTENSION: extension },
-          }).complete(request({ adapterId: "pi-claude-bridge" })),
-        ),
-      ).rejects.toThrow("MIST_PI_BRIDGE_EXTENSION 须为已安装扩展的绝对路径或 ~/ 路径");
-      expect(() => readFileSync(recordPath, "utf8")).toThrow();
-    },
-  );
-
-  it("API-key 路由忽略 bridge 路径，不载入扩展", async () => {
-    const { bin, recordPath } = fakePi();
-    await collect(
-      new PiCliTransport({
-        piBin: bin,
-        extraEnv: { FAKE_PI_RECORD: recordPath, MIST_PI_BRIDGE_EXTENSION: "npm:invalid" },
-      }).complete(request()),
-    );
-    const record = JSON.parse(readFileSync(recordPath, "utf8")) as FakeRecord;
-    expect(record.args).not.toContain("--extension");
-    expect(record.args).toContain("--no-extensions");
   });
 
   it.each(["turn-error", "turn-aborted", "assistant-error-event"])(
@@ -651,7 +594,7 @@ describe("PiCliTransport", () => {
     expect(record.systemPrompt).not.toContain("每天写日报");
     expect(record.systemPrompt).not.toContain("爱吃苹果");
     expect(record.systemPrompt).not.toContain("早安");
-    // 历史与动态材料进 session 文件：历史角色/顺序/正文保留，动态材料在尾部 context。
+    // 历史与动态材料进 session 文件：历史角色/顺序/正文保留，动态材料在历史前的 context。
     const entries = parseSession(record.sessionRaw);
     const messages = entries.filter((entry) => entry.type === "message");
     expect(roleContentText(messages[0])).toEqual({ role: "user", text: "早安" });
@@ -746,7 +689,7 @@ describe("#227 结构化历史 session（role/content 形状与顺序）", () =>
     expect(record.sessionRaw ?? "").not.toContain(current);
   });
 
-  it("session 是合法 v3 JSONL：header + parentId 线性链 + 末尾 custom context（动态材料）", () => {
+  it("session 是合法 v3 JSONL：header + parentId 线性链 + 首部 custom context（动态材料）", () => {
     const raw = renderHistorySession(
       request({
         bootPack: {
@@ -771,21 +714,18 @@ describe("#227 结构化历史 session（role/content 形状与顺序）", () =>
     for (let i = 1; i < chain.length; i += 1) {
       expect(chain[i]?.parentId).toBe(chain[i - 1]?.id);
     }
-    expect(chain.at(-1)?.type).toBe("custom_message");
-    expect(String(chain.at(-1)?.content)).toContain("每天写日报");
+    expect(chain[0]?.type).toBe("custom_message");
+    expect(String(chain[0]?.content)).toContain("每天写日报");
   });
 
   it("pi-ai 与 bridge 两路用同一个 session（不换住户、不换角色）；bridge 也拿到 assistant 正文", async () => {
     for (const adapterId of ["pi-ai", "pi-claude-bridge"] as const) {
       const { bin, recordPath } = fakePi();
-      const bridge = fakeInstalledBridge();
       await collect(
         new PiCliTransport({
           piBin: bin,
           extraEnv: {
             FAKE_PI_RECORD: recordPath,
-            PI_CODING_AGENT_DIR: bridge.agentDir,
-            MIST_PI_BRIDGE_EXTENSION: "",
           },
         }).complete(
           request({
@@ -852,8 +792,103 @@ describe("#227 结构化历史 session（role/content 形状与顺序）", () =>
     await waitForExit(record.pid);
     await expect(pending).resolves.toBe("rejected");
     expect(() => readFileSync(sessionPath, "utf8")).toThrow();
-    expect(() => readFileSync(dirPath, "utf8")).toThrow();
+    expect(existsSync(dirPath)).toBe(false);
   });
+});
+
+describe("#231 policy and history regressions", () => {
+  it("keeps the session cwd stable across real transport turns", async () => {
+    const { bin, recordPath } = fakePi();
+    const transport = new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_RECORD: recordPath } });
+    await collect(transport.complete(request()));
+    const first = JSON.parse(readFileSync(recordPath, "utf8")) as FakeRecord;
+    await collect(transport.complete(request({ history: [{ role: "user", text: "prior" }] })));
+    const second = JSON.parse(readFileSync(recordPath, "utf8")) as FakeRecord;
+    expect(parseSession(first.sessionRaw)[0]).toMatchObject({ cwd: process.cwd() });
+    expect(parseSession(second.sessionRaw)[0]).toMatchObject({ cwd: process.cwd() });
+  });
+
+  it("disables compaction in private settings and verifies it before prompt without mutating the original", async () => {
+    const original = tempDir();
+    const settings = JSON.stringify({
+      compaction: { enabled: true },
+      reviewSetting: "preserve-me",
+    });
+    writeFileSync(join(original, "settings.json"), settings);
+    const { bin, recordPath } = fakePi();
+    await collect(
+      new PiCliTransport({
+        piBin: bin,
+        extraEnv: { FAKE_PI_RECORD: recordPath, PI_CODING_AGENT_DIR: original },
+      }).complete(request()),
+    );
+    const record = JSON.parse(readFileSync(recordPath, "utf8")) as FakeRecord & {
+      commands: string[];
+    };
+    expect(record.agentSettings).toMatchObject({
+      compaction: { enabled: false },
+      reviewSetting: "preserve-me",
+    });
+    expect(record.commands).toEqual(["get_state", "prompt"]);
+    expect(record.agentDir).not.toBe(original);
+    expect(existsSync(record.agentDir)).toBe(false);
+    expect(readFileSync(join(original, "settings.json"), "utf8")).toBe(settings);
+  });
+
+  it("refuses an effective compaction policy that is still enabled before any prompt", async () => {
+    const { bin, recordPath } = fakePi();
+    await expect(
+      collect(
+        new PiCliTransport({
+          piBin: bin,
+          extraEnv: { FAKE_PI_RECORD: recordPath, FAKE_PI_POLICY_ENABLED: "1" },
+        }).complete(request()),
+      ),
+    ).rejects.toThrow(/compaction|压缩/);
+    expect(existsSync(recordPath)).toBe(false);
+  });
+
+  it.each(["compact-start", "compact-end"])(
+    "rejects %s before committing a runtime turn",
+    async (mode) => {
+      const { bin } = fakePi();
+      const runtime = new ResidentRuntime({
+        dataDir: tempDir(),
+        transport: new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_MODE: mode } }),
+      });
+      try {
+        const candidate = runtime.createCandidate({
+          residentId: "review-compact",
+          persona: "synthetic",
+          proposedBy: { kind: "installer", id: "test" },
+        });
+        runtime.attestCandidate(
+          candidate.candidateId,
+          { kind: "candidate", candidateId: candidate.candidateId },
+          "accepted",
+        );
+        runtime.provisionChannel({
+          residentId: "review-compact",
+          channel: {
+            claudeSubscription: false,
+            credentialKind: "api-key",
+            model: "anthropic/claude-test",
+          },
+          canarySecret: "SYNTHETIC-KEY",
+        });
+        expect(await runtime.say({ residentId: "review-compact", text: "current" })).toMatchObject({
+          ok: false,
+          error: { code: "channel-unavailable" },
+        });
+        expect(runtime.readStream({ residentId: "review-compact" })).toMatchObject({
+          ok: false,
+          error: { code: "stream-not-found" },
+        });
+      } finally {
+        await runtime.close();
+      }
+    },
+  );
 });
 
 /**

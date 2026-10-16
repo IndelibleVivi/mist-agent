@@ -21,12 +21,6 @@
 
 ## 写文档的规矩
 
-- 模型输入投影由 `src/resident-runtime/pi-transport.ts` 维护：身份/交接信 system 前缀、
-  角色历史和本轮尾部动态材料；私有 Pi session 是可删除临时投影，不是第二真源。
-- Usage 只收有效 reported 数值，日志 owner 为 `src/resident-runtime/usage-log.ts`；未知不补零，
-  历史导入占位计数不计入 usage。改此链跑 Pi transport 与 runtime tests，核身份闸、隐私、
-  日志故障不改聊天/ACK，并同步 README / runtime-config / resident-runtime 清单。
-
 - 「实证」二字只给验收清单跑出来的东西用。读过源码 ≠ 验过。
 - 每条设计决定写代价。写不出代价的是愿望，愿望去 issue，不进设计稿。
 - 一份文档一个主题。不许新建散装 MD 往根目录或 docs/ 里随手丢——

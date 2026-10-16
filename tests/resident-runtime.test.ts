@@ -1648,12 +1648,58 @@ describe("#227 逐回合 usage 日志（真实 runtime 接线 + 读口）", () =
       });
       expect(runtime.turnUsage({ residentId: pending.candidateId })).toMatchObject({
         ok: false,
-        error: { code: "candidate-pending" },
+        error: { code: "resident-not-found" },
       });
       expect(runtime.turnUsage({ residentId: "../../outside" })).toMatchObject({
         ok: false,
         error: { code: "resident-not-found" },
       });
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("usage only accepts canonical residentId after activation", async () => {
+    const runtime = new ResidentRuntime({ dataDir: tempDir() });
+    try {
+      const candidate = runtime.createCandidate({
+        residentId: "review-usage",
+        persona: "synthetic",
+        proposedBy: { kind: "installer", id: "test" },
+      });
+      runtime.attestCandidate(
+        candidate.candidateId,
+        { kind: "candidate", candidateId: candidate.candidateId },
+        "accepted",
+      );
+      expect(runtime.turnUsage({ residentId: "review-usage" })).toMatchObject({ ok: true });
+      expect(runtime.turnUsage({ residentId: candidate.candidateId })).toMatchObject({
+        ok: false,
+        error: { code: "resident-not-found" },
+      });
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("usage preserves valid records on both sides of a truncated line and counts damaged records", async () => {
+    const dataDir = tempDir();
+    const runtime = new ResidentRuntime({
+      dataDir,
+      transport: usageTransport(() => ({ input: 2 })).transport,
+    });
+    try {
+      runtimeProvision(runtime, "review-truncated");
+      unwrap(await runtime.say({ residentId: "review-truncated", text: "first" }));
+      const path = join(dataDir, "logs", "review-truncated.usage.jsonl");
+      const before = readFileSync(path, "utf8");
+      writeFileSync(path, `${before}{ truncated`);
+      unwrap(await runtime.say({ residentId: "review-truncated", text: "second" }));
+      const view = unwrap(runtime.turnUsage({ residentId: "review-truncated" }));
+      expect(view.turns).toHaveLength(2);
+      expect(view.cumulative).toMatchObject({ input: 4 });
+      expect(view).toMatchObject({ invalidRecords: 1, cumulativeCoverage: { totalTurns: 2 } });
+      expect(readFileSync(path, "utf8")).toContain("{ truncated\n{");
     } finally {
       await runtime.close();
     }

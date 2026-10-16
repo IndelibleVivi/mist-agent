@@ -24,6 +24,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -60,6 +61,8 @@ export interface TurnUsageView {
    * 不吞错也不伪报已记录。
    */
   readonly logError: string | null;
+  /** 损坏/截断记录被跳过的条数；有效记录继续可读，不包含坏行正文。 */
+  readonly invalidRecords: number;
 }
 
 type UsageField = (typeof USAGE_FIELDS)[number];
@@ -95,7 +98,12 @@ export class TurnUsageLog {
       const fd = this.#open(residentId, true);
       try {
         fchmodSync(fd, 0o600);
-        writeFileSync(fd, `${JSON.stringify(safe)}\n`, { encoding: "utf8" });
+        const size = fstatSync(fd).size;
+        const last = Buffer.alloc(1);
+        const needsNewline = size > 0 && readSync(fd, last, 0, 1, size - 1) === 1 && last[0] !== 10;
+        writeFileSync(fd, `${needsNewline ? "\n" : ""}${JSON.stringify(safe)}\n`, {
+          encoding: "utf8",
+        });
       } finally {
         closeSync(fd);
       }
@@ -125,11 +133,20 @@ export class TurnUsageLog {
       throw error;
     }
     const turns: (TurnUsageRecord & { residentId: string })[] = [];
+    let invalidRecords = 0;
     for (const line of content.split("\n")) {
       if (line.trim().length === 0) continue;
-      const parsed: unknown = JSON.parse(line);
-      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
-        throw new Error("Invalid usage record");
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        invalidRecords += 1;
+        continue;
+      }
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        invalidRecords += 1;
+        continue;
+      }
       const row = parsed as Record<string, unknown>;
       if (
         typeof row.turnId !== "string" ||
@@ -139,8 +156,10 @@ export class TurnUsageLog {
         typeof row.generation !== "number" ||
         !Number.isSafeInteger(row.generation) ||
         row.generation < 0
-      )
-        throw new Error("Invalid usage record");
+      ) {
+        invalidRecords += 1;
+        continue;
+      }
       const usage = normalizeTurnUsage(row.turn);
       turns.push({
         residentId,
@@ -152,10 +171,14 @@ export class TurnUsageLog {
         ...(usage === undefined ? {} : { turn: usage }),
       });
     }
-    return this.#view(turns, residentId);
+    return this.#view(turns, residentId, invalidRecords);
   }
 
-  #view(turns: (TurnUsageRecord & { residentId: string })[], residentId: string): TurnUsageView {
+  #view(
+    turns: (TurnUsageRecord & { residentId: string })[],
+    residentId: string,
+    invalidRecords = 0,
+  ): TurnUsageView {
     const sums: Record<UsageField, number> = {
       input: 0,
       output: 0,
@@ -195,6 +218,7 @@ export class TurnUsageLog {
       cumulative: normalizeTurnUsage(cumulative) ?? {},
       cumulativeCoverage: { totalTurns, perField: coverage },
       logError: this.#lastError.get(residentId) ?? null,
+      invalidRecords,
     };
   }
 
@@ -211,7 +235,7 @@ export class TurnUsageLog {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
     const flags = writing
-      ? constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND
+      ? constants.O_RDWR | constants.O_CREAT | constants.O_APPEND
       : constants.O_RDONLY;
     // 非阻塞打开避免检查后被替换为 FIFO 等特殊文件时把聊天挂住；普通文件语义不变。
     const fd = openSync(
