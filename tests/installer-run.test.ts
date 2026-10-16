@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -8,10 +8,11 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { residentCommand } from "../src/installer/cli.ts";
 import { InstallerController } from "../src/installer/controller.ts";
 import { FileMemoryLibrary } from "../src/installer/memory-library.ts";
 import type { OAuthLoginPort } from "../src/installer/pi-login.ts";
@@ -21,7 +22,7 @@ import { runInstaller } from "../src/installer/run.ts";
 import { InstallerStateStore } from "../src/installer/state-store.ts";
 import { ResidentIdentityStore } from "../src/resident-continuity/identity-store.ts";
 import type { ModelCompletionRequest, ModelTransport } from "../src/resident-runtime/channels.ts";
-import { main as residentMain } from "../src/resident-runtime/cli.ts";
+import { parseResidentCliArguments, main as residentMain } from "../src/resident-runtime/cli.ts";
 import { ResidentRuntime } from "../src/resident-runtime/runtime.ts";
 
 const temporaryDirectories: string[] = [];
@@ -1245,4 +1246,26 @@ it("goes from a committed setup to chat only after the resident itself accepts t
     expect(readFileSync(join(directory, "residents", file), "utf8")).not.toContain(secret);
   }
   expect(store.readCredentialSecret("openrouter-key")).toBe(secret);
+});
+
+describe("setup's next-step command", () => {
+  it("carries a custom data directory, spaces and quotes included, through to the resident's arguments", () => {
+    const dataDir = join(freshDirectory(), "my mist's data");
+    const command = residentCommand(dataDir, join(freshDirectory(), "default"));
+    const prefix = "npm run resident -- ";
+    expect(command.startsWith(`${prefix}--data-dir `)).toBe(true);
+
+    // 让真 shell 拆词，拆出来的参数原样交给 resident 的参数解析。
+    const words = execFileSync("bash", ["-c", `printf '%s\\0' ${command.slice(prefix.length)}`])
+      .toString("utf8")
+      .split("\0")
+      .filter((word) => word.length > 0);
+    expect(words).toEqual(["--data-dir", resolve(dataDir)]);
+    expect(parseResidentCliArguments(words).dataDir).toBe(resolve(dataDir));
+  });
+
+  it("stays the bare command for the default directory", () => {
+    expect(residentCommand(join(homedir(), ".mist"))).toBe("npm run resident");
+    expect(residentCommand("/srv/mist")).toBe("npm run resident -- --data-dir /srv/mist");
+  });
 });

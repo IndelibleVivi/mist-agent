@@ -42,6 +42,7 @@ export interface InstallSource {
 
 export type OnboardingFailureCode =
   | "install-missing"
+  | "install-unreadable"
   | "channel-unsupported"
   | "persona-missing"
   | "persona-invalid"
@@ -107,6 +108,13 @@ function fail(code: OnboardingFailureCode, message: string, remedy: string): Onb
   return { ok: false, code, message, remedy };
 }
 
+/** 读文件出错只报错误码，不带原 message：JSON 解析的报错会摘录文件内容。 */
+function describeReadError(error: unknown): string {
+  if (error instanceof Error && "code" in error && typeof error.code === "string")
+    return error.code;
+  return error instanceof SyntaxError ? "内容不是合法的 JSON" : "读取失败";
+}
+
 function expandHome(path: string): string {
   if (path === "~") return homedir();
   if (path.startsWith("~/")) return join(homedir(), path.slice(2));
@@ -126,7 +134,13 @@ function readPersona(path: string): { ok: true; persona: string } | { ok: false;
   if (size > PERSONA_MAX_BYTES) {
     return { ok: false, reason: `${absolute} 超过 ${PERSONA_MAX_BYTES / 1024} KB` };
   }
-  const persona = readFileSync(absolute, "utf8");
+  let persona: string;
+  try {
+    persona = readFileSync(absolute, "utf8");
+  } catch (error) {
+    // stat 过了不代表读得了（权限、读到一半被删）。
+    return { ok: false, reason: `读不出 ${absolute}（${describeReadError(error)}）` };
+  }
   if (persona.trim().length === 0) return { ok: false, reason: `${absolute} 是空的` };
   return { ok: true, persona };
 }
@@ -166,9 +180,22 @@ async function collectReply(
  * 任何一步没成都返回结构化失败，不进聊天。
  */
 export async function residentFromInstall(options: OnboardingOptions): Promise<OnboardingResult> {
-  const config = options.install.loadCurrentConfig();
+  let config: MistInstallConfigV0 | null;
+  try {
+    config = options.install.loadCurrentConfig();
+  } catch (error) {
+    return fail(
+      "install-unreadable",
+      `安装快照读不出来（${describeReadError(error)}）`,
+      "重新运行 npm run setup 再存一次；装在别的目录就两边都带上同一个 --data-dir",
+    );
+  }
   if (config === null) {
-    return fail("install-missing", "还没有装好的 mist", "先运行 npm run setup，保存之后再来");
+    return fail(
+      "install-missing",
+      "还没有装好的 mist",
+      "先运行 npm run setup，保存之后再来；setup 装在别的目录的话，这里也带上同一个 --data-dir",
+    );
   }
   const primary = config.bindings.find((binding) => binding.lane === "primary");
   if (primary === undefined || primary.credentialRef.type !== "api_key") {
@@ -178,7 +205,16 @@ export async function residentFromInstall(options: OnboardingOptions): Promise<O
       "重新运行 npm run setup，主通道选一把 API key（比如 OpenRouter 或 Kimi Code）",
     );
   }
-  const secret = options.install.readCredentialSecret(primary.credentialRef.id);
+  let secret: string;
+  try {
+    secret = options.install.readCredentialSecret(primary.credentialRef.id);
+  } catch (error) {
+    return fail(
+      "install-unreadable",
+      `安装里的 key 读不出来（${describeReadError(error)}）`,
+      "重新运行 npm run setup，把这把 key 再存一次",
+    );
+  }
   const residentId = config.residentId;
 
   const active = options.runtime.requireActiveResident(residentId);

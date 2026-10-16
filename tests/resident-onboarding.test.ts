@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -373,6 +373,60 @@ describe("residentFromInstall", () => {
   });
 });
 
+describe("residentFromInstall when files cannot be read", () => {
+  function currentSnapshot(dataDir: string): string {
+    const pointer = JSON.parse(readFileSync(join(dataDir, "current.json"), "utf8")) as {
+      snapshotId: string;
+    };
+    return join(dataDir, "snapshots", pointer.snapshotId);
+  }
+
+  it("turns an unreadable persona file into persona-invalid without calling the model", async () => {
+    const h = harness(["认"]);
+    install(h.dataDir);
+    const path = personaFile(h.dataDir);
+    chmodSync(path, 0o000);
+
+    const result = await h.run({ personaPath: path, model: MODEL });
+
+    chmodSync(path, 0o600);
+    expect(result).toMatchObject({ ok: false, code: "persona-invalid" });
+    expect(result.ok === false && result.message).toContain("EACCES");
+    expect(result.ok === false && result.remedy.length).toBeGreaterThan(0);
+    expect(h.transport.requests).toHaveLength(0);
+    expect(h.runtime.latestCandidateFor("resident-1")).toBeNull();
+  });
+
+  it("turns a missing install key into install-unreadable before handing over any persona", async () => {
+    const h = harness(["认"]);
+    install(h.dataDir);
+    const credentials = join(currentSnapshot(h.dataDir), "credentials");
+    for (const file of readdirSync(credentials)) rmSync(join(credentials, file));
+
+    const result = await h.run({ personaPath: personaFile(h.dataDir), model: MODEL });
+
+    expect(result).toMatchObject({ ok: false, code: "install-unreadable" });
+    expect(result.ok === false && result.message).toContain("ENOENT");
+    expect(h.transport.requests).toHaveLength(0);
+    expect(h.runtime.latestCandidateFor("resident-1")).toBeNull();
+  });
+
+  it("reports a damaged install snapshot by error code only, without quoting the file", async () => {
+    const h = harness(["认"]);
+    install(h.dataDir);
+    writeFileSync(
+      join(currentSnapshot(h.dataDir), "config.json"),
+      '{"residentId": "TEST-LEAK-MARKER',
+    );
+
+    const result = await h.run({ personaPath: personaFile(h.dataDir), model: MODEL });
+
+    expect(result).toMatchObject({ ok: false, code: "install-unreadable" });
+    expect(JSON.stringify(result)).not.toContain("TEST-LEAK-MARKER");
+    expect(h.transport.requests).toHaveLength(0);
+  });
+});
+
 describe("npm run resident from the install", () => {
   it("explains that setup comes first when nothing is installed", async () => {
     const dataDir = freshDirectory();
@@ -390,5 +444,33 @@ describe("npm run resident from the install", () => {
     expect(code).toBe(1);
     expect(stderr).toContain("install-missing");
     expect(stderr).toContain("npm run setup");
+  });
+
+  it("prints the persona-invalid diagnosis and a remedy when the persona file cannot be read", async () => {
+    const dataDir = freshDirectory();
+    install(dataDir);
+    const path = personaFile(dataDir);
+    chmodSync(path, 0o000);
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", cliPath, "--data-dir", dataDir, "--persona", path, "--model", MODEL],
+      {
+        env: { ...process.env, MIST_RESIDENT_RUNTIME_TRANSPORT: "synthetic" },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+    child.stdin.end();
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
+    chmodSync(path, 0o600);
+
+    expect(code).toBe(1);
+    expect(stderr).toContain("persona-invalid");
+    expect(stderr).toContain("EACCES");
+    expect(stderr).toContain("处理建议");
+    expect(stderr).not.toContain("Resident TUI failed");
   });
 });

@@ -49,6 +49,22 @@ export function parseInstallerArguments(args: readonly string[]): CliArguments {
   return parsed;
 }
 
+/** shell 里能原样粘贴的一个参数：只含安全字符就不加引号，否则单引号包起来。 */
+function shellWord(value: string): string {
+  if (/^[A-Za-z0-9_/.:@%+=,-]+$/.test(value)) return value;
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/**
+ * 装完的下一步命令。数据目录不是默认的 ~/.mist 就带上 --data-dir：resident 自己只会回落到
+ * MIST_DATA_DIR 或 ~/.mist，换个终端、没带环境变量，就会读不到刚存的安装。
+ */
+export function residentCommand(dataDir: string, defaultDir = join(homedir(), ".mist")): string {
+  const absolute = resolve(dataDir);
+  if (absolute === resolve(defaultDir)) return "npm run resident";
+  return `npm run resident -- --data-dir ${shellWord(absolute)}`;
+}
+
 export async function main(args = process.argv.slice(2)): Promise<void> {
   const cli = parseInstallerArguments(args);
   const prompt = new InquirerPromptPort();
@@ -73,7 +89,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   if (result.status === "committed") {
     prompt.info(`Setup saved as ${result.receipt.snapshotId}.`);
     prompt.info(
-      "Next: run `npm run resident`. The first start asks for a persona file and a model, lets the resident accept or decline the persona itself, then opens the chat.",
+      `Next: run \`${residentCommand(dataDir)}\`. The first start asks for a persona file and a model, lets the resident accept or decline the persona itself, then opens the chat.`,
     );
   } else if (result.status === "paused") {
     prompt.info("Setup paused. Run the same command to continue.");
