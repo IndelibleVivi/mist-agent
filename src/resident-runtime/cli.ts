@@ -1,13 +1,15 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { createInterface } from "node:readline";
+import { type Interface, createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 import type { BreathTrigger } from "../../acceptance/resident-runtime-driver.ts";
+import { InstallerStateStore } from "../installer/state-store.ts";
 import type { ResidentIdentityFailureReason } from "../resident-continuity/identity-store.ts";
 import { parseManualBreath } from "../session/breath-trigger.ts";
 import { assembleResidentRuntime } from "./assembly.ts";
-import type { ModelTransport } from "./channels.ts";
+import { type ModelTransport, createModelTransport } from "./channels.ts";
 import { CredentialStore } from "./credentials.ts";
+import { residentFromInstall } from "./onboarding.ts";
 import { ResidentChatTui } from "./tui.ts";
 
 /** 身份闸拒绝在终端边界的人话 message：保持与 runtime identityFailure 同一口径。 */
@@ -32,8 +34,11 @@ function identityFailureRemedy(reason: ResidentIdentityFailureReason): string {
 }
 
 interface ResidentCliOptions {
-  readonly residentId: string;
+  /** 缺省 = 从当前安装启动（第一次会递人格稿、请住户自认、配通道）。 */
+  readonly residentId?: string;
   readonly dataDir: string;
+  readonly personaPath?: string;
+  readonly model?: string;
   readonly help: boolean;
 }
 
@@ -60,9 +65,10 @@ export function parseResidentCliInput(line: string): ResidentCliInput {
   return { kind: "chat", text: line };
 }
 
+const VALUE_OPTIONS = new Set(["--resident", "--data-dir", "--persona", "--model"]);
+
 export function parseResidentCliArguments(args: readonly string[]): ResidentCliOptions {
-  let residentId: string | undefined;
-  let dataDir = process.env.MIST_DATA_DIR ?? join(homedir(), ".mist");
+  const values = new Map<string, string>();
   let help = false;
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
@@ -70,31 +76,49 @@ export function parseResidentCliArguments(args: readonly string[]): ResidentCliO
       help = true;
       continue;
     }
-    if (argument !== "--resident" && argument !== "--data-dir") {
+    if (argument === undefined || !VALUE_OPTIONS.has(argument)) {
       throw new Error(`unknown resident option: ${argument ?? ""}`);
     }
     const value = args[index + 1];
-    if (value === undefined || value.startsWith("--")) {
+    if (value === undefined || value.startsWith("--") || value.trim().length === 0) {
       throw new Error(`${argument} requires a value`);
     }
-    if (argument === "--resident") residentId = value;
-    else dataDir = value;
+    values.set(argument, value);
     index += 1;
   }
-  if (!help && (residentId === undefined || residentId.trim().length === 0)) {
-    throw new Error("--resident is required; use --help for usage");
+  const residentId = values.get("--resident");
+  const personaPath = values.get("--persona");
+  const model = values.get("--model");
+  if (residentId !== undefined && (personaPath !== undefined || model !== undefined)) {
+    throw new Error(
+      "--persona and --model belong to the install start; drop --resident to use them",
+    );
   }
-  return { residentId: residentId ?? "", dataDir: resolve(dataDir), help };
+  return {
+    ...(residentId === undefined ? {} : { residentId }),
+    dataDir: resolve(
+      values.get("--data-dir") ?? process.env.MIST_DATA_DIR ?? join(homedir(), ".mist"),
+    ),
+    ...(personaPath === undefined ? {} : { personaPath }),
+    ...(model === undefined ? {} : { model }),
+    help,
+  };
 }
 
 export async function main(
   args = process.argv.slice(2),
-  injection: { transport?: ModelTransport } = {},
+  injection: { transport?: ModelTransport; lines?: AsyncIterable<string> } = {},
 ): Promise<void> {
   const options = parseResidentCliArguments(args);
   if (options.help) {
     process.stdout.write(
-      "Usage: npm run resident -- --resident <residentId> [--data-dir <path>]\n",
+      "Usage: npm run resident [-- --persona <file>] [--model <provider/model>] [--data-dir <path>]\n",
+    );
+    process.stdout.write(
+      "Without --resident it starts from the current setup: the first start hands the persona to the resident, lets it accept or decline, then sets up the model channel.\n",
+    );
+    process.stdout.write(
+      "       npm run resident -- --resident <residentId> [--data-dir <path>]  (an existing resident, channel already set up)\n",
     );
     process.stdout.write("Type /exit to leave the single-resident chat.\n");
     process.stdout.write(
@@ -103,23 +127,65 @@ export async function main(
     return;
   }
 
-  const runtime = assembleResidentRuntime({
-    dataDir: options.dataDir,
-    ...(injection.transport === undefined ? {} : { transport: injection.transport }),
-  });
+  // 从安装启动是给人直接用的入口：没设 MIST_RESIDENT_RUNTIME_TRANSPORT 时走真实 pi 通道，
+  // 不然自认那一轮只会收到合成回声。带 --resident 的老入口照旧按环境变量（缺省合成）。
+  const mode = process.env.MIST_RESIDENT_RUNTIME_TRANSPORT;
+  const transport =
+    injection.transport ??
+    createModelTransport(options.residentId === undefined ? mode || "pi" : mode);
+  const runtime = assembleResidentRuntime({ dataDir: options.dataDir, transport });
+  // 第一次启动的问答和之后的聊天读同一条输入，不开第二个 readline。
+  let input: Interface | null = null;
+  let source: AsyncIterable<string>;
+  if (injection.lines === undefined) {
+    input = createInterface({ input: process.stdin, crlfDelay: Number.POSITIVE_INFINITY });
+    source = input;
+  } else {
+    source = injection.lines;
+  }
+  const lines = source[Symbol.asyncIterator]();
+  const nextLine = async (): Promise<string | null> => {
+    const next = await lines.next();
+    return next.done === true ? null : next.value;
+  };
   try {
+    let referenceId = options.residentId;
+    if (referenceId === undefined) {
+      const credentials = new CredentialStore(join(options.dataDir, "credentials"));
+      const prepared = await residentFromInstall({
+        runtime,
+        credentials,
+        install: new InstallerStateStore(options.dataDir),
+        transport,
+        ask: async (question) => {
+          process.stdout.write(`${question}\n> `);
+          return nextLine();
+        },
+        say: (text) => process.stdout.write(`${text}\n`),
+        ...(options.personaPath === undefined ? {} : { personaPath: options.personaPath }),
+        ...(options.model === undefined ? {} : { model: options.model }),
+      });
+      if (!prepared.ok) {
+        process.stderr.write(
+          `${prepared.code}：${prepared.message}\n处理建议：${prepared.remedy}\n`,
+        );
+        process.exitCode = 1;
+        return;
+      }
+      referenceId = prepared.residentId;
+    }
     // CLI 是宿主边界：candidateId 只在这里 resolve 一次，之后一律用 canonical
     // residentId。身份闸（D22 / #182）先于凭证面成立——安装器只保存了配置，没有
     // 住户自认，所以没有 active 住户时按 reason 机器可分地拒绝，不假装凭证问题：
     // candidate-pending / candidate-rejected / resident-not-found 三码各自成对。
     // 不 throw 崩溃：把 code/message/remedy 写进 stderr 后 return exitCode=1。
-    const active = runtime.requireActiveResident(options.residentId);
+    const active = runtime.requireActiveResident(referenceId);
     if (!active.ok) {
       const failure = {
         code: active.reason,
-        message: identityFailureMessage(active.reason, options.residentId),
+        message: identityFailureMessage(active.reason, referenceId),
         remedy: identityFailureRemedy(active.reason),
-        residentId: options.residentId,
+        residentId: referenceId,
       };
       process.stderr.write(`${failure.code}：${failure.message}\n处理建议：${failure.remedy}\n`);
       process.exitCode = 1;
@@ -135,18 +201,17 @@ export async function main(
         process.stdout.write(`${frame.text}\n`);
       },
     });
-    const input = createInterface({ input: process.stdin, crlfDelay: Number.POSITIVE_INFINITY });
     let interrupted = false;
     const onSigint = (): void => {
       interrupted = true;
-      input.close();
+      input?.close();
     };
     process.once("SIGINT", onSigint);
 
     try {
       tui.start();
       process.stdout.write("输入 /exit 结束。\n你> ");
-      for await (const line of input) {
+      for (let line = await nextLine(); line !== null; line = await nextLine()) {
         const command = parseResidentCliInput(line);
         if (command.kind === "exit") break;
         if (line.trim().length === 0) {
@@ -162,11 +227,11 @@ export async function main(
         process.stdout.write("\n你> ");
       }
     } finally {
-      input.close();
       process.off("SIGINT", onSigint);
       if (interrupted) process.exitCode = 130;
     }
   } finally {
+    input?.close();
     await runtime.close();
   }
 }

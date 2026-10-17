@@ -140,9 +140,19 @@ describe("resident CLI arguments", () => {
     });
   });
 
-  it("supports help without requiring a resident ID and rejects missing IDs", () => {
+  it("supports help, and starts from the install when no resident is named", () => {
     expect(parseResidentCliArguments(["--help"]).help).toBe(true);
-    expect(() => parseResidentCliArguments([])).toThrow(/--resident is required/);
+    expect(parseResidentCliArguments(["--data-dir", "/tmp/mist-test"])).toEqual({
+      dataDir: "/tmp/mist-test",
+      help: false,
+    });
+    expect(
+      parseResidentCliArguments(["--persona", "p.md", "--model", "openrouter/test/model"]),
+    ).toMatchObject({ personaPath: "p.md", model: "openrouter/test/model" });
+    expect(() => parseResidentCliArguments(["--resident"])).toThrow(/requires a value/);
+    expect(() =>
+      parseResidentCliArguments(["--resident", "r-cli", "--model", "openrouter/test/model"]),
+    ).toThrow(/drop --resident/);
   });
 });
 

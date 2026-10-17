@@ -244,6 +244,17 @@ export class ResidentIdentityStore {
       : { ok: true, value: this.#candidateSnapshot(candidate) };
   }
 
+  /**
+   * Onboarding lookup for a host that only knows the resident id it asked for (the terminal
+   * reads it from the install): the newest candidate that requested this id, or null. Read-only.
+   */
+  latestCandidateFor(requestedResidentId: string): CandidateSnapshot | null {
+    const candidate = this.#registry.candidates.findLast(
+      (entry) => entry.requestedResidentId === requestedResidentId,
+    );
+    return candidate === undefined ? null : this.#candidateSnapshot(candidate);
+  }
+
   readCandidate(candidateId: string): CandidateSnapshot {
     const inspected = this.inspectCandidate(candidateId);
     if (!inspected.ok) throw new Error(inspected.reason);

@@ -14,8 +14,8 @@
 
 | 变量 | 读取点 | 默认 | 用途 |
 |---|---|---|---|
-| `MIST_DATA_DIR` | `src/installer/cli.ts`、`src/resident-runtime/cli.ts` | `~/.mist` | 安装器与终端的数据根；各入口的 `--data-dir` 优先。共用根目录不表示安装快照已接到 runtime |
-| `MIST_RESIDENT_RUNTIME_TRANSPORT` | `src/resident-runtime/channels.ts` | `synthetic`（未设或空字符串） | `synthetic` 为确定性合成通道；`pi` 经外部 pi CLI 调真实模型。其他值拒绝启动；设为 pi 不自动完成通道配置 |
+| `MIST_DATA_DIR` | `src/installer/cli.ts`、`src/resident-runtime/cli.ts` | `~/.mist` | 安装器与终端的数据根；各入口的 `--data-dir` 优先。不带 `--resident` 的 `npm run resident` 从这里的当前安装启动（#182）；带 `--resident` 的老入口不读安装 |
+| `MIST_RESIDENT_RUNTIME_TRANSPORT` | `src/resident-runtime/channels.ts`、`src/resident-runtime/cli.ts` | `synthetic`（未设或空字符串）；不带 `--resident` 从安装启动时为 `pi` | `synthetic` 为确定性合成通道；`pi` 经外部 pi CLI 调真实模型。其他值拒绝启动。从安装启动时由第一次启动按安装配通道；带 `--resident` 时设为 pi 不自动完成通道配置 |
 | `MIST_RESIDENT_RUNTIME_DIR` | `src/resident-runtime/host-process.ts` | 无；缺失拒绝启动 | runtime IPC 宿主的落盘根，判卷 adapter 显式注入。普通 `npm run resident` 的数据根仍走 `--data-dir` / `MIST_DATA_DIR` |
 | `MIST_GROUP_CHAT_DATA_ROOT` | `src/group-chat/host-process.ts` | 无；缺失拒绝启动 | 群聊 IPC 宿主的落盘根，由群聊判卷 adapter（`src/group-chat-acceptance-driver.ts`）显式注入 |
 | `MIST_WINDOW_ARCHIVE_PATH` | `tests/fixtures/session-registry-host.ts` | 空 = 纯内存 | 窗生命周期 JSONL 归档路径（`window_opened` / `window_archived` 追加写）。不设则不持久化，供无持久化需求的嵌入方 |
@@ -56,7 +56,7 @@ pi 通道在子进程中仅按当前 provider 设置一项专属凭证变量，�
 ## 住户运行时的账装配
 
 CLI 与宿主子进程共用 `src/resident-runtime/assembly.ts`，沿用现役
-`MIST_RESIDENT_RUNTIME_TRANSPORT`（默认 synthetic）与宿主 `MIST_RESIDENT_RUNTIME_DIR`，
+`MIST_RESIDENT_RUNTIME_TRANSPORT`（默认 synthetic；终端从安装启动时默认 pi）与宿主 `MIST_RESIDENT_RUNTIME_DIR`，
 不新增变量。认证账跟着 `dataDir` 落在
 `residents/<id>.facts.json`。candidate 本人接受后，room 与账在同一物化入口创建；
 启动时为 active 身份恢复 room / 账，查询与 `provisionChannel()` 不负责开户。

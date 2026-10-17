@@ -349,6 +349,11 @@ export class ResidentRuntime {
     return this.#identities.inspectCandidate(candidateId);
   }
 
+  /** 终端第一次启动用：按安装里写的住户号找最近一份候选（只读，不建不改）。 */
+  latestCandidateFor(requestedResidentId: string): CandidateSnapshot | null {
+    return this.#identities.latestCandidateFor(requestedResidentId);
+  }
+
   requireActiveResident(referenceId: string): IdentityResult<ActiveResidentIdentity> {
     return this.#identities.requireActiveResident(referenceId);
   }

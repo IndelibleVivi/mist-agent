@@ -1,7 +1,7 @@
 import type { CredentialMethod, CredentialType } from "./contracts.ts";
 
 export interface ProviderCapability {
-  id: "claude" | "codex" | "grok";
+  id: "claude" | "codex" | "grok" | "openrouter" | "kimi";
   label: string;
   piAuthKey: string;
   methods: readonly [CredentialMethod, ...CredentialMethod[]];
@@ -13,6 +13,8 @@ export interface ProviderCapability {
  *
  * This table is the installer's active acquisition catalog. Pi supports xAI/Grok OAuth,
  * but issue #50 explicitly defers that path to a later plugin; v0 exposes Grok by API key only.
+ * OpenRouter and Kimi Code are API-key only: other providers' keys go through OpenRouter
+ * (#182, 2026-10-13), and Kimi Code is pi's `kimi-coding` provider.
  */
 export const PROVIDERS: readonly ProviderCapability[] = [
   {
@@ -32,6 +34,18 @@ export const PROVIDERS: readonly ProviderCapability[] = [
     id: "grok",
     label: "Grok / xAI",
     piAuthKey: "xai",
+    methods: ["api-key"],
+  },
+  {
+    id: "openrouter",
+    label: "OpenRouter",
+    piAuthKey: "openrouter",
+    methods: ["api-key"],
+  },
+  {
+    id: "kimi",
+    label: "Kimi Code",
+    piAuthKey: "kimi-coding",
     methods: ["api-key"],
   },
 ] as const;
@@ -54,6 +68,8 @@ export function credentialTypeFor(
       return "codex_oauth";
     case "grok":
       return "grok_oauth";
+    default:
+      throw new Error(`${provider.label} has no OAuth credential type`);
   }
 }
 

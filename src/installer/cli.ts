@@ -49,6 +49,20 @@ export function parseInstallerArguments(args: readonly string[]): CliArguments {
   return parsed;
 }
 
+/** shell 里能原样粘贴的一个参数：只含安全字符就不加引号，否则单引号包起来。 */
+function shellWord(value: string): string {
+  if (/^[A-Za-z0-9_/.:@%+=,-]+$/.test(value)) return value;
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/**
+ * 装完的下一步命令，总是带上这次的 --data-dir：resident 自己会先吃 MIST_DATA_DIR、再回落
+ * ~/.mist，哪怕这次装的就是 ~/.mist，环境变量指着别处也会进错安装。
+ */
+export function residentCommand(dataDir: string): string {
+  return `npm run resident -- --data-dir ${shellWord(resolve(dataDir))}`;
+}
+
 export async function main(args = process.argv.slice(2)): Promise<void> {
   const cli = parseInstallerArguments(args);
   const prompt = new InquirerPromptPort();
@@ -72,6 +86,9 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   });
   if (result.status === "committed") {
     prompt.info(`Setup saved as ${result.receipt.snapshotId}.`);
+    prompt.info(
+      `Next: run \`${residentCommand(dataDir)}\`. The first start asks for a persona file and a model, lets the resident accept or decline the persona itself, then opens the chat.`,
+    );
   } else if (result.status === "paused") {
     prompt.info("Setup paused. Run the same command to continue.");
   } else if (result.status === "dependency-pending") {
