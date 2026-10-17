@@ -1,9 +1,9 @@
 /**
- * #194（RT-01～RT-07）的验收驱动契约。
+ * #194（RT-01～RT-08）的验收驱动契约。
  *
  * 判卷只通过本接口观察住户运行时，不 import `src/` 实现。实现方在
  * `src/resident-runtime-acceptance-driver.ts` 导出 `createResidentRuntimeDriver()`；
- * 驱动缺失时七盏灯全部保持红色——那是判卷先行的起点，不是故障。
+ * 驱动缺失时八盏灯全部保持红色——那是判卷先行的起点，不是故障。
  *
  * 判卷对象是 D28 那条最小闭环：醒来（读启动包 + 真实对话往返）、写流（一窗流唯一
  * writer）、换代（亲笔交接信）、通道（D25 订阅 / API key）、TUI、凭证、真源。
@@ -305,6 +305,22 @@ export interface ResidentRuntimeDriver {
 
   // —— 对话往返 ——
   say(input: { residentId: string; text: string; turnId?: string }): Promise<Result<TurnResult>>;
+
+  /**
+   * 验收观察口：真实模型 transport 的调用次数。RT-08 用前后差证明恢复拒绝发生在
+   * 模型调用之前；只看结构化错误码不足以排除「先调用、再报错」的假绿。
+   */
+  modelInvocationCount(): Promise<number>;
+
+  /** RT-08 故障夹具：让下一次认证回合在正文与 ACK 落盘后，确认记录写入失败。 */
+  armTurnConfirmationWriteFault(input: { residentId: string }): Promise<void>;
+  /** 清掉上面的确定性落盘故障；不补造确认记录。 */
+  repairTurnConfirmationWriteFault(input: { residentId: string }): Promise<void>;
+  /**
+   * RT-08 崩溃夹具：把一个已完成回合裁成只剩耐久 user 腿，随后用同一数据根拉起
+   * 新宿主。夹具只负责造状态；判卷仍须独立读流确认只剩一条 user，再执行换代与重试。
+   */
+  crashAfterUserWrite(input: { residentId: string; turnId: string }): Promise<void>;
 
   // —— 一窗流只读 ——
   readStream(input: { residentId: string }): Promise<Result<StreamSnapshot>>;
