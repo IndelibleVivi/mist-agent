@@ -1,9 +1,9 @@
 /**
- * #194（RT-01～RT-08）的验收驱动契约。
+ * #194（RT-01～RT-09）的验收驱动契约。
  *
  * 判卷只通过本接口观察住户运行时，不 import `src/` 实现。实现方在
  * `src/resident-runtime-acceptance-driver.ts` 导出 `createResidentRuntimeDriver()`；
- * 驱动缺失时八盏灯全部保持红色——那是判卷先行的起点，不是故障。
+ * 驱动缺失时九盏灯全部保持红色——那是判卷先行的起点，不是故障。
  *
  * 判卷对象是 D28 那条最小闭环：醒来（读启动包 + 真实对话往返）、写流（一窗流唯一
  * writer）、换代（亲笔交接信）、通道（D25 订阅 / API key）、TUI、凭证、真源。
@@ -164,6 +164,64 @@ export interface StreamSnapshot {
   readonly events: readonly StreamEventView[];
 }
 
+// —— 模型请求观察（RT-09） ——
+
+/** 随请求进模型的一条历史消息：只有角色与正文。 */
+export interface ModelHistoryMessageView {
+  readonly role: "user" | "assistant";
+  readonly text: string;
+}
+
+/**
+ * 某位住户最近一次真实模型请求的观察视图（transport 实际收到的那份）。
+ *
+ * 只带判卷要比的三样：住户、本回合用户那句、随请求进模型的历史。**不带凭证原文**，
+ * 也不带启动包——这个观察口不许变成 RT-06 扫描面之外的第二个漏密钥的口子。
+ */
+export interface ModelRequestView {
+  readonly residentId: string;
+  readonly text: string;
+  readonly history: readonly ModelHistoryMessageView[];
+}
+
+// —— 认证事实账的确认位（RT-09） ——
+
+/** 认证事实账上一扇窗的确认位（落盘那份）。 */
+export interface LedgerViewportAlignmentView {
+  readonly windowId: string;
+  /** 这行确认位登记时绑定的窗代际；没有认证身份的旧档行为 null。 */
+  readonly generation: number | null;
+  /** 登记那一刻的账序号：这一次激活的对齐起点。 */
+  readonly baselineSeq: number;
+  /** 已确认交付到的账序号；只前进不后退。 */
+  readonly ackedSeq: number;
+}
+
+export interface LedgerAlignmentView {
+  readonly residentId: string;
+  /** 账上最后一条的 seq；空账为 0。 */
+  readonly latestSeq: number;
+  readonly viewports: readonly LedgerViewportAlignmentView[];
+}
+
+// —— 暂停记录与并发（RT-09，#234） ——
+
+/** 暂停记录的三种坏法。#234 第 3 条：一律按猝死处理，宁可忘，不冒认。 */
+export type PauseRecordFault =
+  /** 记录不在：等同正常退出时那笔记录没写成。 */
+  | "missing"
+  /** 记录在但读不懂：字节损坏或截断，解析、校验过不去。 */
+  | "garbled"
+  /** 记录完好可读，但身份对不上：不是这位住户、这扇窗、这一代的那笔。 */
+  | "foreign";
+
+/** 并发夹具里一个宿主进程的结局。 */
+export interface ContendedTurn {
+  /** 这个宿主进程的 pid；没起来（ready 前就退出或超时）为 null。 */
+  readonly pid: number | null;
+  readonly result: Result<TurnResult>;
+}
+
 /**
  * 一窗流的落盘文件清单。RT-02「不出现第二条会话」的机器形式就是它——
  * 一位住户的 canonical stream 落盘文件恰好一个，多一个就是长了第二条生命线。
@@ -286,6 +344,17 @@ export interface ResidentRuntimeDriver {
   startHost(): Promise<HostDescriptor>;
   /** 硬杀宿主进程，不给优雅 flush 的机会。 */
   killHost(): Promise<void>;
+  /**
+   * 正常关闭宿主：走宿主自己的正常关闭路径——与终端 `/exit`、stdin 结束是**同一条**
+   * （现役是 `runtime.close()`），然后由子进程自己退出。驱动只等它退出，不许拿 SIGKILL
+   * 冒充；限时内没自己退出、或退出码非 0，就抛错（那是红，不是暂停）。宿主没在跑时
+   * 是空操作。施工若把「这一代暂停」挂在别处，宿主子进程必须同走那条路径，否则本方法
+   * 判不到终端的真实行为。
+   *
+   * RT-09 拿它与 `killHost` 对照：同样换进程，一个是正常退出（#234 裁定 A：接着同一代），
+   * 一个是硬杀（D8 三：猝死开新一代）。
+   */
+  stopHost(): Promise<void>;
   hostDescriptor(): Promise<HostDescriptor>;
 
   // —— 通道（D25） ——
@@ -321,6 +390,59 @@ export interface ResidentRuntimeDriver {
    * 新宿主。夹具只负责造状态；判卷仍须独立读流确认只剩一条 user，再执行换代与重试。
    */
   crashAfterUserWrite(input: { residentId: string; turnId: string }): Promise<void>;
+
+  /**
+   * 验收观察口：本宿主进程启动以来，这位住户最近一次真实模型请求（见
+   * `ModelRequestView`）；没有就 null，宿主重启后从 null 起算。
+   *
+   * RT-09 要判「接回同一代时，上一段的 user/assistant 确实随请求进了模型」与「猝死后
+   * 上一代原始流水没进」。只看 `TurnResult.generation` 排除不了「代号接上了、上下文却是
+   * 空的」与「代号换了、旧流水却塞进来了」两种假绿；读流只证明落了账，不证明进了模型。
+   */
+  lastModelRequest(input: { residentId: string }): Promise<ModelRequestView | null>;
+
+  // —— 认证事实账（RT-09） ——
+  /**
+   * RT-09 夹具：以宿主维护身份往这位住户的认证事实账追加一条现行事实。不经任何窗、
+   * 不动任何窗的确认位，只造「账上有东西、窗还没确认到」的状态；判卷经
+   * `ledgerAlignment` 独立读回。
+   */
+  appendLedgerFact(input: { residentId: string; body: string }): Promise<Result<{ seq: number }>>;
+  /**
+   * 验收观察口：这位住户认证事实账**落盘**的确认位（只读）。宿主停着也要读得到——判卷
+   * 要在正常退出与下次启动之间核「暂停本身没动确认位」，这时调别的方法会把宿主拉起来。
+   *
+   * 为什么只有它能排除假绿（#234 第 5 条）：接回同一代后认证回合跑得通，只说明窗登记
+   * 上了，分不清「接回原来那次激活」与「按同一身份重新登记一次」。后者把 baseline 挪到
+   * 接回那一刻、把 acked 抬平到 latestSeq：暂停前没交付的缺口被吞掉，已交付的初始事实
+   * 重新冻结成新一轮初始交付。两者在模型请求与一窗流上都不留痕，只在确认位上分得开。
+   */
+  ledgerAlignment(input: { residentId: string }): Promise<Result<LedgerAlignmentView>>;
+
+  // —— 暂停记录与并发（RT-09，#234） ——
+  /**
+   * RT-09 故障夹具：宿主停着时（正常退出之后、下次启动之前）把这位住户的暂停记录按
+   * `fault` 弄坏，别的住户的记录一字不动；宿主在跑时调用直接抛错。夹具只造状态，判卷
+   * 独立判下次启动的结局：新一代、上一代原始流水不进模型请求、归档可查、旧事件不动。
+   *
+   * 现役代码还没有暂停记录：施工前实现方明桩（申报进 `STUBBED`），判卷在走到这里之前
+   * 就已判红；施工落下暂停记录时一并实现本夹具，并从 `STUBBED` 划掉。
+   */
+  tamperPauseRecord(input: { residentId: string; fault: PauseRecordFault }): Promise<void>;
+  /**
+   * RT-09 并发夹具：驱动自己的宿主停着时（先 `stopHost`，否则抛错），在同一数据根上
+   * **同时**另起两个宿主进程；两边都报 ready 或确认起不来之后，同一时刻各对同一住户说
+   * 一句（`texts[0]` 给先起的那个）；两边答完后都走正常关闭（同 `stopHost`）并等它们
+   * 自己退出。按起进程顺序返回两边的结局。
+   *
+   * 起不来（ready 前就退出或超时）或请求抛错的一边记作 `writer-unavailable` 的失败结果，
+   * 不吞成成功——「第二个进程拒绝开张」是合法结局之一。夹具只负责真并发；判卷独立判
+   * 「两边没拿到同一代、至多一边接回暂停的那代」。
+   */
+  raceHosts(input: {
+    residentId: string;
+    texts: readonly [string, string];
+  }): Promise<readonly [ContendedTurn, ContendedTurn]>;
 
   // —— 一窗流只读 ——
   readStream(input: { residentId: string }): Promise<Result<StreamSnapshot>>;

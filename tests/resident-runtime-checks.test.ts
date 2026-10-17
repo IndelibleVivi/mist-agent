@@ -1,11 +1,11 @@
 /**
- * RT-01～RT-08 **判卷自身**的回归测试。
+ * RT-01～RT-09 **判卷自身**的回归测试。
  *
  * 为什么要测判卷：判卷没被测过，等于判卷没被验过。#200 审读第 1 条就是这么漏的——
  * 原七盏灯共用一个住户、`reset()` 从没被调用，正确实现会被判红，而判卷自己全绿，
  * 谁也看不出来。这个文件用一份**内存合成驱动**做两件事：
  *
- * 1. 正对照：合规实现跑八盏全绿，连跑（模拟 runner 的循环）也全绿。
+ * 1. 正对照：合规实现跑九盏全绿，连跑（模拟 runner 的循环）也全绿。
  * 2. 反对照：逐条改坏，断言**预期的那一盏**真的变红。
  *
  * 合成驱动不碰真实持久目录（落盘清单是内存数组 + `os.tmpdir()` 下的临时夹具），
@@ -22,10 +22,15 @@ import type {
   BreatheOutcome,
   ChannelRoute,
   ChannelSpec,
+  ContendedTurn,
   HostDescriptor,
+  LedgerAlignmentView,
   LetterItemView,
   LetterView,
   MemoryEntryView,
+  ModelHistoryMessageView,
+  ModelRequestView,
+  PauseRecordFault,
   ProvisionedChannel,
   ResidentRuntimeCheckResult,
   ResidentRuntimeDriver,
@@ -130,6 +135,34 @@ interface Faults {
   recoveryCrossGenerationRegenerates: boolean;
   /** RT-08：写后失败不返回 runtime 自造的锚。 */
   recoveryDropsFailureAnchor: boolean;
+  /** RT-09：正常退出也开新一代——现役行为：每次启动都按猝死。 */
+  pauseAlwaysNewGeneration: boolean;
+  /** RT-09：硬杀后不看暂停记录，照样接着上一代。 */
+  resumeAfterHardKill: boolean;
+  /** RT-09：损坏或身份对不上的暂停记录也照接。 */
+  resumeOnTamperedRecord: boolean;
+  /** RT-09：暂停记录接回后不作废，再硬杀还能接一次。 */
+  pauseRecordReusable: boolean;
+  /** RT-09：接回后把上一段流水又写进一窗流一遍。 */
+  resumeDuplicatesStream: boolean;
+  /** RT-09：接回同一代，模型请求却不带上一段。 */
+  resumeDropsHistory: boolean;
+  /** RT-09：接回时认证账按同一身份重新登记（baseline 挪到接回那一刻）。 */
+  resumeReregistersLedger: boolean;
+  /** RT-09：接回时开了一扇新窗，新窗的第 1 代冒充「同一代」。 */
+  resumeChangesWindow: boolean;
+  /** RT-09：正常退出时把账上还没交付的缺口直接确认掉。 */
+  pauseAcksGap: boolean;
+  /** RT-09：硬杀后开了新一代，却把上一代原始流水塞进模型请求（D8 三）。 */
+  hardKillCarriesHistory: boolean;
+  /** RT-09：两个宿主同时起，都接回了暂停那一代。 */
+  raceBothResume: boolean;
+  /** RT-09 夹具改坏：弄坏暂停记录时把那一代的归档也抹了。 */
+  tamperDropsArchive: boolean;
+  /** RT-09 观察口改坏：模型请求的历史恒为空（正对照失效）。 */
+  requestHistoryAlwaysEmpty: boolean;
+  /** RT-09 观察口改坏：确认位读数冻在第一次读到的样子（正对照失效）。 */
+  alignmentObserverFrozen: boolean;
 }
 
 const NO_FAULTS: Faults = {
@@ -173,6 +206,20 @@ const NO_FAULTS: Faults = {
   recoveryRetryWritesBody: false,
   recoveryCrossGenerationRegenerates: false,
   recoveryDropsFailureAnchor: false,
+  pauseAlwaysNewGeneration: false,
+  resumeAfterHardKill: false,
+  resumeOnTamperedRecord: false,
+  pauseRecordReusable: false,
+  resumeDuplicatesStream: false,
+  resumeDropsHistory: false,
+  resumeReregistersLedger: false,
+  resumeChangesWindow: false,
+  pauseAcksGap: false,
+  hardKillCarriesHistory: false,
+  raceBothResume: false,
+  tamperDropsArchive: false,
+  requestHistoryAlwaysEmpty: false,
+  alignmentObserverFrozen: false,
 };
 
 interface SynthCredential {
@@ -206,6 +253,34 @@ interface SynthResident {
   provisions: number;
   /** 换通道后对外冒充的住户标识（改坏用）。 */
   effectiveId: string | null;
+  /** 每条事件落在哪一代：RT-09 按代算模型请求的历史与猝死归档。 */
+  eventGenerations: Map<string, number>;
+  /** 当前这一代是第几次启动里开的窗；null = 从没开过。 */
+  activeBoot: number | null;
+  /** 正常退出落下的「这一代暂停」；硬杀不落。 */
+  pauseRecord: SynthPauseRecord | null;
+  /** 本次启动里接回时流里已有几条（resumeDropsHistory 用它切掉上一段）。 */
+  resumedAtEvent: number | null;
+  /** resumeDuplicatesStream：接回后的第一回合落完再把上一段写一遍。 */
+  duplicatePending: boolean;
+  /** tamperDropsArchive：这位住户下次猝死时那代归档不留。 */
+  archiveLost: boolean;
+  /** 认证事实账账尾。 */
+  ledgerSeq: number;
+  /** 认证事实账上这扇窗的确认位。 */
+  alignment: SynthAlignment | null;
+}
+
+interface SynthPauseRecord {
+  readonly generation: number;
+  readonly state: "valid" | Exclude<PauseRecordFault, "missing">;
+}
+
+interface SynthAlignment {
+  windowId: string;
+  generation: number;
+  baselineSeq: number;
+  ackedSeq: number;
 }
 
 interface SynthTurn {
@@ -251,6 +326,12 @@ class SyntheticDriver implements ResidentRuntimeDriver {
   #turns = new Map<string, Map<string, SynthTurn>>();
   #confirmationFaults = new Set<string>();
   #fixtureRoot = mkdtempSync(join(tmpdir(), "mist-rt-synth-"));
+  /** 宿主进程在不在跑：停着时调宿主方法会像真驱动一样把它拉起来。 */
+  #hostRunning = true;
+  /** 本次启动以来每位住户最近一次模型请求（RT-09 观察口）。 */
+  #lastRequests = new Map<string, ModelRequestView>();
+  /** alignmentObserverFrozen：第一次读到的确认位。 */
+  #frozenAlignments = new Map<string, LedgerAlignmentView>();
 
   async reset(): Promise<void> {
     if (this.faults.resetDoesNothing) return;
@@ -263,10 +344,15 @@ class SyntheticDriver implements ResidentRuntimeDriver {
     this.#modelCalls = 0;
     this.#turns.clear();
     this.#confirmationFaults.clear();
+    this.#lastRequests.clear();
+    this.#frozenAlignments.clear();
+    this.#hostRunning = true;
   }
 
   async startHost(): Promise<HostDescriptor> {
     this.#boots += 1;
+    this.#hostRunning = true;
+    this.#lastRequests.clear();
     if (this.faults.restartReusesIdentity) {
       this.#host = { ...this.#host };
     } else {
@@ -283,6 +369,8 @@ class SyntheticDriver implements ResidentRuntimeDriver {
   }
 
   async killHost(): Promise<void> {
+    // 硬杀不落暂停记录：这次启动里开着的窗全按猝死，下次启动开新一代。
+    this.#hostRunning = false;
     if (this.faults.restartMutatesStream) {
       for (const resident of this.#residents.values()) {
         const first = resident.events[0];
@@ -293,7 +381,21 @@ class SyntheticDriver implements ResidentRuntimeDriver {
     }
   }
 
+  async stopHost(): Promise<void> {
+    if (!this.#hostRunning) return;
+    // 正常退出：这次启动里开着的每扇窗落一笔「这一代暂停」。
+    for (const resident of this.#residents.values()) {
+      if (resident.activeBoot !== this.#boots) continue;
+      resident.pauseRecord = { generation: resident.generation, state: "valid" };
+      if (this.faults.pauseAcksGap && resident.alignment !== null) {
+        resident.alignment.ackedSeq = resident.ledgerSeq;
+      }
+    }
+    this.#hostRunning = false;
+  }
+
   async hostDescriptor(): Promise<HostDescriptor> {
+    await this.#ensureRunning();
     return this.#host;
   }
 
@@ -352,6 +454,7 @@ class SyntheticDriver implements ResidentRuntimeDriver {
     text: string;
     turnId?: string;
   }): Promise<Result<TurnResult>> {
+    await this.#ensureRunning();
     const resident = this.#ensure(input.residentId);
     const credential = resident.credential;
     if (credential === null) {
@@ -406,6 +509,8 @@ class SyntheticDriver implements ResidentRuntimeDriver {
       );
     }
 
+    this.#openWindow(resident);
+    this.#recordRequest(resident, input.residentId, input.text);
     this.#modelCalls += 1;
     const userEvent = this.#append(input.residentId, "user", input.text);
     resident.tokensSinceBreath += TOKENS_PER_SAY;
@@ -426,6 +531,13 @@ class SyntheticDriver implements ResidentRuntimeDriver {
     if (this.faults.switchChannelRewritesStream && resident.events.length > 2) {
       const first = resident.events[0];
       if (first !== undefined) resident.events[0] = { ...first, text: `${first.text}~改史` };
+    }
+    // 回合交付完：认证账确认位前进到账尾（接回的那次激活也一样，只经真实交付前进）。
+    if (resident.alignment !== null) resident.alignment.ackedSeq = resident.ledgerSeq;
+    if (resident.duplicatePending) {
+      resident.duplicatePending = false;
+      const replayed = resident.events.slice(0, resident.resumedAtEvent ?? 0);
+      for (const event of replayed) this.#append(input.residentId, event.kind, event.text);
     }
 
     const result: TurnResult = {
@@ -486,6 +598,85 @@ class SyntheticDriver implements ResidentRuntimeDriver {
     turn.status = "orphan";
     await this.killHost();
     await this.startHost();
+  }
+
+  async lastModelRequest(input: { residentId: string }): Promise<ModelRequestView | null> {
+    await this.#ensureRunning();
+    return this.#lastRequests.get(input.residentId) ?? null;
+  }
+
+  async appendLedgerFact(input: {
+    residentId: string;
+    body: string;
+  }): Promise<Result<{ seq: number }>> {
+    await this.#ensureRunning();
+    const resident = this.#ensure(input.residentId);
+    resident.ledgerSeq += 1;
+    return ok({ seq: resident.ledgerSeq });
+  }
+
+  async ledgerAlignment(input: { residentId: string }): Promise<Result<LedgerAlignmentView>> {
+    // 读的是落盘那份：宿主停着也读得到，不拉宿主。
+    const resident = this.#residents.get(input.residentId);
+    if (resident === undefined) {
+      return err("resident-not-found", "这位住户没有认证事实账", "先入住再读", input.residentId);
+    }
+    const view: LedgerAlignmentView = {
+      residentId: input.residentId,
+      latestSeq: resident.ledgerSeq,
+      viewports: resident.alignment === null ? [] : [{ ...resident.alignment }],
+    };
+    if (!this.faults.alignmentObserverFrozen) return ok(view);
+    const frozen = this.#frozenAlignments.get(input.residentId) ?? view;
+    this.#frozenAlignments.set(input.residentId, frozen);
+    return ok(frozen);
+  }
+
+  async tamperPauseRecord(input: { residentId: string; fault: PauseRecordFault }): Promise<void> {
+    if (this.#hostRunning) throw new Error("tamperPauseRecord 只在宿主停着时用");
+    const resident = this.#ensure(input.residentId);
+    const record = resident.pauseRecord;
+    if (record === null) throw new Error(`${input.residentId} 没有暂停记录可弄坏`);
+    resident.pauseRecord = input.fault === "missing" ? null : { ...record, state: input.fault };
+    if (this.faults.tamperDropsArchive) resident.archiveLost = true;
+  }
+
+  async raceHosts(input: {
+    residentId: string;
+    texts: readonly [string, string];
+  }): Promise<readonly [ContendedTurn, ContendedTurn]> {
+    if (this.#hostRunning) throw new Error("raceHosts 要求宿主先停");
+    const resident = this.#ensure(input.residentId);
+    const before = resident.pauseRecord;
+    const leftHost = await this.startHost();
+    const left: ContendedTurn = {
+      pid: leftHost.pid,
+      result: await this.say({ residentId: input.residentId, text: input.texts[0] }),
+    };
+    let right: ContendedTurn;
+    if (this.faults.raceBothResume) {
+      // 认领不原子：后起的那个宿主读到的还是认领前的盘面。
+      resident.pauseRecord = before;
+      this.#boots += 1;
+      this.#pid += 1;
+      const pid = this.#pid;
+      right = {
+        pid,
+        result: await this.say({ residentId: input.residentId, text: input.texts[1] }),
+      };
+    } else {
+      right = {
+        pid: null,
+        result: err(
+          "writer-unavailable",
+          "同一数据根上已有活宿主",
+          "等它正常退出后再启动",
+          input.residentId,
+        ),
+      };
+    }
+    await this.stopHost();
+    return [left, right];
   }
 
   async readStream(input: { residentId: string }): Promise<Result<StreamSnapshot>> {
@@ -626,6 +817,7 @@ class SyntheticDriver implements ResidentRuntimeDriver {
       resident.turnStarted = false;
       resident.tokensSinceBreath = 0;
       resident.events = [];
+      this.#registerAlignment(resident);
     }
   }
 
@@ -633,6 +825,7 @@ class SyntheticDriver implements ResidentRuntimeDriver {
     residentId: string;
     generation: number;
   }): Promise<Result<StreamSnapshot>> {
+    await this.#ensureRunning();
     const resident = this.#ensure(input.residentId);
     const archived = resident.archive.get(input.generation);
     if (archived === undefined) {
@@ -791,9 +984,93 @@ class SyntheticDriver implements ResidentRuntimeDriver {
       channel: null,
       provisions: 0,
       effectiveId: null,
+      eventGenerations: new Map(),
+      activeBoot: null,
+      pauseRecord: null,
+      resumedAtEvent: null,
+      duplicatePending: false,
+      archiveLost: false,
+      ledgerSeq: 0,
+      alignment: null,
     };
     this.#residents.set(residentId, created);
     return created;
+  }
+
+  /** 像真驱动一样：宿主停着时第一次用到宿主方法就把它拉起来。 */
+  async #ensureRunning(): Promise<void> {
+    if (!this.#hostRunning) await this.startHost();
+  }
+
+  /**
+   * 本次启动里第一次用到这扇窗时定：接回暂停那代，还是按猝死开新一代（#234 裁定 A）。
+   * 合规路径：暂停记录在、完好、对得上这一代 → 接回同一代，记录随即作废；否则猝死。
+   */
+  #openWindow(resident: SynthResident): void {
+    if (resident.activeBoot === this.#boots) return;
+    const firstOpen = resident.activeBoot === null;
+    resident.activeBoot = this.#boots;
+    if (firstOpen) {
+      this.#registerAlignment(resident);
+      return;
+    }
+    const record = resident.pauseRecord;
+    if (!this.faults.pauseRecordReusable) resident.pauseRecord = null;
+    const honoured =
+      record !== null &&
+      record.generation === resident.generation &&
+      (record.state === "valid" || this.faults.resumeOnTamperedRecord);
+    const resume =
+      !this.faults.pauseAlwaysNewGeneration && (honoured || this.faults.resumeAfterHardKill);
+    if (resume) {
+      resident.resumedAtEvent = resident.events.length;
+      resident.duplicatePending = this.faults.resumeDuplicatesStream;
+      if (this.faults.resumeChangesWindow) {
+        resident.windowId = `${resident.windowId}-reopened`;
+        this.#registerAlignment(resident);
+      } else if (this.faults.resumeReregistersLedger) {
+        this.#registerAlignment(resident);
+      }
+      return;
+    }
+    // 猝死（D8 三）：上一代原始流水封存进归档、按代可查，开新一代。
+    const dead = resident.generation;
+    if (!resident.archiveLost) resident.archive.set(dead, this.#eventsOfGeneration(resident, dead));
+    resident.generation = dead + 1;
+    resident.turnStarted = false;
+    resident.tokensSinceBreath = 0;
+    resident.resumedAtEvent = null;
+    this.#registerAlignment(resident);
+  }
+
+  /** 开窗 / 换代时在认证账上登记确认位：baseline 与 acked 都从登记那一刻的账尾起。 */
+  #registerAlignment(resident: SynthResident): void {
+    resident.alignment = {
+      windowId: resident.windowId,
+      generation: resident.generation,
+      baselineSeq: resident.ledgerSeq,
+      ackedSeq: resident.ledgerSeq,
+    };
+  }
+
+  #eventsOfGeneration(resident: SynthResident, generation: number): StreamEventView[] {
+    return resident.events
+      .filter((event) => resident.eventGenerations.get(event.eventId) === generation)
+      .map((event) => ({ ...event }));
+  }
+
+  /** transport 实际收到的那份：本代此前的 user/assistant（改坏开关在这里起作用）。 */
+  #recordRequest(resident: SynthResident, residentId: string, text: string): void {
+    let events = this.#eventsOfGeneration(resident, resident.generation);
+    if (this.faults.hardKillCarriesHistory) events = resident.events.map((event) => ({ ...event }));
+    if (this.faults.resumeDropsHistory && resident.resumedAtEvent !== null) {
+      const cut = new Set(resident.events.slice(0, resident.resumedAtEvent).map((e) => e.eventId));
+      events = events.filter((event) => !cut.has(event.eventId));
+    }
+    const history: ModelHistoryMessageView[] = this.faults.requestHistoryAlwaysEmpty
+      ? []
+      : events.map((event) => ({ role: event.kind, text: event.text }));
+    this.#lastRequests.set(residentId, { residentId, text, history });
   }
 
   #append(residentId: string, kind: "user" | "assistant", text: string): StreamEventView {
@@ -813,6 +1090,7 @@ class SyntheticDriver implements ResidentRuntimeDriver {
       payloadHash: `h-${this.#eventSeq}`,
     };
     resident.events.push(event);
+    resident.eventGenerations.set(event.eventId, resident.generation);
     return event;
   }
 
@@ -869,6 +1147,7 @@ class SyntheticDriver implements ResidentRuntimeDriver {
     resident.generation = from + 1;
     resident.turnStarted = false;
     resident.tokensSinceBreath = 0;
+    this.#registerAlignment(resident);
     // 主人改的线从这一代开始生效。
     if (resident.pendingThreshold !== null) {
       resident.threshold = resident.pendingThreshold;
@@ -942,12 +1221,12 @@ afterEach(() => {
   driver.dispose();
 });
 
-describe("判卷正对照：合规实现八盏全绿", () => {
-  it("连跑八盏全绿（模拟 runner：每盏灯前 reset）", async () => {
+describe("判卷正对照：合规实现九盏全绿", () => {
+  it("连跑九盏全绿（模拟 runner：每盏灯前 reset）", async () => {
     const outcomes = await runAllLamps(driver);
     const red = outcomes.filter((outcome) => !outcome.passed);
     expect(red.map((outcome) => `${outcome.id}：${outcome.detail}`)).toEqual([]);
-    expect(outcomes).toHaveLength(8);
+    expect(outcomes).toHaveLength(9);
   });
 
   it("每盏灯单独跑也全绿", async () => {
@@ -1191,5 +1470,116 @@ describe("判卷反对照：改坏必须变红", () => {
   it("写后失败丢掉 runtime 自造锚 → RT-08 红", async () => {
     driver.faults.recoveryDropsFailureAnchor = true;
     expect(lampById(await runAllLamps(driver), "RT-08").passed).toBe(false);
+  });
+});
+
+describe("RT-09 判卷反对照：正常退出接回同一代（#234）", () => {
+  /** 只跑 RT-09 这一盏；改坏开关期望它红在**那一条**判据上，不是随便哪里红。 */
+  async function runRt09(): Promise<LampOutcome> {
+    return lampById(await runAllLamps(driver), "RT-09");
+  }
+
+  it("合规实现：对得上就接回、硬杀与坏记录照旧猝死、记录只用一次、账不重登记 → RT-09 绿", async () => {
+    const lamp = await runRt09();
+    expect(lamp.passed, lamp.detail).toBe(true);
+    expect(lamp.detail).toContain("并发两宿主：第 1 代 / writer-unavailable");
+  });
+
+  it("正常退出也开新一代（现役行为）→ RT-09 红在第一条行为断言", async () => {
+    driver.faults.pauseAlwaysNewGeneration = true;
+    const lamp = await runRt09();
+    expect(lamp.passed).toBe(false);
+    expect(lamp.detail).toContain("正常退出被当成猝死换了代");
+  });
+
+  it("硬杀后不看暂停记录也接着上一代 → RT-09 红（D8 三）", async () => {
+    driver.faults.resumeAfterHardKill = true;
+    const lamp = await runRt09();
+    expect(lamp.passed).toBe(false);
+    expect(lamp.detail).toContain("硬杀被当成了正常退出");
+  });
+
+  it("损坏或身份对不上的暂停记录也照接 → RT-09 红（宁可忘，不冒认）", async () => {
+    driver.faults.resumeOnTamperedRecord = true;
+    const lamp = await runRt09();
+    expect(lamp.passed).toBe(false);
+    expect(lamp.detail).toContain("坏暂停记录被冒接了");
+  });
+
+  it("暂停记录接回后不作废、再硬杀还接 → RT-09 红（只许用一次）", async () => {
+    driver.faults.pauseRecordReusable = true;
+    const lamp = await runRt09();
+    expect(lamp.passed).toBe(false);
+    expect(lamp.detail).toContain("被用了第二次");
+  });
+
+  it("接回后把上一段流水又写进一窗流 → RT-09 红（流不重复写）", async () => {
+    driver.faults.resumeDuplicatesStream = true;
+    const lamp = await runRt09();
+    expect(lamp.passed).toBe(false);
+    expect(lamp.detail).toContain("旧流水不许再写一遍");
+  });
+
+  it("接回同一代、模型请求却不带上一段 → RT-09 红", async () => {
+    driver.faults.resumeDropsHistory = true;
+    const lamp = await runRt09();
+    expect(lamp.passed).toBe(false);
+    expect(lamp.detail).toContain("上一段没从一窗流读回");
+  });
+
+  it("接回时认证账按同一身份重新登记 → RT-09 红（#234 第 5 条）", async () => {
+    driver.faults.resumeReregistersLedger = true;
+    const lamp = await runRt09();
+    expect(lamp.passed).toBe(false);
+    expect(lamp.detail).toContain("认证账把接回当成一次新激活重新登记了");
+  });
+
+  it("接回时开了新窗、新窗第 1 代冒充同一代 → RT-09 红（代号与历史都骗得过，只有窗号分得开）", async () => {
+    driver.faults.resumeChangesWindow = true;
+    const lamp = await runRt09();
+    expect(lamp.passed).toBe(false);
+    expect(lamp.detail).toContain("接的不是同一扇窗");
+  });
+
+  it("正常退出时把缺口直接确认掉 → RT-09 红（暂停不是交付）", async () => {
+    driver.faults.pauseAcksGap = true;
+    const lamp = await runRt09();
+    expect(lamp.passed).toBe(false);
+    expect(lamp.detail).toContain("暂停不是交付");
+  });
+
+  it("硬杀后开了新一代却把旧流水塞进模型请求 → RT-09 红（D8 三）", async () => {
+    driver.faults.hardKillCarriesHistory = true;
+    const lamp = await runRt09();
+    expect(lamp.passed).toBe(false);
+    expect(lamp.detail).toContain("猝死不自动进继任者上下文");
+  });
+
+  it("两个宿主同时起、都接回暂停那代 → RT-09 红（#234 第 4 条）", async () => {
+    driver.faults.raceBothResume = true;
+    const lamp = await runRt09();
+    expect(lamp.passed).toBe(false);
+    expect(lamp.detail).toContain("暂停记录被两边同时认领");
+  });
+
+  it("弄坏暂停记录的夹具顺手抹了归档 → RT-09 红（坏记录按猝死也不许丢史）", async () => {
+    driver.faults.tamperDropsArchive = true;
+    const lamp = await runRt09();
+    expect(lamp.passed).toBe(false);
+    expect(lamp.detail).toContain("在归档里查不到");
+  });
+
+  it("模型请求观察口的历史恒为空 → RT-09 红在正对照（否则「旧流水没进请求」空转）", async () => {
+    driver.faults.requestHistoryAlwaysEmpty = true;
+    const lamp = await runRt09();
+    expect(lamp.passed).toBe(false);
+    expect(lamp.detail).toContain("历史观察口或本代历史本身不成立");
+  });
+
+  it("确认位观察口冻住不动 → RT-09 红（否则「baseline 没动」空转）", async () => {
+    driver.faults.alignmentObserverFrozen = true;
+    const lamp = await runRt09();
+    expect(lamp.passed).toBe(false);
+    expect(lamp.detail).toContain("没经接回的这次激活交付确认");
   });
 });

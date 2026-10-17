@@ -8,6 +8,8 @@
  *
  * 被 SIGKILL 后内存态全丢：一窗流、住户档案、凭证、窗账 journal 全在盘上，
  * 重启只能从盘读回——这正是 RT-02 的耐久断言要的真实证据，不是内存替身。
+ * 正常关闭走 `stop`：与终端 `/exit`、stdin 结束同一条 `runtime.close()`，答完断开 IPC
+ * 后进程自己退出（RT-09 拿它与硬杀对照）。
  *
  * 代价：宿主里同步/异步方法统一包成 IPC 请求响应（和 window-history 一样的税）；
  * 换来判卷只经进程边界观察，绝不共享内存态。
@@ -20,6 +22,7 @@ import type {
   BreatheOutcome,
   ChannelSpec,
   LetterTimeline,
+  ModelRequestView,
   Result,
   SecretScanReport,
   StreamFileInventory,
@@ -44,13 +47,26 @@ if (dataDir === undefined || dataDir.length === 0) {
 /** 每次 boot 新随机；判卷靠它 + pid 断言「确实换了一个进程」。 */
 const bootId = randomUUID();
 let modelInvocationCount = 0;
+/**
+ * RT-09 观察口：每位住户最近一次真实模型请求。只抄角色与正文——凭证原文与启动包
+ * 不进这里，观察口不许成为 RT-06 扫描面之外的第二个漏密钥的口子。进程内存态，
+ * 重启即清空。
+ */
+const lastModelRequests = new Map<string, ModelRequestView>();
 const upstreamTransport = createModelTransport();
 const countedTransport: ModelTransport = {
   async *complete(request: ModelCompletionRequest) {
     modelInvocationCount += 1;
+    lastModelRequests.set(request.residentId, {
+      residentId: request.residentId,
+      text: request.text,
+      history: request.history.map((message) => ({ role: message.role, text: message.text })),
+    });
     yield* upstreamTransport.complete(request);
   },
 };
+/** RT-09 夹具的宿主维护署名：只在验收宿主里出现，不冒充住户或人类来源。 */
+const ACCEPTANCE_LEDGER_SENDER = "resident-runtime-acceptance";
 // 宿主装配走与 CLI 共用的 seam：接上认证权威事实账（与住户档案同在 residents/），
 // currentFacts 与信里 commitment 档实际来自 ledger.currentSet()，say 走真实交付/回执。
 const runtime = assembleResidentRuntime({ dataDir, transport: countedTransport });
@@ -66,6 +82,8 @@ interface Command {
     readonly channel?: ChannelSpecLike;
     readonly canarySecret?: string;
     readonly needle?: string;
+    /** RT-09 账夹具：追加的现行事实正文。 */
+    readonly body?: string;
     readonly generation?: number;
     /** 换气面（RT-03）：窗身份、触发线、入口。 */
     readonly windowId?: string;
@@ -148,6 +166,33 @@ async function handle(command: Command): Promise<unknown> {
       })) as Result<TurnResult>;
     case "modelInvocationCount":
       return modelInvocationCount;
+    case "lastModelRequest":
+      return lastModelRequests.get(residentId(input.residentId)) ?? null;
+    case "appendLedgerFact": {
+      // 宿主维护入账走现役 host.system()（与旧字符串承诺 remedy 指的同一入口）：
+      // 不经任何窗、不动任何确认位，只造「账上有、窗还没确认到」的状态。
+      const owner = residentId(input.residentId);
+      const authority = runtime.ledgerAuthority();
+      if (authority === null) {
+        return {
+          ok: false,
+          error: {
+            code: "writer-unavailable",
+            message: "这个宿主没接认证事实账",
+            remedy: "宿主装配要经 assembleResidentRuntime 接上 ledger 选项",
+            residentId: owner,
+          },
+        } satisfies Result<{ seq: number }>;
+      }
+      const entry = authority.host
+        .system(ACCEPTANCE_LEDGER_SENDER)
+        .append(
+          owner,
+          { kind: "active_rule", body: required(input.body, "body") },
+          "RT-09 acceptance fixture: host maintenance fact",
+        );
+      return { ok: true, value: { seq: entry.seq } } satisfies Result<{ seq: number }>;
+    }
     case "tuiTranscript": {
       if (input.script === undefined) throw new Error("script is required");
       return runResidentTuiScript(runtime, {
@@ -197,6 +242,8 @@ async function handle(command: Command): Promise<unknown> {
         needle: required(input.needle, "needle"),
       }) as Result<SecretScanReport>;
     case "stop":
+      // 正常关闭：与 cli.ts 在 `/exit`、stdin 结束时走的同一条 runtime.close()。
+      // 答完后断开 IPC，进程自己退出——驱动的 stopHost 只等，不 SIGKILL。
       await runtime.close();
       return "stopping";
     default:
