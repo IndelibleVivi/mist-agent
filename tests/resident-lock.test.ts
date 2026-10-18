@@ -182,6 +182,49 @@ describe("ResidentHostLocks", () => {
     expect(readdirSync(dirname(path))).toEqual([]);
   });
 
+  it("被挤掉的持有者：提示退出本宿主重启，不教人删锁在本进程里重试（本进程不重建这把锁）", () => {
+    const root = tempRoot();
+    const displaced = new ResidentHostLocks(root);
+    displaced.acquire("r-a");
+    writeLock(root, { pid: liveProcess(), token: "displacer" });
+    let refused: unknown;
+    try {
+      displaced.acquire("r-a");
+    } catch (error) {
+      refused = error;
+    }
+    expect(refused).toBeInstanceOf(ResidentHostLockError);
+    const remedy = (refused as ResidentHostLockError).remedy;
+    expect(remedy).toContain("退出本宿主再重新启动");
+    expect(remedy).not.toMatch(/删掉锁文件/);
+    expect(remedy).not.toMatch(/重试/);
+    // 删了锁在本进程里也确实拿不回来：提示没骗人。
+    rmSync(residentLockPath(root, "r-a"));
+    expect(() => displaced.acquire("r-a")).toThrow(ResidentHostLockError);
+    // 从没拿过这把锁的进程，照旧是「到那边退出，或确认没人在跑后删锁重试」。
+    writeLock(root, { pid: liveProcess(), token: "holder" });
+    let busy: unknown;
+    try {
+      new ResidentHostLocks(root).acquire("r-a");
+    } catch (error) {
+      busy = error;
+    }
+    expect((busy as ResidentHostLockError).remedy).toMatch(/删掉锁文件 .* 后重试/);
+  });
+
+  it("stillHolds：只有锁文件里此刻是自己的令牌才算，不看 close()；被换、被删、从没拿过都不算", () => {
+    const root = tempRoot();
+    const locks = new ResidentHostLocks(root);
+    expect(locks.stillHolds("r-a")).toBe(false);
+    locks.acquire("r-a");
+    locks.close();
+    expect(locks.stillHolds("r-a")).toBe(true);
+    writeLock(root, { pid: liveProcess(), token: "displacer" });
+    expect(locks.stillHolds("r-a")).toBe(false);
+    rmSync(residentLockPath(root, "r-a"));
+    expect(locks.stillHolds("r-a")).toBe(false);
+  });
+
   it("close() 之后拿过的锁也不认，releaseAll 才删文件", () => {
     const root = tempRoot();
     const locks = new ResidentHostLocks(root);
@@ -194,11 +237,24 @@ describe("ResidentHostLocks", () => {
     expect(readdirSync(join(root, "sessions", "active"))).toEqual([]);
   });
 
-  it("锁的位置被目录占住：不是谁的锁，当陈锁接管", () => {
+  it("锁的位置被目录占住：不是 mist 的锁，拒绝并要人挪走，目录和里面的东西原样留着", () => {
     const root = tempRoot();
-    mkdirSync(join(residentLockPath(root, "r-a"), "occupied"), { recursive: true });
-    new ResidentHostLocks(root).acquire("r-a");
-    expect(readLock(root)).toMatchObject({ pid: process.pid });
+    const path = residentLockPath(root, "r-a");
+    mkdirSync(join(path, "occupied"), { recursive: true });
+    writeFileSync(join(path, "occupied", "keep.txt"), "别人的东西");
+    let refused: unknown;
+    try {
+      new ResidentHostLocks(root).acquire("r-a");
+    } catch (error) {
+      refused = error;
+    }
+    expect(refused).toBeInstanceOf(ResidentHostLockError);
+    expect((refused as ResidentHostLockError).message).toContain("不是 mist 锁");
+    expect((refused as ResidentHostLockError).remedy).toContain(path);
+    expect((refused as ResidentHostLockError).remedy).toContain("挪到别处");
+    expect(statSync(path).isDirectory()).toBe(true);
+    expect(readFileSync(join(path, "occupied", "keep.txt"), "utf8")).toBe("别人的东西");
+    expect(readdirSync(dirname(path))).toEqual(["r-a.lock"]);
   });
 
   it("关闭只放令牌还是自己的锁：被换掉的锁原样留下", () => {

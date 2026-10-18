@@ -13,18 +13,22 @@
  * 一段空文件，被同时起的另一个进程当成坏锁接管，两边都以为自己拿到了。
  *
  * 锁在且 pid 活着、不是本进程：拒绝（调用方收成 writer-unavailable）。锁文件在却读不出
- * （EIO、EMFILE、EACCES 等）：核实不了谁拿着，同样拒绝，绝不当坏锁抢。pid 已死（ESRCH）、
- * 就是本进程、读出来解析不了，或锁路径被目录等非文件占住：当陈锁接管——先 rename 到独有名字
- * （同时接管的几个进程只有一个 rename 得到），核对挪走的正是判过陈的那份（读出来逐字相同，
- * 或仍是非文件；读不出不算相同），再按上面建锁；挪走的若是别人刚建的新锁就 link 放回认输，
- * 放回时出 EEXIST 以外的错就照实报错、不冒充「别人拿着」。
+ * （EIO、EMFILE、EACCES 等）：核实不了谁拿着，同样拒绝，绝不当坏锁抢。锁路径被目录、符号
+ * 链接等非文件占住：那不是 mist 的锁，也拒绝，要人把它挪走——本模块从不递归删除任何东西。
+ * pid 已死（ESRCH）、就是本进程，或读出来解析不了：当陈锁接管——先 rename 到独有名字（同时
+ * 接管的几个进程只有一个 rename 得到），核对挪走的正是判过陈的那份（普通文件、读出来逐字
+ * 相同；读不出不算相同），再按上面建锁；挪走的若是别人刚建的新锁就 link 放回认输，放回时出
+ * EEXIST 以外的错就照实报错、不冒充「别人拿着」；挪走的若是判过之后才冒出来的非文件，原样
+ * rename 回去，挪不回去就留在旁名并在报错里给出旁名。旁名只在 lstat 认得是普通文件时才删。
  *
  * 两个进程同时起不会两边都拿到。文件路径上没有比较并交换，三个以上进程同时接管同一把陈锁
  * 时，挪走与放回之间的空档里可能有第三个进程建上新锁，把刚接管的那一边挤掉；被挤掉的持有者
- * 在下一回合开头核对令牌时停下，至多已在途的那一回合与新持有者重叠一次。
+ * 在下一回合开头核对令牌时停下，至多已在途的那一回合与新持有者重叠一次；被挤掉的进程不再
+ * 重建这把锁、不再为这位住户开窗，关闭时也不落暂停记录（`stillHolds`），要退出重启。
  *
  * 代价：死进程的 pid 被系统复用给别的活进程时，这位住户会一直显示「在别处打开」，直到有人
- * 按提示删掉锁文件；三个以上进程抢陈锁时可能有一回合重叠（见上）；每回合多读一次锁文件；
+ * 按提示删掉锁文件；锁路径被非文件占住时要人手动挪走；三个以上进程抢陈锁时可能有一回合重叠
+ * （见上）；每回合多读一次锁文件；
  * 两个 pid 命名空间不同的容器共用一个数据目录时，存活判断不可靠——对方活着也可能被当成陈锁
  * 接管，本空间碰巧有同号进程时又会一直显示「在别处打开」。
  */
@@ -40,6 +44,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  unlinkSync,
   writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -112,10 +117,22 @@ function observe(path: string): Observed {
   }
 }
 
-/** 挪走的那份是不是判过陈的那份：逐字相同，或仍是非文件；读不出永远不算相同。 */
-function sameObservation(judged: Observed, moved: Observed): boolean {
-  if (judged.kind === "file") return moved.kind === "file" && moved.raw === judged.raw;
-  return judged.kind === "not-file" && moved.kind === "not-file";
+/** lstat 认得是普通文件（不跟符号链接）；看不了就不算。 */
+function isRegularFile(path: string): boolean {
+  try {
+    return lstatSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** 只删普通文件，绝不递归：旁名是本进程独有的名字，删不掉就留着。 */
+function discardRegularFile(path: string): void {
+  try {
+    if (isRegularFile(path)) unlinkSync(path);
+  } catch {
+    // 留一份改了名的残档，不会被当成锁。
+  }
 }
 
 function parseHolder(observed: Observed, residentId: string): LockHolder | null {
@@ -223,12 +240,15 @@ export class ResidentHostLocks {
       }
       const observed = observe(path);
       if (observed.kind === "missing") continue; // 持有者刚放了锁：再建一次。
-      if (observed.kind === "unreadable") throw this.#unverifiable(residentId, observed.code, path);
+      if (observed.kind === "unreadable") {
+        throw this.#unverifiable(residentId, observed.code, path, false);
+      }
+      if (observed.kind === "not-file") throw this.#notALock(residentId, path);
       const holder = parseHolder(observed, residentId);
       if (holder !== null && holder.pid !== process.pid && isAlive(holder.pid)) {
         throw this.#busy(residentId, holder.pid, path);
       }
-      if (!this.#takeOver(residentId, path, observed)) break;
+      if (!this.#takeOver(residentId, path, observed.raw)) break;
       if (createExclusive(path, content)) {
         this.#held.set(residentId, token);
         return;
@@ -241,6 +261,23 @@ export class ResidentHostLocks {
   /** 从此不再拿锁、不再认可已拿的锁（runtime.close() 一开头就调）。重复调用无事。 */
   close(): void {
     this.#closed = true;
+  }
+
+  /**
+   * 锁文件里此刻还是不是本进程的令牌。不看 close()（关闭时落暂停记录前用）；读不出、
+   * 被换、被删、从没拿过都是 false。
+   */
+  stillHolds(residentId: string): boolean {
+    const token = this.#held.get(residentId);
+    if (token === undefined) return false;
+    try {
+      return (
+        parseHolder(observe(residentLockPath(this.#dataDir, residentId)), residentId)?.token ===
+        token
+      );
+    } catch {
+      return false;
+    }
   }
 
   /** 关闭时放掉本进程拿着的每把锁（只删令牌还是自己的那份）。隐含 close()；重复调用无事。 */
@@ -259,63 +296,95 @@ export class ResidentHostLocks {
     this.#held.clear();
   }
 
-  /** 每回合的令牌核对：锁文件里不是自己的令牌（被接管、被删）或读不出，就停下。 */
+  /**
+   * 每回合的令牌核对：锁文件里不是自己的令牌（被接管、被删）或读不出，就停下。被挤掉的
+   * 进程不重建这把锁（`#held` 照旧留着），所以提示的是退出本宿主重启，不是删锁重试。
+   */
   #verify(residentId: string, token: string, path: string): void {
     const observed = observe(path);
     if (parseHolder(observed, residentId)?.token === token) return;
-    if (observed.kind === "unreadable") throw this.#unverifiable(residentId, observed.code, path);
+    if (observed.kind === "unreadable") {
+      throw this.#unverifiable(residentId, observed.code, path, true);
+    }
     throw new ResidentHostLockError(
       `住户 ${residentId} 的锁已被接管或删除：本进程不再为它调模型、写一窗流`,
-      this.#remedy(path),
+      `本进程不会再为这位住户开窗：先看锁文件 ${path} 里现在是哪个进程、那边是否还在用这位住户，然后退出本宿主再重新启动`,
     );
   }
 
   /**
-   * 接管陈锁：rename 到独有名字（抢不到就是别人先接管了），核对挪走的正是判过陈的那份；
-   * 挪走的若是别人刚建的新锁，link 放回并认输。放回撞上 EEXIST 是锁路径又被人建上了，
-   * 那份才是现役的锁；别的错照实抛——被挪走的持有者下一回合核对令牌时会停下。
+   * 接管陈锁：rename 到独有名字（抢不到就是别人先接管了），核对挪走的正是判过陈的那份
+   * （普通文件、逐字相同）。挪走的若是别人刚建的新锁，link 放回并认输：放回撞上 EEXIST 是
+   * 锁路径又被人建上了，那份才是现役的锁；别的错照实抛——被挪走的持有者下一回合核对令牌时
+   * 会停下。挪走的若是判过之后才冒出来的非文件，原样 rename 回去，绝不删。
    */
-  #takeOver(residentId: string, path: string, judged: Observed): boolean {
+  #takeOver(residentId: string, path: string, staleRaw: string): boolean {
     const aside = `${path}.stale-${process.pid}-${randomUUID()}`;
     try {
       renameSync(path, aside);
     } catch {
       return false;
     }
-    try {
-      if (sameObservation(judged, observe(aside))) return true;
+    const moved = observe(aside);
+    if (moved.kind === "file" && moved.raw === staleRaw) {
+      discardRegularFile(aside);
+      return true;
+    }
+    if (!isRegularFile(aside)) {
       try {
-        linkSync(aside, path);
+        renameSync(aside, path);
       } catch (error) {
-        const code = errorCode(error);
-        if (code === "EEXIST") return false;
         throw new ResidentHostLockError(
-          `住户 ${residentId} 的锁接管没成：挪走的是另一个进程刚建的锁，放回时出错（${code}）；那个进程下一回合核对锁时会停下`,
-          `稍后重试；若确认没有别的 mist 进程在跑，删掉锁文件 ${path} 后重试`,
+          `住户 ${residentId} 的锁路径上冒出来一个不是 mist 锁的东西，挪走后放不回去（${errorCode(error)}），现在在 ${aside}`,
+          `把 ${aside} 挪回 ${path} 或挪到别处，确认锁路径上没有不是 mist 锁的东西后重试`,
         );
       }
-      return false;
-    } finally {
-      rmSync(aside, { force: true, recursive: true });
+      throw this.#notALock(residentId, path);
     }
+    let putBackCode: string | null = null;
+    try {
+      linkSync(aside, path);
+    } catch (error) {
+      const code = errorCode(error);
+      if (code !== "EEXIST") putBackCode = code;
+    }
+    discardRegularFile(aside);
+    if (putBackCode !== null) {
+      throw new ResidentHostLockError(
+        `住户 ${residentId} 的锁接管没成：挪走的是另一个进程刚建的锁，放回时出错（${putBackCode}）；那个进程下一回合核对锁时会停下`,
+        `稍后重试；若确认没有别的 mist 进程在跑，删掉锁文件 ${path} 后重试`,
+      );
+    }
+    return false;
   }
 
-  #remedy(path: string): string {
-    return `先到那个进程里退出（/exit）再来；若确认没有别的 mist 进程在跑，删掉锁文件 ${path} 后重试`;
-  }
-
+  /** 从没拿到过这把锁的进程：提示到那边退出，或确认没人在跑后删锁重试。 */
   #busy(residentId: string, pid: number | undefined, path: string): ResidentHostLockError {
     const who = pid === undefined ? "另一个 mist 进程" : `另一个 mist 进程（pid ${pid}）`;
     return new ResidentHostLockError(
       `住户 ${residentId} 正在${who}里打开：本进程不开窗、不调模型、不写一窗流`,
-      this.#remedy(path),
+      `先到那个进程里退出（/exit）再来；若确认没有别的 mist 进程在跑，删掉锁文件 ${path} 后重试`,
     );
   }
 
-  #unverifiable(residentId: string, code: string, path: string): ResidentHostLockError {
+  #notALock(residentId: string, path: string): ResidentHostLockError {
+    return new ResidentHostLockError(
+      `住户 ${residentId} 的锁路径被不是 mist 锁的东西占着（目录、符号链接等）：本进程不开窗、不调模型、不写一窗流`,
+      `${path} 不是 mist 的锁：看清里面是什么，把它挪到别处后重试`,
+    );
+  }
+
+  #unverifiable(
+    residentId: string,
+    code: string,
+    path: string,
+    held: boolean,
+  ): ResidentHostLockError {
     return new ResidentHostLockError(
       `住户 ${residentId} 的锁文件在却读不出（${code}）：核实不了是谁拿着，本进程不开窗、不调模型、不写一窗流`,
-      `修好锁文件的读取（权限、磁盘）后重试；若确认没有别的 mist 进程在跑，删掉锁文件 ${path} 后重试`,
+      held
+        ? `修好锁文件 ${path} 的读取（权限、磁盘）后重试；本进程不会重建这把锁——它若已坏掉或被删，退出本宿主再重新启动`
+        : `修好锁文件的读取（权限、磁盘）后重试；若确认没有别的 mist 进程在跑，删掉锁文件 ${path} 后重试`,
     );
   }
 }

@@ -1090,7 +1090,9 @@ export class ResidentRuntime {
   }
 
   /** 猝死：没来得及写信就杀（D8 三）。继任者下次 say 同窗接代，原始流水归档可查。
-   * 与 say()/breathe() 同一串行域：换代动作不插进回合中途。 */
+   * 与 say()/breathe() 同一串行域：换代动作不插进回合中途。写窗账与换气配置之前先过住户
+   * 宿主锁：别的进程拿着、本进程已被挤掉或已 close()，就以 `ResidentHostLockError` 拒绝
+   * （fail-closed，什么都不写）。 */
   suddenDeath(input: { residentId: string }): Promise<void> {
     return this.#enqueue(input.residentId, async () => {
       this.#suddenDeathNow(input);
@@ -1098,6 +1100,7 @@ export class ResidentRuntime {
   }
 
   #suddenDeathNow(input: { residentId: string }): void {
+    this.#hostLocks.acquire(input.residentId);
     const knownId = this.#windows.get(input.residentId) ?? this.#windowIndex[input.residentId];
     if (knownId !== undefined) {
       try {
@@ -1374,6 +1377,8 @@ export class ResidentRuntime {
   /**
    * 给每扇活窗落暂停记录。认证账的初始快照（pendingInitial）只在内存里：这一代还没交付
    * 就暂停，接回后它再也送不到——这种窗不落记录，下次启动按新一代重新对齐（PR #98 口径）。
+   * 锁已不是本进程的（被接管、被删、读不出）也不落：内存里那一代可能早被继任者接走，盖掉
+   * 继任者的暂停记录就是把它退回旧代。
    */
   #pauseActiveWindows(): void {
     const pausedAt = new Date().toISOString();
@@ -1388,6 +1393,7 @@ export class ResidentRuntime {
         generation: window.generation,
       };
       try {
+        if (!this.#hostLocks.stillHolds(window.residentId)) continue;
         const authority = this.#ledgerAuthority;
         if (authority !== null && !authority.host.initialDelivered(identity)) continue;
         this.#pauseRecords.write({ ...identity, pausedAt });

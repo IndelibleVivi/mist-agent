@@ -1,10 +1,18 @@
 /**
- * 住户宿主锁的确定性竞态与读失败（Grok 评审 #234 锁 1、2）：在 node:fs 的 rename / link /
- * readFileSync 上挂钩，把「三个进程抢同一把陈锁」卡进挪走与放回之间的空档，以及把锁文件
- * 读不出造出来。真进程的并发抢锁见 resident-lock.test.ts。
+ * 住户宿主锁的确定性竞态与读失败（Grok 评审 #234 锁）：在 node:fs 的 rename / link /
+ * readFileSync 上挂钩，把「三个进程抢同一把陈锁」和「判过之后锁路径变成目录」卡进挪走与
+ * 放回之间的空档，以及把锁文件读不出造出来。真进程的并发抢锁见 resident-lock.test.ts。
  */
 import type { PathLike } from "node:fs";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -21,6 +29,8 @@ const hooks = vi.hoisted(() => ({
   onPutBack: null as (() => void) | null,
   /** 读这些路径时抛这个错误码。 */
   readFails: null as ((path: string) => string | null) | null,
+  /** 把旁名挪回锁路径的 rename 抛这个错误码。 */
+  renameBackFails: null as string | null,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -30,6 +40,9 @@ vi.mock("node:fs", async (importOriginal) => {
   return {
     ...actual,
     renameSync: (from: PathLike, to: PathLike): void => {
+      if (hooks.renameBackFails !== null && String(from).includes(".stale-")) {
+        throw fail(hooks.renameBackFails);
+      }
       const hook = hooks.beforeStaleRename;
       if (hook !== null && String(to).includes(".stale-")) {
         hooks.beforeStaleRename = null;
@@ -59,6 +72,7 @@ afterEach(() => {
   hooks.beforeStaleRename = null;
   hooks.onPutBack = null;
   hooks.readFails = null;
+  hooks.renameBackFails = null;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -174,5 +188,56 @@ describe("ResidentHostLocks：锁文件读不出就拒绝，不当坏锁抢", ()
     locks.acquire("r-a");
     hooks.readFails = (target) => (target.endsWith("r-a.lock") ? "EIO" : null);
     expect(refusalOf(() => locks.acquire("r-a")).message).toContain("读不出（EIO）");
+  });
+});
+
+describe("ResidentHostLocks：判过陈锁之后锁路径变成非文件（绝不递归删除）", () => {
+  /** 判过陈锁、正要挪走时，锁路径被换成一个装着东西的目录。 */
+  function directoryRacesIn(path: string): void {
+    hooks.beforeStaleRename = () => {
+      rmSync(path);
+      mkdirSync(join(path, "nested"), { recursive: true });
+      writeFileSync(join(path, "nested", "keep.txt"), "别人的东西");
+    };
+  }
+
+  it("挪走的是目录：原样挪回锁路径，里面的东西一样不少；拒绝并说那不是 mist 的锁", () => {
+    const root = tempRoot();
+    const path = writeLock(root, { pid: DEAD_PID, token: "stale" });
+    directoryRacesIn(path);
+    const refused = refusalOf(() => new ResidentHostLocks(root).acquire("r-a"));
+    expect(statSync(path).isDirectory()).toBe(true);
+    expect(readFileSync(join(path, "nested", "keep.txt"), "utf8")).toBe("别人的东西");
+    expect(refused.message).toContain("不是 mist 锁");
+    expect(refused.remedy).toContain(path);
+    expect(readdirSync(dirname(path))).toEqual(["r-a.lock"]);
+  });
+
+  it("挪不回去：留在旁名、东西不少，报错里给出旁名", () => {
+    const root = tempRoot();
+    const path = writeLock(root, { pid: DEAD_PID, token: "stale" });
+    directoryRacesIn(path);
+    hooks.renameBackFails = "EXDEV";
+    const refused = refusalOf(() => new ResidentHostLocks(root).acquire("r-a"));
+    hooks.renameBackFails = null;
+    const [aside, ...rest] = readdirSync(dirname(path));
+    expect(rest).toEqual([]);
+    expect(aside).toMatch(/^r-a\.lock\.stale-/);
+    const asidePath = join(dirname(path), aside ?? "");
+    expect(refused.message).toContain(asidePath);
+    expect(refused.message).toContain("EXDEV");
+    expect(refused.remedy).toContain(asidePath);
+    expect(readFileSync(join(asidePath, "nested", "keep.txt"), "utf8")).toBe("别人的东西");
+  });
+});
+
+describe("ResidentHostLocks.stillHolds", () => {
+  it("锁文件读不出就不算还拿着", () => {
+    const root = tempRoot();
+    const locks = new ResidentHostLocks(root);
+    locks.acquire("r-a");
+    expect(locks.stillHolds("r-a")).toBe(true);
+    hooks.readFails = (target) => (target.endsWith("r-a.lock") ? "EIO" : null);
+    expect(locks.stillHolds("r-a")).toBe(false);
   });
 });

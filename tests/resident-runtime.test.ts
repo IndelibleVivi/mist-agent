@@ -48,6 +48,7 @@ import { CredentialStore } from "../src/resident-runtime/credentials.ts";
 import { renderSystemPrompt } from "../src/resident-runtime/pi-transport.ts";
 import { ResidentRuntime } from "../src/resident-runtime/runtime.ts";
 import { sealLetter } from "../src/session/handover-letter.ts";
+import { SessionRegistry } from "../src/session/session-registry.ts";
 import { FactLedger } from "../src/store/fact-ledger.ts";
 import { ResidentStore } from "../src/store/resident-store.ts";
 import { openCanonicalStreamWriter } from "../src/window-host/window-history-host.ts";
@@ -1868,6 +1869,77 @@ describe("正常退出接回同一代（#234 主笔裁定 A）", () => {
       await runtime.close();
     }
     expect(existsSync(path)).toBe(false);
+  });
+
+  it("被挤掉的持有者 close()：不落暂停记录，继任者的暂停记录逐字不动；锁还在手的住户照常落", async () => {
+    const dataDir = tempDir();
+    const displaced = pausable(dataDir);
+    for (const residentId of ["r-superseded", "r-still-mine"]) {
+      runtimeProvision(displaced, residentId);
+      unwrap<TurnResult>(await displaced.say({ residentId, text: "暂停前那句" }));
+    }
+    // 继任者接管了 r-superseded、跑到下一代、正常退出：落下自己的暂停记录，放掉锁。
+    const successorRecord = `${JSON.stringify({
+      schemaVersion: 1,
+      residentId: "r-superseded",
+      windowId: "w_successor",
+      scopeId: "private",
+      scopeGeneration: 1,
+      generation: 2,
+      pausedAt: "2026-10-18T00:00:00.000Z",
+    })}\n`;
+    mkdirSync(join(dataDir, "sessions", "paused"), { recursive: true });
+    writeFileSync(pausePath(dataDir, "r-superseded"), successorRecord);
+    rmSync(lockPath(dataDir, "r-superseded"));
+    await displaced.close();
+    expect(readFileSync(pausePath(dataDir, "r-superseded"), "utf8")).toBe(successorRecord);
+    expect(JSON.parse(readFileSync(pausePath(dataDir, "r-still-mine"), "utf8"))).toMatchObject({
+      residentId: "r-still-mine",
+      generation: 1,
+    });
+  });
+
+  it("被挤掉的持有者 suddenDeath：拒绝且什么都不写，继任者开出下一代后的 journal 照样回放得了", async () => {
+    const dataDir = tempDir();
+    const displaced = pausable(dataDir);
+    const successorProcess = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+    });
+    try {
+      runtimeProvision(displaced, "r-sudden");
+      unwrap<TurnResult>(await displaced.say({ residentId: "r-sudden", text: "第一代" }));
+      // 继任者接管锁，按同一窗号开出第 2 代（它那边的 registry 往同一份 journal 追加）。
+      writeFileSync(
+        lockPath(dataDir, "r-sudden"),
+        JSON.stringify({
+          schemaVersion: 1,
+          residentId: "r-sudden",
+          pid: successorProcess.pid,
+          token: "successor",
+          startedAt: "2026-10-18T00:00:00.000Z",
+        }),
+      );
+      const archivePath = join(dataDir, "sessions", "windows.journal");
+      const index = JSON.parse(
+        readFileSync(join(dataDir, "sessions", "window-index.json"), "utf8"),
+      ) as { windows: Record<string, string> };
+      const successor = new SessionRegistry<{ letter: null }>({ archivePath });
+      expect(
+        successor.open("r-sudden", {
+          context: { letter: null },
+          windowId: index.windows["r-sudden"] ?? "",
+        }).generation,
+      ).toBe(2);
+      const before = diskState(dataDir, "r-sudden");
+      await expect(displaced.suddenDeath({ residentId: "r-sudden" })).rejects.toThrow(
+        /已被接管或删除/,
+      );
+      expect(diskState(dataDir, "r-sudden")).toEqual(before);
+      expect(() => new SessionRegistry({ archivePath })).not.toThrow();
+    } finally {
+      successorProcess.kill("SIGKILL");
+      await displaced.close();
+    }
   });
 
   it("接回的这一代暂停前已起过回合：窗照旧无权给自己改线（D8 一）", async () => {
