@@ -161,7 +161,40 @@ describe("ResidentHostLocks", () => {
     expect(readdirSync(dirname(path))).toEqual(["r-a.lock"]);
   });
 
-  it("锁的位置被目录占住：读不出，同样当陈锁接管", () => {
+  it("拿过的锁每次再用都核对令牌：被换成别人的、被删掉，都拒绝，且不自己重建", () => {
+    const root = tempRoot();
+    const locks = new ResidentHostLocks(root);
+    locks.acquire("r-a");
+    const path = residentLockPath(root, "r-a");
+    writeLock(root, { pid: liveProcess(), token: "displacer" });
+    expect(() => locks.acquire("r-a")).toThrow(/已被接管或删除/);
+    expect(readLock(root).token).toBe("displacer");
+    rmSync(path);
+    let refused: unknown;
+    try {
+      locks.acquire("r-a");
+    } catch (error) {
+      refused = error;
+    }
+    expect(refused).toBeInstanceOf(ResidentHostLockError);
+    expect((refused as ResidentHostLockError).message).toMatch(/已被接管或删除/);
+    expect((refused as ResidentHostLockError).remedy).toContain(path);
+    expect(readdirSync(dirname(path))).toEqual([]);
+  });
+
+  it("close() 之后拿过的锁也不认，releaseAll 才删文件", () => {
+    const root = tempRoot();
+    const locks = new ResidentHostLocks(root);
+    locks.acquire("r-a");
+    locks.close();
+    expect(() => locks.acquire("r-a")).toThrow(/已关闭/);
+    expect(() => locks.acquire("r-b")).toThrow(/已关闭/);
+    expect(readdirSync(join(root, "sessions", "active"))).toEqual(["r-a.lock"]);
+    locks.releaseAll();
+    expect(readdirSync(join(root, "sessions", "active"))).toEqual([]);
+  });
+
+  it("锁的位置被目录占住：不是谁的锁，当陈锁接管", () => {
     const root = tempRoot();
     mkdirSync(join(residentLockPath(root, "r-a"), "occupied"), { recursive: true });
     new ResidentHostLocks(root).acquire("r-a");
