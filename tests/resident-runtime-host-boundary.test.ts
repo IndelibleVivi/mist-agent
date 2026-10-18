@@ -409,7 +409,11 @@ describe("resident host lock across real host processes (D9: one stream, one wri
     const rightOpening = unwrap(await say(setup, "r-host-right", "right before"));
     await stopHost(setup);
 
-    const [left, right] = await Promise.all([startHost(dataDir), startHost(dataDir)]);
+    // 顺序起、都 ready 后再并发说：同一刻起两个宿主会撞上既有的启动竞态（认证账启动时用固定
+    // 的 facts.json.tmp 重写全部账档，一边可能在 ready 前崩掉，D33 代价行），那不是本条要验的锁。
+    const left = await startHost(dataDir);
+    const right = await startHost(dataDir);
+    expect(left.pid).not.toBe(right.pid);
     const [leftTurn, rightTurn] = await Promise.all([
       say(left, "r-host-left", "left speaks"),
       say(right, "r-host-right", "right speaks"),

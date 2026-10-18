@@ -12,7 +12,6 @@ import {
   readdirSync,
   rmSync,
   statSync,
-  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,8 +32,16 @@ const hooks = vi.hoisted(() => ({
   readFails: null as ((path: string) => string | null) | null,
   /** 把旁名挪回锁路径的 rename 抛这个错误码。 */
   renameBackFails: null as string | null,
-  /** 把旁名放回锁路径（rename 或 link，源是旁名）真正执行之前跑一次（一次性）。 */
+  /**
+   * 把非文件放回锁路径真正执行之前跑一次（一次性）：rename / link 的源是旁名，或任何一次
+   * symlink（锁模块只在放回符号链接时调它；测试自己造链接用的是未挂钩的原版）。
+   */
   beforeAnyPutBack: null as (() => void) | null,
+  /**
+   * 照 macOS 的 link(2)：源是符号链接时链到它解引用后的目标（Linux 不解引用）。
+   * 打开后任何平台上都按 macOS 的语义跑，放回符号链接若退回用 link 就会现形。
+   */
+  linkFollowsSymlinks: false,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -70,8 +77,20 @@ vi.mock("node:fs", async (importOriginal) => {
         hooks.onPutBack = null;
         hook();
       }
+      if (hooks.linkFollowsSymlinks && actual.lstatSync(existing).isSymbolicLink()) {
+        actual.linkSync(actual.realpathSync(existing), target);
+        return;
+      }
       actual.linkSync(existing, target);
     },
+    symlinkSync: ((...args: Parameters<typeof actual.symlinkSync>) => {
+      const putBack = hooks.beforeAnyPutBack;
+      if (putBack !== null) {
+        hooks.beforeAnyPutBack = null;
+        putBack();
+      }
+      actual.symlinkSync(...args);
+    }) as typeof actual.symlinkSync,
     readFileSync: ((...args: Parameters<typeof actual.readFileSync>) => {
       const code = hooks.readFails?.(String(args[0])) ?? null;
       if (code !== null) throw fail(code);
@@ -79,6 +98,9 @@ vi.mock("node:fs", async (importOriginal) => {
     }) as typeof actual.readFileSync,
   };
 });
+
+/** 测试自己造符号链接用原版，不触发放回钩子。 */
+const unhookedFs = await vi.importActual<typeof import("node:fs")>("node:fs");
 
 const roots: string[] = [];
 
@@ -88,6 +110,7 @@ afterEach(() => {
   hooks.readFails = null;
   hooks.renameBackFails = null;
   hooks.beforeAnyPutBack = null;
+  hooks.linkFollowsSymlinks = false;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -248,11 +271,12 @@ describe("ResidentHostLocks：判过陈锁之后锁路径变成非文件（绝�
 
 describe("ResidentHostLocks：判过陈锁之后锁路径变成符号链接（放回不换掉别人的锁）", () => {
   function symlinkRacesIn(root: string, path: string): string {
+    hooks.linkFollowsSymlinks = true;
     const target = join(root, "elsewhere.txt");
     writeFileSync(target, "链接指向的东西");
     hooks.beforeStaleRename = () => {
       rmSync(path);
-      symlinkSync(target, path);
+      unhookedFs.symlinkSync(target, path);
     };
     return target;
   }

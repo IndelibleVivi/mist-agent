@@ -121,6 +121,8 @@ npm run resident -- --resident <residentId> --data-dir <dataDir>
 同一位住户同一时刻只能在一个终端或宿主进程里聊：另一个进程开着时，第二个会报
 writer-unavailable 并给出那边的 pid，先到那边 `/exit`；若确认没有别的 mist 进程在跑，按提示
 删掉 `<dataDir>/sessions/active/<residentId>.lock`。硬杀留下的锁下次启动会自动接管。
+同一个数据目录别在同一刻起两个进程：认证账启动时用固定临时文件名重写账档，撞上时其中一个会在
+启动阶段报 ENOENT 退出（main 上就有的老问题，见 [D33](docs/decisions.md) 代价行），隔一下再起即可。
 
 这条接线不代表出信已满足全部 D8 语义：现役生成器对已有承诺缺 `ledgerSeq` 时会拒绝换代，
 固定模板的 intent 也不构成当刻亲笔的证据。真实 CLI 输入回归与底层判卷边界见

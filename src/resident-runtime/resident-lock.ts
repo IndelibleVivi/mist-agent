@@ -19,8 +19,9 @@
  * 接管的几个进程只有一个 rename 得到），核对挪走的正是判过陈的那份（普通文件、读出来逐字
  * 相同；读不出不算相同），再按上面建锁；挪走的若是别人刚建的新锁就 link 放回认输，放回时出
  * EEXIST 以外的错就照实报错、不冒充「别人拿着」；挪走的若是判过之后才冒出来的非文件，原样
- * 放回（目录 rename、其余 link，都换不掉空档里别人刚建的锁），放不回去就留在旁名并在报错里
- * 给出旁名。旁名只在 lstat 认得是普通文件时才删。
+ * 按类型放回（目录 rename、符号链接按原 link text 排他重建、fifo 等 link，都换不掉空档里别人
+ * 刚建的锁），放不回去就留在旁名并在报错里给出旁名。旁名只在 lstat 认得是普通文件、或非文件
+ * 已原样放回之后才删。
  *
  * 两个进程同时起不会两边都拿到。文件路径上没有比较并交换，三个以上进程同时接管同一把陈锁
  * 时，挪走与放回之间的空档里可能有第三个进程建上新锁，把刚接管的那一边挤掉；被挤掉的持有者
@@ -43,8 +44,10 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readlinkSync,
   renameSync,
   rmSync,
+  symlinkSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
@@ -317,7 +320,7 @@ export class ResidentHostLocks {
    * 接管陈锁：rename 到独有名字（抢不到就是别人先接管了），核对挪走的正是判过陈的那份
    * （普通文件、逐字相同）。挪走的若是别人刚建的新锁，link 放回并认输：放回撞上 EEXIST 是
    * 锁路径又被人建上了，那份才是现役的锁；别的错照实抛——被挪走的持有者下一回合核对令牌时
-   * 会停下。挪走的若是判过之后才冒出来的非文件，原样 rename 回去，绝不删。
+   * 会停下。挪走的若是判过之后才冒出来的非文件，按类型原样放回（`#putBackNonFile`），绝不删。
    */
   #takeOver(residentId: string, path: string, staleRaw: string): boolean {
     const aside = `${path}.stale-${process.pid}-${randomUUID()}`;
@@ -353,18 +356,21 @@ export class ResidentHostLocks {
   }
 
   /**
-   * 把判过之后才冒出来的非文件原样放回，但绝不换掉空档里别人刚建上的锁：目录用 rename
-   * （目标是文件时 ENOTDIR、非空目录时 ENOTEMPTY；顶多换掉一个空目录，不丢东西），符号链接、
-   * fifo 等用 link
-   * （目标已在就 EEXIST）再删旁名。放不回去就留在旁名，报错里给出旁名。
+   * 把判过之后才冒出来的非文件原样放回，但绝不换掉空档里别人刚建上的锁。按类型来：目录用
+   * rename（目标是文件时 ENOTDIR、非空目录时 ENOTEMPTY；顶多换掉一个空目录，不丢东西）；
+   * 符号链接读出原 link text 再 `symlink` 到锁路径（排他，目标已在就 EEXIST）——不能用 link，
+   * macOS 的 link(2) 会解引用符号链接，放回去的就成了目标文件的硬链接；fifo、socket 等用 link
+   * （目标已在就 EEXIST）。放回之后才删旁名；放不回去就留在旁名，报错里给出旁名。
    */
   #putBackNonFile(residentId: string, path: string, aside: string): void {
     try {
-      if (lstatSync(aside).isDirectory()) {
+      const moved = lstatSync(aside);
+      if (moved.isDirectory()) {
         renameSync(aside, path);
         return;
       }
-      linkSync(aside, path);
+      if (moved.isSymbolicLink()) symlinkSync(readlinkSync(aside), path);
+      else linkSync(aside, path);
     } catch (error) {
       throw new ResidentHostLockError(
         `住户 ${residentId} 的锁路径上冒出来一个不是 mist 锁的东西，挪走后放不回去（${errorCode(error)}），现在在 ${aside}`,
