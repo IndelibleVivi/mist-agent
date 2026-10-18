@@ -293,8 +293,12 @@ TUI 的 ACK 故障回归从 `tui.submit()` 发出后续补账消息，再从 `/r
   五、同一次正常退出后用 `tamperPauseRecord()` 把三位住户的记录分别弄成缺失、损坏、身份对不上：
   三位都开新一代，旧流水不进请求、归档可查、旧事件不动；同一轮里没被弄坏的对照住户照样接回
   （正对照）。
-  六、`raceHosts()` 在同一数据根上真并发起两个宿主进程各说一句：至少一边说成（正对照），
-  至多一边接回暂停那代；两边都说成时代际不同、pid 不同。
+  六、`raceHosts()` 在同一数据根上起两个宿主进程（顺序起：先起的 ready 了再起第二个——同一刻
+  起两个会撞上 main 上就有的认证账启动竞态，一边在 ready 前崩掉），两边都 ready 后同一时刻
+  各说一句，暂停记录认领与住户锁在这一句上真撞。不可退的断言：两边都起到 ready、ready pid
+  是两个不同的进程；两边的 say 都真返回（不是起不来、不是请求抛错）；输的一边只认 say 自己
+  返回的结构化 `writer-unavailable`。在此之上：至少一边说成（正对照），至多一边接回暂停那代；
+  两边都说成时代际不同、pid 不同。
 
 ## RT-09 的口径与边界（#234 判卷先行）
 
@@ -317,8 +321,8 @@ TUI 的 ACK 故障回归从 `tui.submit()` 发出后续补账消息，再从 `/r
 令牌（猝死前也核对）；锁在另一个活进程手里、读不出、被非文件占住或被接管，就在调模型、写流之前
 以 writer-unavailable 拒绝；pid 已死或解析不了才 rename 接管；被挤掉的一边关闭时不落暂停记录；
 `close()` 一开头停止认锁，关完 writer 后放。
-于是两个宿主只有拿到锁的一边开窗写流，另一边被拒，不再两边同时撞在一窗流固定的 `.tmp` 上、
-一边都没说成（三个以上进程抢陈锁的边界见 D33）。
+于是两个宿主只有拿到锁的一边开窗写流，另一边由 say 返回 writer-unavailable，不再两边同时撞在
+一窗流固定的 `.tmp` 上、一边都没说成（三个以上进程抢陈锁的边界见 D33）。
 
 **驱动契约新增**（判卷仍只经契约观察，不 import `src/`）：
 
@@ -335,9 +339,13 @@ TUI 的 ACK 故障回归从 `tui.submit()` 发出后续补账消息，再从 `/r
 - `tamperPauseRecord()`：宿主停着时把一位住户的暂停记录弄成缺失、损坏或身份对不上，别的
   住户不动。现役代码没有暂停记录，驱动把它申报为明桩（见下「真灯与桩灯」）；判卷在走到它
   之前就已判红。施工落下暂停记录时一并实现并从 `STUBBED` 划掉。
-- `raceHosts()`：驱动自己的宿主停着时，在同一数据根上同时 spawn 两个宿主进程，都 ready
-  （或确认起不来）后同一时刻各说一句，再各自正常关闭。起不来或请求抛错的一边记作
-  `writer-unavailable`，不吞成成功。
+- `raceHosts()`：驱动自己的宿主停着时，在同一数据根上先 spawn 一个宿主进程等它 ready，再
+  spawn 第二个等它 ready，然后同一时刻各说一句，说完话的正常关闭、没起来或请求抛错的杀掉。
+  每一边走到哪一步照实报在 `ContendedTurn.stage` 上（`said` / `not-ready` / `request-failed`，
+  带 spawn pid 与 ready pid）：起不来、请求抛错都不许折成 say 的结果。顺序起是因为认证账
+  启动时用固定的 `<residentId>.facts.json.tmp` 重写全部账档，同一刻起两个宿主时一边会在
+  ready 前因 rename ENOENT 退出——那是 main 上就有的启动竞态，不是本灯要验的东西；暂停记录
+  认领与住户锁都在第一句 say 上，仍被同时发出的两句真撞。
 
 **第 5 条为什么判 baseline**：认证账的 `registerViewport` 认「已登记」靠进程内存（重启后
 从盘上恢复的窗行不算已登记）。接回后若按同一身份再登记一次，账会新起一行：baseline 挪到
@@ -383,6 +391,7 @@ runtime、同时开窗，能稳定抓住两类错：两边都按启动时的盘�
 | 2026-09-24 | RT-03 猝死单判加：猝死前标记确已入流（正对照）+ 继任者代际必须更高（真换代）+ 归档按代可查（D8 三正面）；驱动契约新增只读 `archivedTranscript` | 同上第 3 条：原判据只查「启动包里没有标记」，空的 `suddenDeath` 也能点绿，且没验 D8 三「原始流水进归档可查」，允许丢史 |
 | 2026-10-17 | 新增 RT-08：确认缺失、同锚重试、跨代孤立 user、模型零调用、正文零新增与 IPC 锚往返合成一盏恢复灯 | [#223 D32 主笔裁定](https://github.com/mist-agent-harness/mist-agent/pull/223#issuecomment-6214284808)：恢复语义动一窗流与事实账，施工方单测不能替代可执行判卷与独立验收席 |
 | 2026-10-17 | 新增 RT-09：正常退出接回同一代，硬杀与坏暂停记录照旧猝死，暂停记录只用一次，两进程不拿同一代，认证账确认位不重登记；驱动契约新增 `stopHost`、`lastModelRequest`、`appendLedgerFact`、`ledgerAlignment`、`tamperPauseRecord`、`raceHosts` | [#234](https://github.com/mist-agent-harness/mist-agent/issues/234) 主笔裁定 A（2026-10-17）：动换代时带走什么与一窗流按代读回的口径，D32 第二条严格路径，判卷先行 |
+| 2026-10-18 | RT-09 第六条改判：两宿主顺序起、都 ready 后同时说；两边都起到 ready 且 pid 不同、两边 say 都真返回、输的一边只认 say 返回的 writer-unavailable，全部不可退；`ContendedTurn` 加 `stage` / `readyPid` / `failure`，`result` 只在 `said` 时有 | [PR #235](https://github.com/mist-agent-harness/mist-agent/pull/235) 验收席 Elio（zaymb）P1-1：同时起两宿主时一边在 ready 前因认证账固定 `.tmp` 的 rename ENOENT 退出，夹具把它折成 writer-unavailable，「至少一边成功」照样点绿，失败方根本没走到住户锁——假绿 |
 
 ## 2026-10-17 D32 独立验收落章（#223）
 

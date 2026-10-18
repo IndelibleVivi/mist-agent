@@ -215,11 +215,27 @@ export type PauseRecordFault =
   /** 记录完好可读，但身份对不上：不是这位住户、这扇窗、这一代的那笔。 */
   | "foreign";
 
-/** 并发夹具里一个宿主进程的结局。 */
+/**
+ * 并发夹具里一个宿主进程走到了哪一步（PR #235 验收席 P1-1）：起不来、请求抛错都照实报，
+ * 不许折成 `say` 的结果——否则「没起来」会冒充「被锁拒绝」，并发段成了假绿。
+ *
+ * - `said`：起到 ready，`say` 真返回了（成功，或 say 自己返回的结构化失败）；
+ * - `not-ready`：ready 之前就退出或超时，根本没走到 `say`；
+ * - `request-failed`：起到 ready，但 `say` 请求本身抛错（宿主崩溃、IPC 断开、超时），
+ *   没拿到 say 的返回。
+ */
+export type ContendedStage = "said" | "not-ready" | "request-failed";
+
 export interface ContendedTurn {
-  /** 这个宿主进程的 pid；没起来（ready 前就退出或超时）为 null。 */
+  readonly stage: ContendedStage;
+  /** spawn 出来的宿主进程 pid；连进程都没起来为 null。 */
   readonly pid: number | null;
-  readonly result: Result<TurnResult>;
+  /** 宿主 ready 时自报的 pid；没走到 ready 为 null。 */
+  readonly readyPid: number | null;
+  /** `say` 自己返回的结果；只有 `said` 有，别的阶段为 null。 */
+  readonly result: Result<TurnResult> | null;
+  /** 没走到 say 返回时的原因（`not-ready` / `request-failed`）；`said` 为 null。 */
+  readonly failure: string | null;
 }
 
 /**
@@ -430,14 +446,17 @@ export interface ResidentRuntimeDriver {
    */
   tamperPauseRecord(input: { residentId: string; fault: PauseRecordFault }): Promise<void>;
   /**
-   * RT-09 并发夹具：驱动自己的宿主停着时（先 `stopHost`，否则抛错），在同一数据根上
-   * **同时**另起两个宿主进程；两边都报 ready 或确认起不来之后，同一时刻各对同一住户说
-   * 一句（`texts[0]` 给先起的那个）；两边答完后都走正常关闭（同 `stopHost`）并等它们
-   * 自己退出。按起进程顺序返回两边的结局。
+   * RT-09 并发夹具：驱动自己的宿主停着时（先 `stopHost`，否则抛错），在同一数据根上另起
+   * 两个宿主进程——**先起一个等它 ready，再起第二个等它 ready**（同一刻起两个会撞上既有的
+   * 认证账启动竞态，一边在 ready 前崩掉，那不是这里要验的东西）；两边都 ready 后**同一时刻**
+   * 各对同一住户说一句（`texts[0]` 给先起的那个），暂停记录认领与住户锁在这一句上真撞；
+   * 两边答完后正常关闭（同 `stopHost`）并等它们自己退出，没起来或请求抛错的一边直接杀掉。
+   * 按起进程顺序返回两边的结局。
    *
-   * 起不来（ready 前就退出或超时）或请求抛错的一边记作 `writer-unavailable` 的失败结果，
-   * 不吞成成功——「第二个进程拒绝开张」是合法结局之一。夹具只负责真并发；判卷独立判
-   * 「两边没拿到同一代、至多一边接回暂停的那代」。
+   * 每一边走到哪一步照实报在 `stage` 上：起不来是 `not-ready`，请求抛错是 `request-failed`，
+   * 都不许折成 say 的结果；「第二个进程被拒」必须是 `said` 且 say 自己返回的结构化失败。
+   * 夹具只负责真并发；判卷独立判「两边都 ready 且是两个进程、两边的 say 都真返回、输的一边
+   * 是 say 返回的 writer-unavailable、两边没拿到同一代、至多一边接回暂停的那代」。
    */
   raceHosts(input: {
     residentId: string;

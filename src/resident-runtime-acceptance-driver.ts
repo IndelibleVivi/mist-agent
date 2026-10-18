@@ -16,8 +16,9 @@
  * 并由判卷另行读回正对照；它们不实现被判行为。
  *
  * RT-09（#234）：stopHost 走宿主的正常关闭（IPC `stop` → runtime.close()，与终端
- * `/exit`、stdin 结束同一条），只等子进程自己退出；raceHosts 在同一数据根上真并发另起
- * 两个子进程；ledgerAlignment 只读 residents/ 下认证账的落盘确认位；appendLedgerFact
+ * `/exit`、stdin 结束同一条），只等子进程自己退出；raceHosts 在同一数据根上顺序另起
+ * 两个子进程、都 ready 后同一时刻各说一句，每边走到哪一步照实报（不把起不来折成 say 的
+ * 结果）；ledgerAlignment 只读 residents/ 下认证账的落盘确认位；appendLedgerFact
  * 经宿主的 host.system() 入账。tamperPauseRecord 是故障夹具：只在宿主停着时按
  * `pause-records.ts` 给的真实路径把一位住户的暂停记录删掉、截断或换成别的窗，不实现
  * 被判行为。
@@ -282,20 +283,26 @@ class ResidentRuntimeProductionDriver implements ResidentRuntimeDriver {
     if (this.#child !== null) {
       throw new Error("raceHosts 要求驱动自己的宿主先停（stopHost）——不许有第三个宿主同时在场");
     }
-    // 两个子进程同时 spawn：构造 runtime（读盘上的窗账与暂停记录）这一段就是并发的。
-    const contenders = [spawnHostChild(this.#dataDir), spawnHostChild(this.#dataDir)] as const;
-    const ready = await Promise.allSettled([contenders[0].ready, contenders[1].ready]);
+    // 顺序起：先起一个等它 ready，再起第二个等它 ready。同一刻起两个会撞上既有的认证账
+    // 启动竞态（固定的 facts.json.tmp），一边在 ready 前崩掉——那不是这里要验的（PR #235
+    // 验收席 P1-1）。暂停记录认领与住户锁都在第一句 say 上，下面同一时刻发出两句时真撞。
+    const first = spawnHostChild(this.#dataDir);
+    const firstReady = await settle(first.ready);
+    const second = spawnHostChild(this.#dataDir);
+    const secondReady = await settle(second.ready);
+    const outcomes: ContendedTurn[] = [];
     try {
-      // 两边都报 ready 或确认起不来之后，同一时刻发出两句，开窗/接回这一段也并发。
       const [left, right] = await Promise.all([
-        contend(contenders[0].child, ready[0], input.residentId, input.texts[0]),
-        contend(contenders[1].child, ready[1], input.residentId, input.texts[1]),
+        contend(first.child, firstReady, input.residentId, input.texts[0]),
+        contend(second.child, secondReady, input.residentId, input.texts[1]),
       ]);
+      outcomes.push(left, right);
       return [left, right];
     } finally {
+      // 说完话的正常关闭（同 stopHost）；没起来或请求抛错的直接杀掉，不留孤儿进程。
       await Promise.all(
-        contenders.map((contender, index) =>
-          ready[index]?.status === "fulfilled"
+        [first, second].map((contender, index) =>
+          outcomes[index]?.stage === "said"
             ? stopHostChild(contender.child)
             : killHostChild(contender.child),
         ),
@@ -505,40 +512,48 @@ function toAlignmentRow(row: Record<string, unknown>): LedgerViewportAlignmentVi
   };
 }
 
-/** 并发夹具里一个宿主的结局：起不来或请求抛错都收成 writer-unavailable，不吞成成功。 */
+function settle<T>(promise: Promise<T>): Promise<PromiseSettledResult<T>> {
+  return promise.then(
+    (value): PromiseSettledResult<T> => ({ status: "fulfilled", value }),
+    (reason: unknown): PromiseSettledResult<T> => ({ status: "rejected", reason }),
+  );
+}
+
+/**
+ * 并发夹具里一个宿主的结局，照实报走到了哪一步：起不来是 `not-ready`，请求抛错是
+ * `request-failed`，都不折成 say 的结果；只有 say 真返回了才是 `said`。
+ */
 async function contend(
   child: ChildProcess,
-  ready: PromiseSettledResult<HostDescriptor> | undefined,
+  ready: PromiseSettledResult<HostDescriptor>,
   residentId: string,
   text: string,
 ): Promise<ContendedTurn> {
-  if (ready === undefined || ready.status === "rejected") {
-    const reason = ready?.status === "rejected" ? describeError(ready.reason) : "unknown";
-    return { pid: null, result: contenderFailure(residentId, `宿主没起来：${reason}`) };
+  const pid = child.pid ?? null;
+  if (ready.status === "rejected") {
+    return {
+      stage: "not-ready",
+      pid,
+      readyPid: null,
+      result: null,
+      failure: `宿主没起来：${describeError(ready.reason)}`,
+    };
   }
+  const readyPid = ready.value.pid;
   try {
     const result = await callHost<Result<TurnResult>>(child, "say", {
       input: { residentId, text },
     });
-    return { pid: ready.value.pid, result };
+    return { stage: "said", pid, readyPid, result, failure: null };
   } catch (error) {
     return {
-      pid: ready.value.pid,
-      result: contenderFailure(residentId, `宿主请求失败：${describeError(error)}`),
+      stage: "request-failed",
+      pid,
+      readyPid,
+      result: null,
+      failure: `宿主请求失败：${describeError(error)}`,
     };
   }
-}
-
-function contenderFailure(residentId: string, message: string): Result<TurnResult> {
-  return {
-    ok: false,
-    error: {
-      code: "writer-unavailable",
-      message,
-      remedy: "同一数据根上已有另一个宿主；等它正常退出后再启动",
-      residentId,
-    },
-  };
 }
 
 function describeError(error: unknown): string {

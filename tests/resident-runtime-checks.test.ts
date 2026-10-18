@@ -157,6 +157,16 @@ interface Faults {
   hardKillCarriesHistory: boolean;
   /** RT-09：两个宿主同时起，都接回了暂停那一代。 */
   raceBothResume: boolean;
+  /** RT-09 夹具改坏：把「第二个宿主 ready 前就崩了」折成一句被拒的 say（PR #235 P1-1 假绿）。 */
+  raceFoldsPreReadyCrash: boolean;
+  /** RT-09：第二个宿主没起到 ready（如实报 not-ready）。 */
+  raceLoserNotReady: boolean;
+  /** RT-09：第二个宿主起来了，但 say 请求本身抛错（如实报 request-failed）。 */
+  raceLoserRequestFailed: boolean;
+  /** RT-09：两边报的 ready pid 是同一个进程。 */
+  raceSamePid: boolean;
+  /** RT-09：输的一边是 say 返回的失败，但不是 writer-unavailable。 */
+  raceLoserNotWriterUnavailable: boolean;
   /** RT-09 夹具改坏：弄坏暂停记录时把那一代的归档也抹了。 */
   tamperDropsArchive: boolean;
   /** RT-09 观察口改坏：模型请求的历史恒为空（正对照失效）。 */
@@ -217,6 +227,11 @@ const NO_FAULTS: Faults = {
   pauseAcksGap: false,
   hardKillCarriesHistory: false,
   raceBothResume: false,
+  raceFoldsPreReadyCrash: false,
+  raceLoserNotReady: false,
+  raceLoserRequestFailed: false,
+  raceSamePid: false,
+  raceLoserNotWriterUnavailable: false,
   tamperDropsArchive: false,
   requestHistoryAlwaysEmpty: false,
   alignmentObserverFrozen: false,
@@ -648,32 +663,65 @@ class SyntheticDriver implements ResidentRuntimeDriver {
     if (this.#hostRunning) throw new Error("raceHosts 要求宿主先停");
     const resident = this.#ensure(input.residentId);
     const before = resident.pauseRecord;
+    // 两个宿主顺序起、都 ready（各自的 pid），再同时说：先说的拿到住户锁，后说的被 say 自己
+    // 以结构化 writer-unavailable 拒绝。
     const leftHost = await this.startHost();
-    const left: ContendedTurn = {
-      pid: leftHost.pid,
-      result: await this.say({ residentId: input.residentId, text: input.texts[0] }),
-    };
+    this.#pid += 1;
+    const rightPid = this.#pid;
+    const said = (pid: number, result: Result<TurnResult>): ContendedTurn => ({
+      stage: "said",
+      pid,
+      readyPid: pid,
+      result,
+      failure: null,
+    });
+    const left = said(
+      leftHost.pid,
+      await this.say({ residentId: input.residentId, text: input.texts[0] }),
+    );
+    const refused = err<TurnResult>(
+      "writer-unavailable",
+      "这位住户正在另一个宿主进程里打开",
+      "先到那个进程里退出再来",
+      input.residentId,
+    );
     let right: ContendedTurn;
     if (this.faults.raceBothResume) {
       // 认领不原子：后起的那个宿主读到的还是认领前的盘面。
       resident.pauseRecord = before;
       this.#boots += 1;
-      this.#pid += 1;
-      const pid = this.#pid;
+      right = said(
+        rightPid,
+        await this.say({ residentId: input.residentId, text: input.texts[1] }),
+      );
+    } else if (this.faults.raceFoldsPreReadyCrash) {
+      // 驱动把「ready 前就崩了」折成一句被拒的 say：没有 pid、没有 ready。
+      right = { stage: "said", pid: null, readyPid: null, result: refused, failure: null };
+    } else if (this.faults.raceLoserNotReady) {
       right = {
-        pid,
-        result: await this.say({ residentId: input.residentId, text: input.texts[1] }),
+        stage: "not-ready",
+        pid: rightPid,
+        readyPid: null,
+        result: null,
+        failure: "宿主没起来：exited 1/null before ready（rename facts.json.tmp ENOENT）",
       };
+    } else if (this.faults.raceLoserRequestFailed) {
+      right = {
+        stage: "request-failed",
+        pid: rightPid,
+        readyPid: rightPid,
+        result: null,
+        failure: "宿主请求失败：resident runtime host exited before answering say",
+      };
+    } else if (this.faults.raceSamePid) {
+      right = said(leftHost.pid, refused);
+    } else if (this.faults.raceLoserNotWriterUnavailable) {
+      right = said(
+        rightPid,
+        err("channel-unavailable", "窗开工失败", "检查窗账后重试", input.residentId),
+      );
     } else {
-      right = {
-        pid: null,
-        result: err(
-          "writer-unavailable",
-          "同一数据根上已有活宿主",
-          "等它正常退出后再启动",
-          input.residentId,
-        ),
-      };
+      right = said(rightPid, refused);
     }
     await this.stopHost();
     return [left, right];
@@ -1560,6 +1608,23 @@ describe("RT-09 判卷反对照：正常退出接回同一代（#234）", () => 
     const lamp = await runRt09();
     expect(lamp.passed).toBe(false);
     expect(lamp.detail).toContain("暂停记录被两边同时认领");
+  });
+
+  it.each([
+    ["raceFoldsPreReadyCrash", "ready 前崩溃被夹具折成 writer-unavailable", "没起到 ready"],
+    ["raceLoserNotReady", "第二个宿主没起到 ready", "没起到 ready"],
+    ["raceLoserRequestFailed", "第二个宿主的 say 请求本身抛错", "say 没真返回"],
+    ["raceSamePid", "两边 ready 的是同一个进程", "ready 的是同一个进程"],
+    [
+      "raceLoserNotWriterUnavailable",
+      "输的一边不是 say 返回的 writer-unavailable",
+      "不是 say 返回的 writer-unavailable",
+    ],
+  ] as const)("并发段：%s（%s）→ RT-09 红（PR #235 验收席 P1-1）", async (fault, _label, why) => {
+    driver.faults[fault] = true;
+    const lamp = await runRt09();
+    expect(lamp.passed).toBe(false);
+    expect(lamp.detail).toContain(why);
   });
 
   it("弄坏暂停记录的夹具顺手抹了归档 → RT-09 红（坏记录按猝死也不许丢史）", async () => {

@@ -1618,6 +1618,9 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
       }
 
       // —— 六、两个进程同时开同一住户：不许拿到同一代，至多一边接回暂停那代（#234 第 4 条） ——
+      // 两宿主顺序起、都 ready 后同时说（既有的认证账启动竞态会让同时起的一边在 ready 前崩，
+      // PR #235 验收席 P1-1）：暂停记录认领与住户锁在第一句上真撞。起不来、请求抛错都不算
+      // 「被拒」，输的一边只认 say 自己返回的 writer-unavailable。
       await provisionOrFail(driver, RACER);
       const raceSeed = await sayOrFail(driver, RACER, markerFor("RT-09", "race-before"), "并发前");
       await driver.stopHost();
@@ -1625,15 +1628,50 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
         residentId: RACER,
         texts: [markerFor("RT-09", "race-a"), markerFor("RT-09", "race-b")],
       });
+      const sideLabel = (side: ContendedTurn): string =>
+        `${side.stage}（pid ${String(side.pid)}，ready pid ${String(side.readyPid)}${
+          side.failure === null ? "" : `：${side.failure}`
+        }${side.result === null ? "" : side.result.ok ? "，说成" : `，${side.result.error.code}`}）`;
+      const raceSides = contended.map(sideLabel).join("；");
+      expect(
+        contended.length === 2,
+        `并发夹具返回了 ${contended.length} 个结局，应为 2 个——两个宿主进程各一个`,
+      );
+      expect(
+        contended.every(
+          (side) => side.stage !== "not-ready" && Number.isSafeInteger(side.readyPid),
+        ),
+        `并发夹具里有一边没起到 ready（${raceSides}）——起不来不是被住户锁拒绝，这一段根本没撞到暂停记录认领与住户锁（PR #235 验收席 P1-1）`,
+      );
+      const [earlier, later] = contended;
+      expect(
+        earlier !== undefined &&
+          later !== undefined &&
+          Number.isSafeInteger(earlier.readyPid) &&
+          Number.isSafeInteger(later.readyPid) &&
+          earlier.readyPid !== later.readyPid,
+        `并发夹具两边 ready 的是同一个进程（${raceSides}）——不是两个进程同时开同一住户`,
+      );
+      expect(
+        contended.every((side) => side.stage === "said" && side.result !== null),
+        `并发夹具里有一边的 say 没真返回（${raceSides}）——请求抛错或宿主崩溃不是被住户锁拒绝`,
+      );
+      expect(
+        contended.every(
+          (side) =>
+            side.result === null ||
+            side.result.ok ||
+            side.result.error.code === "writer-unavailable",
+        ),
+        `并发夹具里输的一边不是 say 返回的 writer-unavailable（${raceSides}）——另一个进程开着这位住户时，拒绝必须是结构化的 writer-unavailable`,
+      );
       const won: { readonly pid: number | null; readonly turn: TurnResult }[] = [];
       for (const side of contended) {
-        if (side.result.ok) won.push({ pid: side.pid, turn: side.result.value });
+        if (side.result?.ok === true) won.push({ pid: side.readyPid, turn: side.result.value });
       }
       expect(
         won.length >= 1,
-        `两个宿主同时起，一边都没说成（${contended
-          .map((side) => (side.result.ok ? "ok" : side.result.error.message))
-          .join("；")}）——并发夹具没真跑起来，「不许拿到同一代」成了空断言`,
+        `两个宿主都 ready 后同时说，一边都没说成（${raceSides}）——并发夹具没真跑起来，「不许拿到同一代」成了空断言`,
       );
       expect(
         won.filter((side) => side.turn.generation === raceSeed.generation).length <= 1,
@@ -1652,7 +1690,11 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
       }
       const raceSummary = contended
         .map((side) =>
-          side.result.ok ? `第 ${side.result.value.generation} 代` : side.result.error.code,
+          side.result === null
+            ? side.stage
+            : side.result.ok
+              ? `第 ${side.result.value.generation} 代`
+              : side.result.error.code,
         )
         .join(" / ");
 
