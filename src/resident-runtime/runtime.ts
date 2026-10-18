@@ -8,7 +8,9 @@
  * 唯一），代际由 `SessionRegistry` 发（1 起点）。正常退出（`close()`：终端 `/exit`、
  * stdin 结束、Ctrl-C，宿主子进程 `stop`）给每扇活窗落一笔「这一代暂停」，下次启动对得上
  * 就接着同一 windowId、同一代（#234 主笔裁定 A）；硬杀、崩溃，或暂停记录缺失、损坏、
- * 对不上，宿主重启后代际递增——即猝死，继任者接代（D8 三）。pi 只当零件库：模型走
+ * 对不上，宿主重启后代际递增——即猝死，继任者接代（D8 三）。一位住户同一时刻只在一个
+ * 宿主进程里开窗（`sessions/active/<residentId>.lock`，D9 一流一写方）：另一个活进程
+ * 开着就以 writer-unavailable 拒绝，硬杀留下的锁下次启动接管。pi 只当零件库：模型走
  * 传输层（channels.ts），不持有会话副本。
  *
  * 失败纪律（RT-01）：凭证没配（credential-missing）与凭证失效（credential-invalid）
@@ -94,6 +96,7 @@ import {
 } from "./channels.ts";
 import { CredentialStore } from "./credentials.ts";
 import { PauseRecordStore } from "./pause-records.ts";
+import { ResidentHostLockError, ResidentHostLocks } from "./resident-lock.ts";
 import { type TurnLedgerTarget, TurnReceiptStore, readTurnLedgerTarget } from "./turn-receipts.ts";
 
 const WINDOW_INDEX_SCHEMA = 1;
@@ -269,6 +272,8 @@ export class ResidentRuntime {
   #windowIndex: Record<string, string> = {};
   /** 正常退出的「这一代暂停」记录（#234）：close() 写，开窗时认领一次即作废。 */
   readonly #pauseRecords: PauseRecordStore;
+  /** 跨进程的住户宿主锁（D9 一流一写方）：本进程第一次给住户开窗时拿，close() 放。 */
+  readonly #hostLocks: ResidentHostLocks;
   #closed = false;
 
   constructor(options: ResidentRuntimeOptions) {
@@ -338,6 +343,7 @@ export class ResidentRuntime {
     });
     this.#windowIndexPath = join(dataDir, "sessions", "window-index.json");
     this.#pauseRecords = new PauseRecordStore(dataDir);
+    this.#hostLocks = new ResidentHostLocks(dataDir);
     const restoredIndex = this.#readWindowIndex();
     this.#windowIndex = restoredIndex.windows;
     this.#publicWindowIndex = restoredIndex.publicWindows;
@@ -548,6 +554,9 @@ export class ResidentRuntime {
     try {
       window = this.#windowFor(input.residentId);
     } catch (error) {
+      if (error instanceof ResidentHostLockError) {
+        return fail("writer-unavailable", error.message, error.remedy, input.residentId);
+      }
       return fail(
         "channel-unavailable",
         `窗开工失败：${(error as Error).message}`,
@@ -911,6 +920,9 @@ export class ResidentRuntime {
     try {
       window = this.#windowFor(input.residentId);
     } catch (error) {
+      if (error instanceof ResidentHostLockError) {
+        return fail("writer-unavailable", error.message, error.remedy, input.residentId);
+      }
       return fail(
         "breath-refused",
         `窗开工失败：${(error as Error).message}`,
@@ -998,6 +1010,9 @@ export class ResidentRuntime {
     try {
       window = this.#windowFor(input.residentId);
     } catch (error) {
+      if (error instanceof ResidentHostLockError) {
+        return fail("writer-unavailable", error.message, error.remedy, input.residentId);
+      }
       return fail(
         "breath-refused",
         `窗开工失败：${(error as Error).message}`,
@@ -1335,8 +1350,9 @@ export class ResidentRuntime {
 
   /**
    * 正常关闭（终端 `/exit`、stdin 结束、Ctrl-C 与宿主子进程 `stop` 都走这里）：先给本进程
-   * 每扇活窗落一笔「这一代暂停」（#234），再关唯一 writer。暂停记录写不成不挡关闭——那位
-   * 住户下次启动按猝死开新一代（#234 代价行：住户忘这一次）。重复调用是空操作。
+   * 每扇活窗落一笔「这一代暂停」（#234），再关唯一 writer，最后放掉本进程拿着的住户宿主锁。
+   * 暂停记录写不成不挡关闭——那位住户下次启动按猝死开新一代（#234 代价行：住户忘这一次）。
+   * 关闭之后不再开窗、不再拿锁。重复调用是空操作。
    */
   async close(): Promise<void> {
     if (this.#closed) return;
@@ -1344,7 +1360,11 @@ export class ResidentRuntime {
     try {
       this.#pauseActiveWindows();
     } finally {
-      await this.#writer.close();
+      try {
+        await this.#writer.close();
+      } finally {
+        this.#hostLocks.releaseAll();
+      }
     }
   }
 
@@ -1458,7 +1478,8 @@ export class ResidentRuntime {
   /**
    * 这位住户当前开工的窗与代际。三条路：本进程的活窗照用；认下的窗不在活窗表里（重启后）
    * 就先认领暂停记录，对得上接回同一代（#234 正常退出），对不上或没有就按同一 windowId
-   * 开下一代（D8 三猝死）；从没开过窗就开新窗。
+   * 开下一代（D8 三猝死）；从没开过窗就开新窗。后两条先拿住户宿主锁：这位住户正在另一个
+   * 活进程里打开就抛 `ResidentHostLockError`，什么都不开、不认领（D9 一流一写方）。
    */
   #windowFor(residentId: string): { windowId: string; generation: number } {
     const cachedId = this.#windows.get(residentId);
@@ -1474,6 +1495,8 @@ export class ResidentRuntime {
       }
       this.#windows.delete(residentId);
     }
+    // 跨进程一流一写方：别的活进程开着这位住户就到此为止，暂停记录也不碰。
+    this.#hostLocks.acquire(residentId);
     const knownId = this.#windowIndex[residentId];
     // 新代醒来信已在上下文里（MV-D04）：注入的是信时间线里的原件，不是转抄。
     const wakeContext = { letter: this.#letters.latest(residentId) };

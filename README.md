@@ -118,6 +118,9 @@ npm run resident -- --resident <residentId> --data-dir <dataDir>
 正常退出（`/exit`、stdin 结束、Ctrl+C）是暂停这扇窗：下次用同一数据目录启动，接着同一窗号、
 同一代，上一段对话照旧读回给模型。硬杀或崩溃不留暂停记录，下次启动照旧换下一代、不带旧流水
 （D8 三猝死）；退出时暂停记录没写成，下次也按猝死算，忘一次（[D33](docs/decisions.md)）。
+同一位住户同一时刻只能在一个终端或宿主进程里聊：另一个进程开着时，第二个会报
+writer-unavailable 并给出那边的 pid，先到那边 `/exit`；若确认没有别的 mist 进程在跑，按提示
+删掉 `<dataDir>/sessions/active/<residentId>.lock`。硬杀留下的锁下次启动会自动接管。
 
 这条接线不代表出信已满足全部 D8 语义：现役生成器对已有承诺缺 `ledgerSeq` 时会拒绝换代，
 固定模板的 intent 也不构成当刻亲笔的证据。真实 CLI 输入回归与底层判卷边界见

@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 /**
  * #194 住户运行时的单元测试：测试跟着功能走（仓规六）。
  *
@@ -1666,6 +1666,123 @@ describe("正常退出接回同一代（#234 主笔裁定 A）", () => {
     } finally {
       await second.close();
     }
+  });
+
+  /** 住户宿主锁的约定落点：`<dataDir>/sessions/active/<residentId>.lock`。 */
+  const lockPath = (dataDir: string, residentId: string): string =>
+    join(dataDir, "sessions", "active", `${residentId}.lock`);
+
+  it("开窗时拿住户宿主锁（0600、本进程 pid），close 放掉；关了再说话不再拿", async () => {
+    const dataDir = tempDir();
+    const runtime = pausable(dataDir);
+    runtimeProvision(runtime, "r-locked");
+    const path = lockPath(dataDir, "r-locked");
+    expect(existsSync(path)).toBe(false);
+    unwrap<TurnResult>(await runtime.say({ residentId: "r-locked", text: "开窗" }));
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+      schemaVersion: 1,
+      residentId: "r-locked",
+      pid: process.pid,
+      token: expect.any(String),
+      startedAt: expect.any(String),
+    });
+    await runtime.close();
+    expect(existsSync(path)).toBe(false);
+    expect(failureOf(await runtime.say({ residentId: "r-locked", text: "关了还说" })).code).toBe(
+      "writer-unavailable",
+    );
+    await runtime.close();
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it("另一个活进程拿着锁：说话、换气、改线都在调模型与写流之前拒成 writer-unavailable，暂停记录不碰；那个进程没了再起就接回同一代", async () => {
+    const { dataDir, turn, stream } = await pausedAfterOneTurn("r-busy");
+    const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+    });
+    const holderGone = new Promise<void>((resolve) => holder.once("exit", () => resolve()));
+    try {
+      const path = lockPath(dataDir, "r-busy");
+      mkdirSync(join(dataDir, "sessions", "active"), { recursive: true });
+      writeFileSync(
+        path,
+        JSON.stringify({
+          schemaVersion: 1,
+          residentId: "r-busy",
+          pid: holder.pid,
+          token: "elsewhere",
+          startedAt: "2026-10-17T00:00:00.000Z",
+        }),
+      );
+      const record = readFileSync(pausePath(dataDir, "r-busy"), "utf8");
+      const journal = journalOf(dataDir);
+      const rec = recorder();
+      const second = pausable(dataDir, rec.transport);
+      try {
+        const refused = await second.say({ residentId: "r-busy", text: "抢着说" });
+        if (refused.ok) throw new Error("锁在别的活进程手里竟然说成了");
+        expect(refused.error.code).toBe("writer-unavailable");
+        expect(refused.error.message).toContain(`pid ${String(holder.pid)}`);
+        expect(refused.error.remedy).toContain(path);
+        expect(failureOf(await second.breathe({ residentId: "r-busy", via: "new" })).code).toBe(
+          "writer-unavailable",
+        );
+        const threshold = second.setBreathThreshold({
+          residentId: "r-busy",
+          windowId: "w-busy",
+          generation: turn.generation,
+          thresholdTokens: 10,
+          authority: "owner",
+        });
+        expect(failureOf(threshold).code).toBe("writer-unavailable");
+        expect(rec.requests).toHaveLength(0);
+        expect(unwrap<StreamSnapshot>(second.readStream({ residentId: "r-busy" })).events).toEqual(
+          stream.events,
+        );
+        expect(readFileSync(pausePath(dataDir, "r-busy"), "utf8")).toBe(record);
+        expect(journalOf(dataDir)).toBe(journal);
+      } finally {
+        await second.close();
+      }
+      // 没拿到的锁，close 不放。
+      expect(JSON.parse(readFileSync(path, "utf8")).token).toBe("elsewhere");
+
+      holder.kill("SIGKILL");
+      await holderGone;
+      const after = recorder();
+      const third = pausable(dataDir, after.transport);
+      try {
+        const next = unwrap<TurnResult>(await third.say({ residentId: "r-busy", text: "轮到我" }));
+        expect(next.generation).toBe(turn.generation);
+        expect(after.requests[0]?.history).toEqual([
+          { role: "user", text: "暂停前那句" },
+          { role: "assistant", text: turn.reply },
+        ]);
+        expect(JSON.parse(readFileSync(path, "utf8")).pid).toBe(process.pid);
+      } finally {
+        await third.close();
+      }
+      expect(existsSync(path)).toBe(false);
+    } finally {
+      if (holder.exitCode === null && holder.signalCode === null) holder.kill("SIGKILL");
+    }
+  });
+
+  it("坏掉的锁当陈锁接管：照常开窗说话", async () => {
+    const dataDir = tempDir();
+    const runtime = pausable(dataDir);
+    runtimeProvision(runtime, "r-garbled-lock");
+    const path = lockPath(dataDir, "r-garbled-lock");
+    mkdirSync(join(dataDir, "sessions", "active"), { recursive: true });
+    writeFileSync(path, '{"pid": 1, "tok');
+    try {
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-garbled-lock", text: "照常" }));
+      expect(JSON.parse(readFileSync(path, "utf8")).pid).toBe(process.pid);
+    } finally {
+      await runtime.close();
+    }
+    expect(existsSync(path)).toBe(false);
   });
 
   it("接回的这一代暂停前已起过回合：窗照旧无权给自己改线（D8 一）", async () => {
