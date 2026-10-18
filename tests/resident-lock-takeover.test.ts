@@ -1,16 +1,18 @@
 /**
  * 住户宿主锁的确定性竞态与读失败（Grok 评审 #234 锁）：在 node:fs 的 rename / link /
- * readFileSync 上挂钩，把「三个进程抢同一把陈锁」和「判过之后锁路径变成目录」卡进挪走与
+ * readFileSync 上挂钩，把「三个进程抢同一把陈锁」和「判过之后锁路径变成目录或符号链接」卡进挪走与
  * 放回之间的空档，以及把锁文件读不出造出来。真进程的并发抢锁见 resident-lock.test.ts。
  */
 import type { PathLike } from "node:fs";
 import {
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -31,6 +33,8 @@ const hooks = vi.hoisted(() => ({
   readFails: null as ((path: string) => string | null) | null,
   /** 把旁名挪回锁路径的 rename 抛这个错误码。 */
   renameBackFails: null as string | null,
+  /** 把旁名放回锁路径（rename 或 link，源是旁名）真正执行之前跑一次（一次性）。 */
+  beforeAnyPutBack: null as (() => void) | null,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -43,6 +47,11 @@ vi.mock("node:fs", async (importOriginal) => {
       if (hooks.renameBackFails !== null && String(from).includes(".stale-")) {
         throw fail(hooks.renameBackFails);
       }
+      const putBack = hooks.beforeAnyPutBack;
+      if (putBack !== null && String(from).includes(".stale-")) {
+        hooks.beforeAnyPutBack = null;
+        putBack();
+      }
       const hook = hooks.beforeStaleRename;
       if (hook !== null && String(to).includes(".stale-")) {
         hooks.beforeStaleRename = null;
@@ -51,6 +60,11 @@ vi.mock("node:fs", async (importOriginal) => {
       actual.renameSync(from, to);
     },
     linkSync: (existing: PathLike, target: PathLike): void => {
+      const putBack = hooks.beforeAnyPutBack;
+      if (putBack !== null && String(existing).includes(".stale-")) {
+        hooks.beforeAnyPutBack = null;
+        putBack();
+      }
       const hook = hooks.onPutBack;
       if (hook !== null && String(existing).includes(".stale-")) {
         hooks.onPutBack = null;
@@ -73,6 +87,7 @@ afterEach(() => {
   hooks.onPutBack = null;
   hooks.readFails = null;
   hooks.renameBackFails = null;
+  hooks.beforeAnyPutBack = null;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -228,6 +243,46 @@ describe("ResidentHostLocks：判过陈锁之后锁路径变成非文件（绝�
     expect(refused.message).toContain("EXDEV");
     expect(refused.remedy).toContain(asidePath);
     expect(readFileSync(join(asidePath, "nested", "keep.txt"), "utf8")).toBe("别人的东西");
+  });
+});
+
+describe("ResidentHostLocks：判过陈锁之后锁路径变成符号链接（放回不换掉别人的锁）", () => {
+  function symlinkRacesIn(root: string, path: string): string {
+    const target = join(root, "elsewhere.txt");
+    writeFileSync(target, "链接指向的东西");
+    hooks.beforeStaleRename = () => {
+      rmSync(path);
+      symlinkSync(target, path);
+    };
+    return target;
+  }
+
+  it("没人插进来：符号链接原样放回，指向的东西不动；拒绝并说那不是 mist 的锁", () => {
+    const root = tempRoot();
+    const path = writeLock(root, { pid: DEAD_PID, token: "stale" });
+    const target = symlinkRacesIn(root, path);
+    const refused = refusalOf(() => new ResidentHostLocks(root).acquire("r-a"));
+    expect(lstatSync(path).isSymbolicLink()).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe("链接指向的东西");
+    expect(refused.message).toContain("不是 mist 锁");
+    expect(readdirSync(dirname(path))).toEqual(["r-a.lock"]);
+  });
+
+  it("放回前空档里有人建上新锁：那把锁不被换掉，符号链接留在旁名并报出来", () => {
+    const root = tempRoot();
+    const path = writeLock(root, { pid: DEAD_PID, token: "stale" });
+    const target = symlinkRacesIn(root, path);
+    const holder = new ResidentHostLocks(root);
+    hooks.beforeAnyPutBack = () => holder.acquire("r-a");
+    const refused = refusalOf(() => new ResidentHostLocks(root).acquire("r-a"));
+    expect(holder.stillHolds("r-a")).toBe(true);
+    expect(lstatSync(path).isFile()).toBe(true);
+    const asides = readdirSync(dirname(path)).filter((name) => name.includes(".stale-"));
+    expect(asides).toHaveLength(1);
+    const asidePath = join(dirname(path), asides[0] ?? "");
+    expect(lstatSync(asidePath).isSymbolicLink()).toBe(true);
+    expect(refused.message).toContain(asidePath);
+    expect(readFileSync(target, "utf8")).toBe("链接指向的东西");
   });
 });
 

@@ -19,7 +19,8 @@
  * 接管的几个进程只有一个 rename 得到），核对挪走的正是判过陈的那份（普通文件、读出来逐字
  * 相同；读不出不算相同），再按上面建锁；挪走的若是别人刚建的新锁就 link 放回认输，放回时出
  * EEXIST 以外的错就照实报错、不冒充「别人拿着」；挪走的若是判过之后才冒出来的非文件，原样
- * rename 回去，挪不回去就留在旁名并在报错里给出旁名。旁名只在 lstat 认得是普通文件时才删。
+ * 放回（目录 rename、其余 link，都换不掉空档里别人刚建的锁），放不回去就留在旁名并在报错里
+ * 给出旁名。旁名只在 lstat 认得是普通文件时才删。
  *
  * 两个进程同时起不会两边都拿到。文件路径上没有比较并交换，三个以上进程同时接管同一把陈锁
  * 时，挪走与放回之间的空档里可能有第三个进程建上新锁，把刚接管的那一边挤掉；被挤掉的持有者
@@ -331,14 +332,7 @@ export class ResidentHostLocks {
       return true;
     }
     if (!isRegularFile(aside)) {
-      try {
-        renameSync(aside, path);
-      } catch (error) {
-        throw new ResidentHostLockError(
-          `住户 ${residentId} 的锁路径上冒出来一个不是 mist 锁的东西，挪走后放不回去（${errorCode(error)}），现在在 ${aside}`,
-          `把 ${aside} 挪回 ${path} 或挪到别处，确认锁路径上没有不是 mist 锁的东西后重试`,
-        );
-      }
+      this.#putBackNonFile(residentId, path, aside);
       throw this.#notALock(residentId, path);
     }
     let putBackCode: string | null = null;
@@ -356,6 +350,32 @@ export class ResidentHostLocks {
       );
     }
     return false;
+  }
+
+  /**
+   * 把判过之后才冒出来的非文件原样放回，但绝不换掉空档里别人刚建上的锁：目录用 rename
+   * （目标是文件时 ENOTDIR、非空目录时 ENOTEMPTY；顶多换掉一个空目录，不丢东西），符号链接、
+   * fifo 等用 link
+   * （目标已在就 EEXIST）再删旁名。放不回去就留在旁名，报错里给出旁名。
+   */
+  #putBackNonFile(residentId: string, path: string, aside: string): void {
+    try {
+      if (lstatSync(aside).isDirectory()) {
+        renameSync(aside, path);
+        return;
+      }
+      linkSync(aside, path);
+    } catch (error) {
+      throw new ResidentHostLockError(
+        `住户 ${residentId} 的锁路径上冒出来一个不是 mist 锁的东西，挪走后放不回去（${errorCode(error)}），现在在 ${aside}`,
+        `把 ${aside} 挪回 ${path} 或挪到别处，确认锁路径上没有不是 mist 锁的东西后重试`,
+      );
+    }
+    try {
+      unlinkSync(aside);
+    } catch {
+      // 已经放回锁路径；旁名多留一个名字，不会被当成锁。
+    }
   }
 
   /** 从没拿到过这把锁的进程：提示到那边退出，或确认没人在跑后删锁重试。 */
