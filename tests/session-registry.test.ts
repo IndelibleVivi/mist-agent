@@ -344,3 +344,133 @@ describe("SessionRegistry：贯穿场景（A01/A02/A03/B01/B02/B03 一口咬住�
     expect(sessions.belongsToActiveWindow(receipt)).toBe(true);
   });
 });
+
+describe("SessionRegistry：接回暂停的那一代（#234）", () => {
+  function journal() {
+    const directory = mkdtempSync(join(tmpdir(), "mist-window-pause-"));
+    const archivePath = join(directory, "windows.jsonl");
+    return {
+      archivePath,
+      read: () => readFileSync(archivePath, "utf8"),
+      cleanup: () => rmSync(directory, { recursive: true, force: true }),
+    };
+  }
+  function identityOf(window: {
+    residentId: string;
+    windowId: string;
+    scopeId: string;
+    scopeGeneration: number;
+    generation: number;
+  }) {
+    const { residentId, windowId, scopeId, scopeGeneration, generation } = window;
+    return { residentId, windowId, scopeId, scopeGeneration, generation };
+  }
+
+  it("重启后原地接回 journal 里最新发出、未归档的那一代：不发新代号、不写 journal", () => {
+    const j = journal();
+    try {
+      const before = new SessionRegistry<string>({ archivePath: j.archivePath });
+      const opened = before.open("resident-a", { scopeId: "room-1", context: "old context" });
+      const written = j.read();
+
+      const after = new SessionRegistry<string>({ archivePath: j.archivePath });
+      const resumed = after.resumePaused(identityOf(opened), "wake context");
+
+      expect(resumed).toMatchObject({ ...identityOf(opened), headId: null });
+      expect(resumed?.context).toBe("wake context");
+      expect(after.isActive(opened.windowId)).toBe(true);
+      expect(after.isCurrentDispatchIdentity(identityOf(opened))).toBe(true);
+      expect(after.issueDispatch(opened.windowId).generation).toBe(1);
+      expect(j.read()).toBe(written);
+      // 接回的这一代之后再猝死，代号照旧从它往后发。
+      after.kill(opened.windowId);
+      expect(
+        after.open("resident-a", { windowId: opened.windowId, scopeId: "room-1", context: "" })
+          .generation,
+      ).toBe(2);
+    } finally {
+      j.cleanup();
+    }
+  });
+
+  it("代际不是这扇窗发过的最新一代：拒绝，什么都不改", () => {
+    const j = journal();
+    try {
+      const before = new SessionRegistry<null>({ archivePath: j.archivePath });
+      const first = before.open("resident-a", { context: null });
+      before.kill(first.windowId);
+      const second = before.open("resident-a", { windowId: first.windowId, context: null });
+      const written = j.read();
+
+      const after = new SessionRegistry<null>({ archivePath: j.archivePath });
+      expect(after.resumePaused(identityOf(first), null)).toBeNull();
+      expect(after.resumePaused({ ...identityOf(second), generation: 3 }, null)).toBeNull();
+      expect(after.isActive(first.windowId)).toBe(false);
+      expect(j.read()).toBe(written);
+      expect(after.resumePaused(identityOf(second), null)?.generation).toBe(2);
+    } finally {
+      j.cleanup();
+    }
+  });
+
+  it("已归档的窗不接回：关窗归档不是暂停", () => {
+    const j = journal();
+    try {
+      const before = new SessionRegistry<null>({ archivePath: j.archivePath });
+      const opened = before.open("resident-a", { context: null });
+      before.kill(opened.windowId);
+      const written = j.read();
+
+      const after = new SessionRegistry<null>({ archivePath: j.archivePath });
+      expect(after.resumePaused(identityOf(opened), null)).toBeNull();
+      expect(after.isArchived(opened.windowId)).toBe(true);
+      expect(after.isActive(opened.windowId)).toBe(false);
+      expect(j.read()).toBe(written);
+    } finally {
+      j.cleanup();
+    }
+  });
+
+  it("本进程里已经活着的窗不接回：同一进程不复活第二份，接回过的也不能再接", () => {
+    const j = journal();
+    try {
+      const live = new SessionRegistry<string>({ archivePath: j.archivePath });
+      const opened = live.open("resident-a", { context: "live" });
+      expect(live.resumePaused(identityOf(opened), "second copy")).toBeNull();
+      expect(live.get(opened.windowId)?.context).toBe("live");
+
+      const after = new SessionRegistry<string>({ archivePath: j.archivePath });
+      expect(after.resumePaused(identityOf(opened), "first")).not.toBeNull();
+      expect(after.resumePaused(identityOf(opened), "again")).toBeNull();
+      expect(after.get(opened.windowId)?.context).toBe("first");
+    } finally {
+      j.cleanup();
+    }
+  });
+
+  it("scope 退役或换了 scopeGeneration、住户或 scope 对不上：拒绝", () => {
+    const j = journal();
+    try {
+      const before = new SessionRegistry<null>({ archivePath: j.archivePath });
+      const opened = before.open("resident-a", { scopeId: "room-1", context: null });
+      const identity = identityOf(opened);
+
+      const mismatched = new SessionRegistry<null>({ archivePath: j.archivePath });
+      expect(mismatched.resumePaused({ ...identity, residentId: "resident-b" }, null)).toBeNull();
+      expect(mismatched.resumePaused({ ...identity, scopeId: "room-2" }, null)).toBeNull();
+      expect(mismatched.resumePaused({ ...identity, scopeGeneration: 2 }, null)).toBeNull();
+      expect(mismatched.isActive(opened.windowId)).toBe(false);
+
+      before.retireScope("resident-a", "room-1", 1);
+      const retired = new SessionRegistry<null>({ archivePath: j.archivePath });
+      expect(retired.resumePaused(identity, null)).toBeNull();
+      retired.activateScope("resident-a", "room-1");
+      const reactivated = new SessionRegistry<null>({ archivePath: j.archivePath });
+      expect(reactivated.getScope("resident-a", "room-1")?.scopeGeneration).toBe(2);
+      expect(reactivated.resumePaused(identity, null)).toBeNull();
+      expect(reactivated.isActive(opened.windowId)).toBe(false);
+    } finally {
+      j.cleanup();
+    }
+  });
+});

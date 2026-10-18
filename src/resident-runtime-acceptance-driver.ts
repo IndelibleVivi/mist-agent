@@ -18,8 +18,9 @@
  * RT-09（#234）：stopHost 走宿主的正常关闭（IPC `stop` → runtime.close()，与终端
  * `/exit`、stdin 结束同一条），只等子进程自己退出；raceHosts 在同一数据根上真并发另起
  * 两个子进程；ledgerAlignment 只读 residents/ 下认证账的落盘确认位；appendLedgerFact
- * 经宿主的 host.system() 入账。tamperPauseRecord 是明桩：现役代码还没有暂停记录可弄坏，
- * 施工落记录时一并实现并从 STUBBED 划掉。
+ * 经宿主的 host.system() 入账。tamperPauseRecord 是故障夹具：只在宿主停着时按
+ * `pause-records.ts` 给的真实路径把一位住户的暂停记录删掉、截断或换成别的窗，不实现
+ * 被判行为。
  */
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -52,12 +53,13 @@ import type {
   TuiTranscript,
   TurnResult,
 } from "../acceptance/resident-runtime-driver.ts";
+import { pauseRecordPath } from "./resident-runtime/pause-records.ts";
 
 /**
- * 判卷桩申报（清单「真灯与桩灯」）。只有 RT-09 的暂停记录故障夹具：现役代码没有暂停
- * 记录，夹具无物可弄坏，明桩抛错；其余调用均转发给真实宿主子进程。
+ * 判卷桩申报（清单「真灯与桩灯」）：空。RT-09 的暂停记录故障夹具随 #234 施工落地，
+ * 其余调用均转发给真实宿主子进程。
  */
-export const STUBBED: readonly string[] = ["tamperPauseRecord"];
+export const STUBBED: readonly string[] = [];
 
 const HOST_PROCESS = fileURLToPath(new URL("./resident-runtime/host-process.ts", import.meta.url));
 const READY_TIMEOUT_MS = 15_000;
@@ -248,15 +250,28 @@ class ResidentRuntimeProductionDriver implements ResidentRuntimeDriver {
 
   // —— 暂停记录与并发（RT-09，#234） ——
 
-  tamperPauseRecord(input: { residentId: string; fault: PauseRecordFault }): Promise<void> {
+  async tamperPauseRecord(input: { residentId: string; fault: PauseRecordFault }): Promise<void> {
     assertFixtureResidentId(input.residentId);
     if (this.#child !== null) {
-      return Promise.reject(new Error("tamperPauseRecord 只在宿主停着时用：先 stopHost"));
+      throw new Error("tamperPauseRecord 只在宿主停着时用：先 stopHost");
     }
-    return stub(
-      "tamperPauseRecord",
-      `现役代码没有暂停记录可弄坏（${input.residentId} / ${input.fault}）；#234 施工落暂停记录时一并实现`,
-    );
+    const path = pauseRecordPath(this.#dataDir, input.residentId);
+    if (!existsSync(path)) {
+      // 没有记录可弄坏就不是「坏记录」夹具：静默放过会让三种坏法塌成同一个「本来就没有」。
+      throw new Error(`${input.residentId} 没有暂停记录可弄坏——正常退出没给这位住户落记录`);
+    }
+    if (input.fault === "missing") {
+      rmSync(path);
+    } else if (input.fault === "garbled") {
+      const raw = readFileSync(path, "utf8");
+      writeFileSync(path, raw.slice(0, Math.floor(raw.length / 2)), "utf8");
+    } else {
+      // 记录完好可读、字段齐全，只是指向另一扇窗：不是这位住户这扇窗这一代的那笔。
+      const record = parseObjectFile(path);
+      const windowId = requireString(record.windowId, "pause record windowId");
+      const foreign = `${windowId.slice(0, -1)}${windowId.endsWith("0") ? "1" : "0"}`;
+      writeFileSync(path, JSON.stringify({ ...record, windowId: foreign }), "utf8");
+    }
   }
 
   async raceHosts(input: {
@@ -640,12 +655,6 @@ function callHost<T>(
       cleanup(error);
     });
   });
-}
-
-function stub<T>(method: string, plan: string): Promise<T> {
-  return Promise.reject(
-    new Error(`${method} 尚未接线（明桩，见 STUBBED）：${plan}。桩不冒充现成。`),
-  );
 }
 
 function waitForReady(child: ChildProcess, dataDir: string): Promise<HostDescriptor> {

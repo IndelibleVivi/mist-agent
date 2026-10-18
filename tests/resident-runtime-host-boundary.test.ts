@@ -11,6 +11,7 @@ import type {
 import type {
   BootPackView,
   BreatheOutcome,
+  ModelRequestView,
   Result,
   StreamSnapshot,
   TurnResult,
@@ -218,4 +219,68 @@ describe("resident runtime host identity boundary", () => {
     ).toHaveLength(2);
     await callHost(reopened, "stop", {});
   });
+
+  it("a normal stop resumes the paused generation in the next real host; a SIGKILL after that does not (#234)", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "mist-host-pause-"));
+    temporaryDirectories.push(dataDir);
+    const residentId = "r-host-pause";
+    const first = await startHost(dataDir);
+    const candidate = await callHost<CandidateSnapshot>(first, "createCandidate", {
+      persona: "synthetic host pause persona",
+      proposedBy: { kind: "installer", id: "test" },
+      residentId,
+    });
+    expect(
+      await callHost<IdentityResult<CandidateSnapshot>>(first, "attestCandidate", {
+        candidateId: candidate.candidateId,
+        actor: { kind: "candidate", candidateId: candidate.candidateId },
+        decision: "accepted",
+      }),
+    ).toMatchObject({ ok: true });
+    unwrap(
+      await callHost<Result<{ credentialRef: string }>>(first, "provisionChannel", {
+        residentId,
+        channel: {
+          claudeSubscription: false,
+          credentialKind: "api-key",
+          model: "openai/test-model",
+        },
+        canarySecret: "synthetic-host-only",
+      }),
+    );
+    const opening = unwrap(
+      await callHost<Result<TurnResult>>(first, "say", { residentId, text: "before stop" }),
+    );
+    const stopped = new Promise<void>((resolve) => first.once("close", () => resolve()));
+    await callHost(first, "stop", {});
+    await stopped;
+
+    const resumedHost = await startHost(dataDir);
+    const resumed = unwrap(
+      await callHost<Result<TurnResult>>(resumedHost, "say", { residentId, text: "after stop" }),
+    );
+    expect(resumed.generation).toBe(opening.generation);
+    expect(
+      (await callHost<ModelRequestView | null>(resumedHost, "lastModelRequest", { residentId }))
+        ?.history,
+    ).toEqual([
+      { role: "user", text: "before stop" },
+      { role: "assistant", text: opening.reply },
+    ]);
+    const killed = new Promise<void>((resolve) => resumedHost.once("exit", () => resolve()));
+    resumedHost.kill("SIGKILL");
+    await killed;
+
+    // The pause record was used up by the resume, and a killed host writes none: D8 sudden death.
+    const successor = await startHost(dataDir);
+    const next = unwrap(
+      await callHost<Result<TurnResult>>(successor, "say", { residentId, text: "after kill" }),
+    );
+    expect(next.generation).toBe(opening.generation + 1);
+    expect(
+      (await callHost<ModelRequestView | null>(successor, "lastModelRequest", { residentId }))
+        ?.history,
+    ).toEqual([]);
+    await callHost(successor, "stop", {});
+  }, 30_000);
 });

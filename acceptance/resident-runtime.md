@@ -306,6 +306,13 @@ TUI 的 ACK 故障回归从 `tui.submit()` 发出后续补账消息，再从 `/r
 接着同一代）」。它之前的正对照（第二句带上第一句、确认位随交付前进、`stopHost` 由子进程自己
 退出、暂停中确认位不变）在现役代码上都过，红不是判卷自己造的。
 
+**施工落下什么**（#234 施工，判卷文字不动）：`runtime.close()` 给每扇已完成初始交付的活窗
+落一笔 `sessions/paused/<residentId>.json`（0600，tmp→fsync→rename；初始事实还没交付的窗不落，
+写失败不拦关 writer）；下次启动在已知窗路径上用 rename 把记录挪成本进程专属名来认领，只此一次、
+认领后不论好坏都删；`SessionRegistry.resumePaused` 对照 journal 的窗身份、末代和 scope 代际，
+认证账 `resumeViewport` 对照落盘窗行的五元组重新认领、不挪 baseline；任一处对不上就照旧
+猝死换代（账不认时先把接回的窗归档）。驱动 `tamperPauseRecord` 已实现，`STUBBED` 清空。
+
 **驱动契约新增**（判卷仍只经契约观察，不 import `src/`）：
 
 - `stopHost()`：宿主正常关闭，与终端 `/exit`、stdin 结束走同一条路径（现役是
@@ -394,8 +401,8 @@ runtime、同时开窗，能稳定抓住两类错：两边都按启动时的盘�
 的 `uses` 清单对照申报名单：依赖桩方法跑绿的灯显示 🟡 桩灯——行为通过，但不计入完成。
 只有九盏**真绿**才算 RT-01～RT-09 全部交付。各包交付时从名单里划掉自己那几个方法，
 桩灯就地转真。隐瞒申报按伪证论，评审在 PR 里对照 TODO 标记查这份名单。
-现役申报只有 `tamperPauseRecord`（RT-09 暂停记录故障夹具）：现役代码没有暂停记录可弄坏，
-明桩抛错；#234 施工落下暂停记录时实现它并划掉，否则 RT-09 点不成真绿。
+现役申报为空：`tamperPauseRecord`（RT-09 暂停记录故障夹具）已由 #234 施工随暂停记录一起
+实现并划掉，RT-09 按真绿计。
 
 出处归结构（照 `acceptance/README.md` 三条边界第 2 条）：真实现必须住在 `src/` 自己的
 模块目录里，`src/resident-runtime-acceptance-driver.ts` 只准 import 和接线；在总装文件里

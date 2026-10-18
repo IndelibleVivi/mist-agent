@@ -5,8 +5,11 @@
  * 真源归 mist（D28 二）：一窗流的唯一 writer 是 `CanonicalStreamWriter`（D9，
  * 全仓唯一构造点在 window-host/window-history-host.ts 的 openCanonicalStreamWriter
  * 开把手上，本类经它拿句柄），启动包由 `buildBootPack` 从存储装配（RT-07 按定义判
- * 唯一），代际由 `SessionRegistry` 发（1 起点，宿主重启后代际递增——硬杀即猝死，
- * 继任者接代）。pi 只当零件库：模型走传输层（channels.ts），不持有会话副本。
+ * 唯一），代际由 `SessionRegistry` 发（1 起点）。正常退出（`close()`：终端 `/exit`、
+ * stdin 结束、Ctrl-C，宿主子进程 `stop`）给每扇活窗落一笔「这一代暂停」，下次启动对得上
+ * 就接着同一 windowId、同一代（#234 主笔裁定 A）；硬杀、崩溃，或暂停记录缺失、损坏、
+ * 对不上，宿主重启后代际递增——即猝死，继任者接代（D8 三）。pi 只当零件库：模型走
+ * 传输层（channels.ts），不持有会话副本。
  *
  * 失败纪律（RT-01）：凭证没配（credential-missing）与凭证失效（credential-invalid）
  * 机器可分、都带可操作 remedy；**往返失败不落账**——一窗流不许出现伪造回复，
@@ -90,6 +93,7 @@ import {
   resolveChannelRoute,
 } from "./channels.ts";
 import { CredentialStore } from "./credentials.ts";
+import { PauseRecordStore } from "./pause-records.ts";
 import { type TurnLedgerTarget, TurnReceiptStore, readTurnLedgerTarget } from "./turn-receipts.ts";
 
 const WINDOW_INDEX_SCHEMA = 1;
@@ -263,6 +267,9 @@ export class ResidentRuntime {
   readonly #turnQueues = new Map<string, Promise<unknown>>();
   readonly #windows = new Map<string, string>();
   #windowIndex: Record<string, string> = {};
+  /** 正常退出的「这一代暂停」记录（#234）：close() 写，开窗时认领一次即作废。 */
+  readonly #pauseRecords: PauseRecordStore;
+  #closed = false;
 
   constructor(options: ResidentRuntimeOptions) {
     if (options.ledger !== undefined && options.factLedger !== undefined) {
@@ -330,6 +337,7 @@ export class ResidentRuntime {
       now: () => new Date().toISOString(),
     });
     this.#windowIndexPath = join(dataDir, "sessions", "window-index.json");
+    this.#pauseRecords = new PauseRecordStore(dataDir);
     const restoredIndex = this.#readWindowIndex();
     this.#windowIndex = restoredIndex.windows;
     this.#publicWindowIndex = restoredIndex.publicWindows;
@@ -1325,8 +1333,45 @@ export class ResidentRuntime {
     };
   }
 
+  /**
+   * 正常关闭（终端 `/exit`、stdin 结束、Ctrl-C 与宿主子进程 `stop` 都走这里）：先给本进程
+   * 每扇活窗落一笔「这一代暂停」（#234），再关唯一 writer。暂停记录写不成不挡关闭——那位
+   * 住户下次启动按猝死开新一代（#234 代价行：住户忘这一次）。重复调用是空操作。
+   */
   async close(): Promise<void> {
-    await this.#writer.close();
+    if (this.#closed) return;
+    this.#closed = true;
+    try {
+      this.#pauseActiveWindows();
+    } finally {
+      await this.#writer.close();
+    }
+  }
+
+  /**
+   * 给每扇活窗落暂停记录。认证账的初始快照（pendingInitial）只在内存里：这一代还没交付
+   * 就暂停，接回后它再也送不到——这种窗不落记录，下次启动按新一代重新对齐（PR #98 口径）。
+   */
+  #pauseActiveWindows(): void {
+    const pausedAt = new Date().toISOString();
+    for (const windowId of this.#windows.values()) {
+      const window = this.#sessions.get(windowId);
+      if (window === undefined) continue;
+      const identity = {
+        residentId: window.residentId,
+        scopeId: window.scopeId,
+        scopeGeneration: window.scopeGeneration,
+        windowId: window.windowId,
+        generation: window.generation,
+      };
+      try {
+        const authority = this.#ledgerAuthority;
+        if (authority !== null && !authority.host.initialDelivered(identity)) continue;
+        this.#pauseRecords.write({ ...identity, pausedAt });
+      } catch {
+        // 写不成就是没有暂停记录：下次启动按 D8 三猝死开新一代（#234 代价行），不挡关闭。
+      }
+    }
   }
 
   // —— 认证权威事实账（#163 seam / MV-A05） ——
@@ -1410,6 +1455,11 @@ export class ResidentRuntime {
 
   // —— 窗口与代际（SessionRegistry 是代际真源） ——
 
+  /**
+   * 这位住户当前开工的窗与代际。三条路：本进程的活窗照用；认下的窗不在活窗表里（重启后）
+   * 就先认领暂停记录，对得上接回同一代（#234 正常退出），对不上或没有就按同一 windowId
+   * 开下一代（D8 三猝死）；从没开过窗就开新窗。
+   */
   #windowFor(residentId: string): { windowId: string; generation: number } {
     const cachedId = this.#windows.get(residentId);
     if (cachedId !== undefined) {
@@ -1428,8 +1478,12 @@ export class ResidentRuntime {
     // 新代醒来信已在上下文里（MV-D04）：注入的是信时间线里的原件，不是转抄。
     const wakeContext = { letter: this.#letters.latest(residentId) };
     if (knownId !== undefined) {
+      // 正常退出暂停的那一代：认领暂停记录（只用一次），对得上就原地接回（#234）。
+      const resumed = this.#resumePaused(residentId, knownId, wakeContext);
+      if (resumed !== null) return resumed;
       try {
-        // 同一 windowId 重开 = 新一代（宿主硬杀即猝死，继任者接代，D8 三）。
+        // 没有可用的暂停记录：同一 windowId 重开 = 新一代（硬杀、崩溃或暂停记录缺失、
+        // 损坏、对不上即猝死，继任者接代，D8 三）。
         const reopened = this.#sessions.open(residentId, {
           context: wakeContext,
           windowId: knownId,
@@ -1449,6 +1503,46 @@ export class ResidentRuntime {
     this.#saveWindowIndex();
     this.#registerLedgerViewport(residentId, opened.windowId);
     return { windowId: opened.windowId, generation: opened.generation };
+  }
+
+  /**
+   * 接回正常退出时暂停的那一代（#234 主笔裁定 A）。暂停记录先认领（原子 rename：只用一次，
+   * 两个进程同时起至多一边拿到），再逐项核对：记录里的窗就是这位住户认下的那扇；registry
+   * 认这一代是最新发出、未归档、scope 仍在；认证账认回同一身份那行确认位（不重登记）。
+   * 任何一步对不上返回 null，调用方照旧按猝死开新一代；账不认时先把接回的这代归档，
+   * 不留半接回的窗。
+   */
+  #resumePaused(
+    residentId: string,
+    knownId: string,
+    context: { letter: SealedLetter | null },
+  ): { windowId: string; generation: number } | null {
+    const record = this.#pauseRecords.claim(residentId);
+    if (record === null || record.windowId !== knownId) return null;
+    const resumed = this.#sessions.resumePaused(record, context);
+    if (resumed === null) return null;
+    const authority = this.#ledgerAuthority;
+    if (authority !== null) {
+      try {
+        authority.host.resumeViewport({
+          residentId: resumed.residentId,
+          scopeId: resumed.scopeId,
+          scopeGeneration: resumed.scopeGeneration,
+          windowId: resumed.windowId,
+          generation: resumed.generation,
+        });
+      } catch {
+        // 账不认这次接回：归档这一代，回到猝死那条路（新一代按当时现行有效集重新对齐）。
+        this.#sessions.kill(resumed.windowId);
+        return null;
+      }
+    }
+    this.#windows.set(residentId, resumed.windowId);
+    // D8 一：这一代暂停前已起过回合，接回后窗照旧无权给自己改线。
+    if (this.#flowOfGeneration(residentId, resumed.generation).length > 0) {
+      this.#turnStarted.add(`${resumed.windowId}#${resumed.generation}`);
+    }
+    return { windowId: resumed.windowId, generation: resumed.generation };
   }
 
   /** 活窗拿得到就拿，拿不到（被杀 / 被归档 / 未开过）返回 null——不在这层伪造活窗。 */
