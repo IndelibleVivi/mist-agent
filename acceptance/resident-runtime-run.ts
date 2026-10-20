@@ -1,10 +1,10 @@
 /**
- * #194（RT-01～RT-08）判卷程序。
+ * #194（RT-01～RT-09）判卷程序。
  *
  *   npm run acceptance:resident-runtime
  *   npm run acceptance:resident-runtime:strict
  *
- * 缺 `src/resident-runtime-acceptance-driver.ts` 时八盏全红，报告模式退出 0，
+ * 缺 `src/resident-runtime-acceptance-driver.ts` 时九盏全红，报告模式退出 0，
  * 严格模式退出 1。驱动文件存在但 import/导出损坏时直接抛错，不能伪装成起点状态。
  */
 import { existsSync } from "node:fs";

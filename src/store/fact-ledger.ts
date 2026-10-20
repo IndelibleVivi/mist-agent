@@ -144,6 +144,19 @@ export interface AuthenticatedFactWriter {
 /** Kept by trusted host assembly. The identity argument must come from authenticated ingress. */
 export interface AuthenticatedLedgerHost {
   registerViewport(identity: Omit<DispatchReceipt, "dispatchId">): number;
+  /**
+   * 正常退出后接回同一代时（#234），认回落盘里**同一身份**那行确认位，不重登记：
+   * baseline 不动、acked 不动、不冻新的初始快照，返回原 baseline。只认「行在、五元组
+   * 逐项相同、初始交付已完成、本进程还没登记过」；否则抛 LedgerAuthenticationError，
+   * 不留任何副作用。其余场景一律走 registerViewport。
+   */
+  resumeViewport(identity: Omit<DispatchReceipt, "dispatchId">): number;
+  /**
+   * 只读：这次激活（本进程登记的同一身份那行）的初始快照是否已经交付。没登记、
+   * 身份对不上、还挂着 pendingInitial 都是 false。宿主据此决定能不能落暂停记录——
+   * 初始快照不落盘，没交付就暂停，接回后它就再也送不到了。
+   */
+  initialDelivered(identity: Omit<DispatchReceipt, "dispatchId">): boolean;
   forDispatch(
     identity: { kind: "human" | "resident"; senderId: string },
     receipt: DispatchReceipt,
@@ -434,6 +447,40 @@ export class FactLedger {
         book.viewports.set(identity.windowId, row);
         registered.add(row);
         return baselineSeq;
+      },
+      resumeViewport(input) {
+        const identity = Object.freeze({
+          residentId: input.residentId,
+          scopeId: input.scopeId,
+          scopeGeneration: input.scopeGeneration,
+          windowId: input.windowId,
+          generation: input.generation,
+        });
+        if (!authority.isCurrentDispatchIdentity(identity))
+          throw new LedgerAuthenticationError("viewport resume is not current");
+        const row = ledger.#ledgers.get(identity.residentId)?.viewports.get(identity.windowId);
+        if (row === undefined || !sameIdentity(row.identity, identity))
+          throw new LedgerAuthenticationError(
+            "no persisted alignment of this exact activation to resume; register the viewport",
+          );
+        if (row.pendingInitial !== null)
+          throw new LedgerAuthenticationError(
+            "initial delivery of this activation is still pending; it cannot be resumed",
+          );
+        if (registered.has(row))
+          throw new LedgerAuthenticationError("viewport alignment is already registered");
+        // 认回原来那次激活：行本身一个字节不动、不落盘，只让本进程认它是已登记的。
+        registered.add(row);
+        return row.baselineSeq;
+      },
+      initialDelivered(identity) {
+        const row = ledger.#ledgers.get(identity.residentId)?.viewports.get(identity.windowId);
+        return (
+          row !== undefined &&
+          registered.has(row) &&
+          sameIdentity(row.identity, identity) &&
+          row.pendingInitial === null
+        );
       },
       forDispatch(identity, inputReceipt) {
         const receipt = Object.freeze({ ...inputReceipt });
@@ -941,6 +988,10 @@ export class FactLedger {
    * （2026-08-20 主笔在 PR #98 拍板）——进程重启后旧 active 窗不续接，
    * 新窗（新 ULID windowId）按当时 currentSet 重新完成一次初始对齐；
    * 与 D8 猝死语义一致（新代靠交接信 + 归档查询，不续旧窗）。
+   * 唯一的例外是正常退出后接回同一代（#234，2026-10-17 主笔裁定 A 改了这条口径）：
+   * 认证宿主经 `resumeViewport` 认回原来那行，baseline 不动、acked 只靠真实交付前进；
+   * 宿主只在初始快照已交付后才落暂停记录，所以接回时不缺这份快照。硬杀、崩溃照旧
+   * 按本段重新对齐。
    *
    * viewportId 对账是不透明字符串；它的发号（w_ + ULID）是宿主的事，不在这里校验。
    */
@@ -969,7 +1020,8 @@ export class FactLedger {
    * 这扇窗未交付的初始快照（开窗截面冻结的现行有效集）；已交付/已清理
    * 返回 null——「已交付」与「从来没有过」对调用方都是「不要注入」。
    * 恢复出的历史窗行同样返回 null：确认位落盘是历史轨迹，不承担初始交付
-   * （PR #98 拍板：旧 active 窗不续接，新窗重新对齐）。
+   * （PR #98 拍板：旧 active 窗不续接，新窗重新对齐；正常退出接回同一代是唯一例外，
+   * 见 openViewport 头注与 #234——那时初始快照早已交付，null 就是实情）。
    * 返回副本：改返回值涂改不了快照。
    */
   pendingInitial(residentId: string, viewportId: string): LedgerEntry[] | null {
@@ -1177,7 +1229,9 @@ export class FactLedger {
               // 初始快照不落盘，恢复出的窗行一律无 pending：确认位落盘是历史
               // 轨迹，不承担初始交付（2026-08-20 主笔在 PR #98 拍板——旧
               // active 窗不续接；新窗开窗时按当时 currentSet 重新冻结一份，
-              // 重新完成一次初始对齐，与 D8 猝死语义同向）。
+              // 重新完成一次初始对齐，与 D8 猝死语义同向）。正常退出接回同一代
+              // （#234）是唯一例外：宿主经 resumeViewport 认回这行，它的初始快照
+              // 在暂停前已交付，null 恰是实情。
               pendingInitial: null,
             },
           ]),

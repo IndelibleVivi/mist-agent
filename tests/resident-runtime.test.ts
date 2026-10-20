@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 /**
  * #194 住户运行时的单元测试：测试跟着功能走（仓规六）。
  *
@@ -9,6 +9,7 @@ import { spawnSync } from "node:child_process";
  */
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -28,7 +29,11 @@ import type {
   StreamSnapshot,
   TurnResult,
 } from "../acceptance/resident-runtime-driver.ts";
-import { type CanonicalEventDraft, CanonicalStreamStore } from "../src/one-stream/index.ts";
+import {
+  type CanonicalEventDraft,
+  CanonicalStreamStore,
+  CanonicalStreamWriter,
+} from "../src/one-stream/index.ts";
 import { ResidentIdentityStore } from "../src/resident-continuity/identity-store.ts";
 import { LetterStore } from "../src/resident-runtime/breath.ts";
 import {
@@ -43,6 +48,7 @@ import { CredentialStore } from "../src/resident-runtime/credentials.ts";
 import { renderSystemPrompt } from "../src/resident-runtime/pi-transport.ts";
 import { ResidentRuntime } from "../src/resident-runtime/runtime.ts";
 import { sealLetter } from "../src/session/handover-letter.ts";
+import { SessionRegistry } from "../src/session/session-registry.ts";
 import { FactLedger } from "../src/store/fact-ledger.ts";
 import { ResidentStore } from "../src/store/resident-store.ts";
 import { openCanonicalStreamWriter } from "../src/window-host/window-history-host.ts";
@@ -196,7 +202,7 @@ describe("住户运行时循环（RT-01 / RT-02）", () => {
     }
   });
 
-  it("跨进程重启同一条主流：旧事件逐条不变、只追加、同窗接代（代际递增）", async () => {
+  it("硬杀后重启同一条主流：旧事件逐条不变、只追加、同窗接代（代际递增）", async () => {
     const dataDir = tempDir();
     const first = new ResidentRuntime({ dataDir });
     try {
@@ -204,7 +210,7 @@ describe("住户运行时循环（RT-01 / RT-02）", () => {
       const turn1 = unwrap<TurnResult>(await first.say({ residentId: "r-b", text: "早安" }));
       expect(turn1.generation).toBe(1);
     } finally {
-      await first.close();
+      await closeLikeHardKill(first, dataDir);
     }
 
     const second = new ResidentRuntime({ dataDir });
@@ -1262,7 +1268,8 @@ describe("交接信随启动包进模型请求（D8 补记三：醒来即已读�
       );
       new LetterStore(join(dataDir, "letters")).append(sealed);
     } finally {
-      await first.close();
+      // 前代按硬杀结束（没有暂停记录，#234），继任者是下一代。
+      await closeLikeHardKill(first, dataDir);
     }
     const recorder = recordingTransport();
     const second = new ResidentRuntime({ dataDir, transport: recorder.transport });
@@ -1445,6 +1452,516 @@ describe("交接信随启动包进模型请求（D8 补记三：醒来即已读�
   });
 });
 
+describe("正常退出接回同一代（#234 主笔裁定 A）", () => {
+  /** 与终端、宿主子进程同一套装配：接认证权威事实账（assembly.ts 的口径）。 */
+  function pausable(
+    dataDir: string,
+    transport: ModelTransport = new SyntheticModelTransport(),
+  ): ResidentRuntime {
+    return new ResidentRuntime({
+      dataDir,
+      transport,
+      ledger: { dataDir: join(dataDir, "residents") },
+    });
+  }
+
+  function recorder(): { transport: ModelTransport; requests: ModelCompletionRequest[] } {
+    const requests: ModelCompletionRequest[] = [];
+    const upstream = new SyntheticModelTransport();
+    return {
+      transport: {
+        async *complete(request: ModelCompletionRequest): AsyncIterable<string> {
+          requests.push(request);
+          yield* upstream.complete(request);
+        },
+      },
+      requests,
+    };
+  }
+
+  /** 暂停记录的约定落点：`<dataDir>/sessions/paused/<residentId>.json`。 */
+  const pausePath = (dataDir: string, residentId: string): string =>
+    join(dataDir, "sessions", "paused", `${residentId}.json`);
+  const journalOf = (dataDir: string): string =>
+    readFileSync(join(dataDir, "sessions", "windows.journal"), "utf8");
+
+  async function pausedAfterOneTurn(residentId: string, dataDir = tempDir()) {
+    const first = pausable(dataDir);
+    runtimeProvision(first, residentId);
+    const turn = unwrap<TurnResult>(await first.say({ residentId, text: "暂停前那句" }));
+    const stream = unwrap<StreamSnapshot>(first.readStream({ residentId }));
+    await first.close();
+    return { dataDir, turn, stream };
+  }
+
+  it("正常退出给活窗落暂停记录：0600、只带这次激活的身份与时刻", async () => {
+    const { dataDir, turn } = await pausedAfterOneTurn("r-pause");
+    const path = pausePath(dataDir, "r-pause");
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    const viewport = new CanonicalStreamStore({ dataDir: join(dataDir, "streams") }).eventsAfter(
+      "r-pause",
+      0,
+    )[0]?.origin.viewport;
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+      schemaVersion: 1,
+      residentId: "r-pause",
+      windowId: viewport?.windowId,
+      scopeId: "private",
+      scopeGeneration: 1,
+      generation: turn.generation,
+      pausedAt: expect.any(String),
+    });
+  });
+
+  it("再启动接回同一窗同一代：上一段随请求进模型、流只追加、记录用掉即作废、窗账不长", async () => {
+    const { dataDir, turn, stream } = await pausedAfterOneTurn("r-resume");
+    const journal = journalOf(dataDir);
+    const rec = recorder();
+    const second = pausable(dataDir, rec.transport);
+    try {
+      const next = unwrap<TurnResult>(await second.say({ residentId: "r-resume", text: "接着说" }));
+      expect(next.generation).toBe(turn.generation);
+      expect(rec.requests[0]?.history).toEqual([
+        { role: "user", text: "暂停前那句" },
+        { role: "assistant", text: turn.reply },
+      ]);
+      const after = unwrap<StreamSnapshot>(second.readStream({ residentId: "r-resume" }));
+      expect(after.events).toHaveLength(4);
+      expect(after.events.slice(0, 2)).toEqual(stream.events);
+      expect(new Set(after.events.map((event) => event.streamSeq)).size).toBe(4);
+      expect(existsSync(pausePath(dataDir, "r-resume"))).toBe(false);
+      expect(journalOf(dataDir)).toBe(journal);
+    } finally {
+      await second.close();
+    }
+  });
+
+  it.each([
+    ["缺失", (_raw: string): string | null => null],
+    ["截断损坏", (raw: string): string | null => raw.slice(0, Math.floor(raw.length / 2))],
+    ["指向别的窗", (raw: string) => JSON.stringify({ ...JSON.parse(raw), windowId: "w_other" })],
+    ["代际对不上", (raw: string) => JSON.stringify({ ...JSON.parse(raw), generation: 2 })],
+    [
+      "scope 代际对不上",
+      (raw: string) => JSON.stringify({ ...JSON.parse(raw), scopeGeneration: 2 }),
+    ],
+    ["别的住户", (raw: string) => JSON.stringify({ ...JSON.parse(raw), residentId: "r-other" })],
+    ["多带字段", (raw: string) => JSON.stringify({ ...JSON.parse(raw), note: "x" })],
+  ])("暂停记录%s：一律按猝死开新一代，记录不留", async (_label, tamper) => {
+    const { dataDir, turn } = await pausedAfterOneTurn("r-tampered");
+    const path = pausePath(dataDir, "r-tampered");
+    const replaced = tamper(readFileSync(path, "utf8"));
+    if (replaced === null) rmSync(path);
+    else writeFileSync(path, replaced);
+    const rec = recorder();
+    const second = pausable(dataDir, rec.transport);
+    try {
+      const next = unwrap<TurnResult>(await second.say({ residentId: "r-tampered", text: "醒来" }));
+      expect(next.generation).toBe(turn.generation + 1);
+      expect(rec.requests[0]?.history).toEqual([]);
+      expect(existsSync(path)).toBe(false);
+    } finally {
+      await second.close();
+    }
+  });
+
+  it("初始快照还没交付就退出：不落暂停记录，下次启动按新一代重新对齐", async () => {
+    const dataDir = tempDir();
+    let upstreamDown = true;
+    const flaky: ModelTransport = {
+      async *complete(request: ModelCompletionRequest): AsyncIterable<string> {
+        if (upstreamDown) throw new Error("上游断了");
+        yield* new SyntheticModelTransport().complete(request);
+      },
+    };
+    const first = pausable(dataDir, flaky);
+    runtimeProvision(first, "r-pending");
+    first
+      .ledgerAuthority()
+      ?.host.system("runtime-test")
+      .append("r-pending", { kind: "active_rule", body: "开窗前的事实" }, "回归夹具");
+    // 窗开了、账登记了，但这一回合没交付：初始快照还挂在内存里。
+    expect(failureOf(await first.say({ residentId: "r-pending", text: "没说成" })).code).toBe(
+      "channel-unavailable",
+    );
+    await first.close();
+    expect(existsSync(pausePath(dataDir, "r-pending"))).toBe(false);
+
+    upstreamDown = false;
+    const rec = recorder();
+    const second = pausable(dataDir, rec.transport);
+    try {
+      const next = unwrap<TurnResult>(await second.say({ residentId: "r-pending", text: "再说" }));
+      expect(next.generation).toBe(2);
+      expect(rec.requests[0]?.bootPack.currentFacts?.map((fact) => fact.body)).toEqual([
+        "开窗前的事实",
+      ]);
+    } finally {
+      await second.close();
+    }
+  });
+
+  it("一位住户的暂停记录写不成：close 照样写完别的住户、关掉 writer，这位下次按猝死开新一代", async () => {
+    const dataDir = tempDir();
+    const first = pausable(dataDir);
+    for (const residentId of ["r-unwritable", "r-written"]) {
+      runtimeProvision(first, residentId);
+      unwrap<TurnResult>(await first.say({ residentId, text: "暂停前那句" }));
+    }
+    // 目标位置被一个目录占住：这位住户的原子 rename 必然失败。
+    mkdirSync(join(pausePath(dataDir, "r-unwritable"), "occupied"), { recursive: true });
+    const closing = vi.spyOn(CanonicalStreamWriter.prototype, "close");
+    await expect(first.close()).resolves.toBeUndefined();
+    expect(closing).toHaveBeenCalledTimes(1);
+    expect(failureOf(await first.say({ residentId: "r-written", text: "关了还说" })).code).toBe(
+      "writer-unavailable",
+    );
+    expect(statSync(pausePath(dataDir, "r-unwritable")).isDirectory()).toBe(true);
+    expect(statSync(pausePath(dataDir, "r-written")).isFile()).toBe(true);
+
+    const second = pausable(dataDir);
+    try {
+      const forgotten = unwrap<TurnResult>(
+        await second.say({ residentId: "r-unwritable", text: "醒来" }),
+      );
+      expect(forgotten.generation).toBe(2);
+      const resumed = unwrap<TurnResult>(
+        await second.say({ residentId: "r-written", text: "接着" }),
+      );
+      expect(resumed.generation).toBe(1);
+    } finally {
+      await second.close();
+    }
+  });
+
+  it("registry 认、认证账不认这一代：先归档接回的窗，再按猝死开新一代并重新对齐", async () => {
+    const { dataDir, turn } = await pausedAfterOneTurn("r-ledger-refuses");
+    // 账上那行确认位的身份改成别的一代：形状合法、能恢复，但对不上暂停记录。
+    const factsPath = join(dataDir, "residents", "r-ledger-refuses.facts.json");
+    const facts = JSON.parse(readFileSync(factsPath, "utf8")) as {
+      viewports: { identity: { generation: number } | null }[];
+    };
+    const row = facts.viewports[0];
+    if (row?.identity == null) throw new Error("夹具：认证账没有落下确认位身份");
+    row.identity.generation = turn.generation + 5;
+    writeFileSync(factsPath, JSON.stringify(facts));
+    const journal = journalOf(dataDir);
+    const rec = recorder();
+    const second = pausable(dataDir, rec.transport);
+    try {
+      const next = unwrap<TurnResult>(
+        await second.say({ residentId: "r-ledger-refuses", text: "醒来" }),
+      );
+      expect(next.generation).toBe(turn.generation + 1);
+      expect(rec.requests[0]?.history).toEqual([]);
+      expect(existsSync(pausePath(dataDir, "r-ledger-refuses"))).toBe(false);
+      const appended = journalOf(dataDir)
+        .slice(journal.length)
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { type: string; window: { generation: number } });
+      expect(appended.map((event) => [event.type, event.window.generation])).toEqual([
+        ["window_archived", turn.generation],
+        ["window_opened", turn.generation + 1],
+      ]);
+    } finally {
+      await second.close();
+    }
+  });
+
+  /** 住户宿主锁的约定落点：`<dataDir>/sessions/active/<residentId>.lock`。 */
+  const lockPath = (dataDir: string, residentId: string): string =>
+    join(dataDir, "sessions", "active", `${residentId}.lock`);
+
+  /** 一位住户在盘上留下的可变状态：流、窗账、换气配置、信与暂停记录，逐字快照。 */
+  function diskState(dataDir: string, residentId: string): Record<string, string | null> {
+    const read = (path: string): string | null =>
+      existsSync(path) ? readFileSync(path, "utf8") : null;
+    const letters = join(dataDir, "letters");
+    return {
+      stream: read(join(dataDir, "streams", `${residentId}.stream.json`)),
+      journal: read(join(dataDir, "sessions", "windows.journal")),
+      breath: read(join(dataDir, "sessions", "breath.json")),
+      paused: read(pausePath(dataDir, residentId)),
+      letters: existsSync(letters) ? readdirSync(letters).sort().join(",") : null,
+    };
+  }
+
+  it("开窗时拿住户宿主锁（0600、本进程 pid），close 放掉；关了以后说话、换气、改线都在调模型与写盘之前拒绝", async () => {
+    const dataDir = tempDir();
+    const rec = recorder();
+    const runtime = pausable(dataDir, rec.transport);
+    runtimeProvision(runtime, "r-locked");
+    const path = lockPath(dataDir, "r-locked");
+    expect(existsSync(path)).toBe(false);
+    const opened = unwrap<TurnResult>(await runtime.say({ residentId: "r-locked", text: "开窗" }));
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+      schemaVersion: 1,
+      residentId: "r-locked",
+      pid: process.pid,
+      token: expect.any(String),
+      startedAt: expect.any(String),
+    });
+    await runtime.close();
+    expect(existsSync(path)).toBe(false);
+    const before = diskState(dataDir, "r-locked");
+    const said = await runtime.say({ residentId: "r-locked", text: "关了还说" });
+    expect(failureOf(said).code).toBe("writer-unavailable");
+    if (said.ok) throw new Error("unreachable");
+    expect(said.error.message).toContain("已关闭");
+    expect(failureOf(await runtime.breathe({ residentId: "r-locked", via: "new" })).code).toBe(
+      "writer-unavailable",
+    );
+    for (const authority of ["window", "owner"] as const) {
+      const threshold = runtime.setBreathThreshold({
+        residentId: "r-locked",
+        windowId: "w-locked",
+        generation: opened.generation,
+        thresholdTokens: 10,
+        authority,
+      });
+      expect(failureOf(threshold).code).toBe("writer-unavailable");
+    }
+    expect(rec.requests).toHaveLength(1);
+    expect(diskState(dataDir, "r-locked")).toEqual(before);
+    await runtime.close();
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it("本进程拿着的锁被接管或删掉：下一回合开头就停下，说话、换气、改线都不调模型、不写盘，也不自己重建锁", async () => {
+    const dataDir = tempDir();
+    const rec = recorder();
+    const runtime = pausable(dataDir, rec.transport);
+    const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+    });
+    try {
+      runtimeProvision(runtime, "r-displaced");
+      const opened = unwrap<TurnResult>(
+        await runtime.say({ residentId: "r-displaced", text: "开窗" }),
+      );
+      const path = lockPath(dataDir, "r-displaced");
+      const displacer = JSON.stringify({
+        schemaVersion: 1,
+        residentId: "r-displaced",
+        pid: holder.pid,
+        token: "displacer",
+        startedAt: "2026-10-17T00:00:00.000Z",
+      });
+      for (const displace of [
+        () => writeFileSync(path, displacer),
+        () => rmSync(path, { force: true }),
+      ]) {
+        displace();
+        const before = diskState(dataDir, "r-displaced");
+        const lockBefore = existsSync(path) ? readFileSync(path, "utf8") : null;
+        const said = await runtime.say({ residentId: "r-displaced", text: "还在吗" });
+        if (said.ok) throw new Error("锁被挤掉后竟然说成了");
+        expect(said.error.code).toBe("writer-unavailable");
+        expect(said.error.message).toContain("已被接管或删除");
+        expect(said.error.remedy).toContain(path);
+        expect(
+          failureOf(await runtime.breathe({ residentId: "r-displaced", via: "new" })).code,
+        ).toBe("writer-unavailable");
+        const threshold = runtime.setBreathThreshold({
+          residentId: "r-displaced",
+          windowId: "w-displaced",
+          generation: opened.generation,
+          thresholdTokens: 10,
+          authority: "owner",
+        });
+        expect(failureOf(threshold).code).toBe("writer-unavailable");
+        expect(rec.requests).toHaveLength(1);
+        expect(diskState(dataDir, "r-displaced")).toEqual(before);
+        expect(existsSync(path) ? readFileSync(path, "utf8") : null).toBe(lockBefore);
+      }
+    } finally {
+      holder.kill("SIGKILL");
+      await runtime.close();
+    }
+  });
+
+  it("另一个活进程拿着锁：说话、换气、改线都在调模型与写流之前拒成 writer-unavailable，暂停记录不碰；那个进程没了再起就接回同一代", async () => {
+    const { dataDir, turn, stream } = await pausedAfterOneTurn("r-busy");
+    const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+    });
+    const holderGone = new Promise<void>((resolve) => holder.once("exit", () => resolve()));
+    try {
+      const path = lockPath(dataDir, "r-busy");
+      mkdirSync(join(dataDir, "sessions", "active"), { recursive: true });
+      writeFileSync(
+        path,
+        JSON.stringify({
+          schemaVersion: 1,
+          residentId: "r-busy",
+          pid: holder.pid,
+          token: "elsewhere",
+          startedAt: "2026-10-17T00:00:00.000Z",
+        }),
+      );
+      const record = readFileSync(pausePath(dataDir, "r-busy"), "utf8");
+      const journal = journalOf(dataDir);
+      const rec = recorder();
+      const second = pausable(dataDir, rec.transport);
+      try {
+        const refused = await second.say({ residentId: "r-busy", text: "抢着说" });
+        if (refused.ok) throw new Error("锁在别的活进程手里竟然说成了");
+        expect(refused.error.code).toBe("writer-unavailable");
+        expect(refused.error.message).toContain(`pid ${String(holder.pid)}`);
+        expect(refused.error.remedy).toContain(path);
+        expect(failureOf(await second.breathe({ residentId: "r-busy", via: "new" })).code).toBe(
+          "writer-unavailable",
+        );
+        const threshold = second.setBreathThreshold({
+          residentId: "r-busy",
+          windowId: "w-busy",
+          generation: turn.generation,
+          thresholdTokens: 10,
+          authority: "owner",
+        });
+        expect(failureOf(threshold).code).toBe("writer-unavailable");
+        expect(rec.requests).toHaveLength(0);
+        expect(unwrap<StreamSnapshot>(second.readStream({ residentId: "r-busy" })).events).toEqual(
+          stream.events,
+        );
+        expect(readFileSync(pausePath(dataDir, "r-busy"), "utf8")).toBe(record);
+        expect(journalOf(dataDir)).toBe(journal);
+      } finally {
+        await second.close();
+      }
+      // 没拿到的锁，close 不放。
+      expect(JSON.parse(readFileSync(path, "utf8")).token).toBe("elsewhere");
+
+      holder.kill("SIGKILL");
+      await holderGone;
+      const after = recorder();
+      const third = pausable(dataDir, after.transport);
+      try {
+        const next = unwrap<TurnResult>(await third.say({ residentId: "r-busy", text: "轮到我" }));
+        expect(next.generation).toBe(turn.generation);
+        expect(after.requests[0]?.history).toEqual([
+          { role: "user", text: "暂停前那句" },
+          { role: "assistant", text: turn.reply },
+        ]);
+        expect(JSON.parse(readFileSync(path, "utf8")).pid).toBe(process.pid);
+      } finally {
+        await third.close();
+      }
+      expect(existsSync(path)).toBe(false);
+    } finally {
+      if (holder.exitCode === null && holder.signalCode === null) holder.kill("SIGKILL");
+    }
+  });
+
+  it("坏掉的锁当陈锁接管：照常开窗说话", async () => {
+    const dataDir = tempDir();
+    const runtime = pausable(dataDir);
+    runtimeProvision(runtime, "r-garbled-lock");
+    const path = lockPath(dataDir, "r-garbled-lock");
+    mkdirSync(join(dataDir, "sessions", "active"), { recursive: true });
+    writeFileSync(path, '{"pid": 1, "tok');
+    try {
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-garbled-lock", text: "照常" }));
+      expect(JSON.parse(readFileSync(path, "utf8")).pid).toBe(process.pid);
+    } finally {
+      await runtime.close();
+    }
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it("被挤掉的持有者 close()：不落暂停记录，继任者的暂停记录逐字不动；锁还在手的住户照常落", async () => {
+    const dataDir = tempDir();
+    const displaced = pausable(dataDir);
+    for (const residentId of ["r-superseded", "r-still-mine"]) {
+      runtimeProvision(displaced, residentId);
+      unwrap<TurnResult>(await displaced.say({ residentId, text: "暂停前那句" }));
+    }
+    // 继任者接管了 r-superseded、跑到下一代、正常退出：落下自己的暂停记录，放掉锁。
+    const successorRecord = `${JSON.stringify({
+      schemaVersion: 1,
+      residentId: "r-superseded",
+      windowId: "w_successor",
+      scopeId: "private",
+      scopeGeneration: 1,
+      generation: 2,
+      pausedAt: "2026-10-18T00:00:00.000Z",
+    })}\n`;
+    mkdirSync(join(dataDir, "sessions", "paused"), { recursive: true });
+    writeFileSync(pausePath(dataDir, "r-superseded"), successorRecord);
+    rmSync(lockPath(dataDir, "r-superseded"));
+    await displaced.close();
+    expect(readFileSync(pausePath(dataDir, "r-superseded"), "utf8")).toBe(successorRecord);
+    expect(JSON.parse(readFileSync(pausePath(dataDir, "r-still-mine"), "utf8"))).toMatchObject({
+      residentId: "r-still-mine",
+      generation: 1,
+    });
+  });
+
+  it("被挤掉的持有者 suddenDeath：拒绝且什么都不写，继任者开出下一代后的 journal 照样回放得了", async () => {
+    const dataDir = tempDir();
+    const displaced = pausable(dataDir);
+    const successorProcess = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+    });
+    try {
+      runtimeProvision(displaced, "r-sudden");
+      unwrap<TurnResult>(await displaced.say({ residentId: "r-sudden", text: "第一代" }));
+      // 继任者接管锁，按同一窗号开出第 2 代（它那边的 registry 往同一份 journal 追加）。
+      writeFileSync(
+        lockPath(dataDir, "r-sudden"),
+        JSON.stringify({
+          schemaVersion: 1,
+          residentId: "r-sudden",
+          pid: successorProcess.pid,
+          token: "successor",
+          startedAt: "2026-10-18T00:00:00.000Z",
+        }),
+      );
+      const archivePath = join(dataDir, "sessions", "windows.journal");
+      const index = JSON.parse(
+        readFileSync(join(dataDir, "sessions", "window-index.json"), "utf8"),
+      ) as { windows: Record<string, string> };
+      const successor = new SessionRegistry<{ letter: null }>({ archivePath });
+      expect(
+        successor.open("r-sudden", {
+          context: { letter: null },
+          windowId: index.windows["r-sudden"] ?? "",
+        }).generation,
+      ).toBe(2);
+      const before = diskState(dataDir, "r-sudden");
+      await expect(displaced.suddenDeath({ residentId: "r-sudden" })).rejects.toThrow(
+        /已被接管或删除/,
+      );
+      expect(diskState(dataDir, "r-sudden")).toEqual(before);
+      expect(() => new SessionRegistry({ archivePath })).not.toThrow();
+    } finally {
+      successorProcess.kill("SIGKILL");
+      await displaced.close();
+    }
+  });
+
+  it("接回的这一代暂停前已起过回合：窗照旧无权给自己改线（D8 一）", async () => {
+    const { dataDir, turn } = await pausedAfterOneTurn("r-lock");
+    const second = pausable(dataDir);
+    try {
+      const refused = second.setBreathThreshold({
+        residentId: "r-lock",
+        windowId: "w-lock",
+        generation: turn.generation,
+        thresholdTokens: 10,
+        authority: "window",
+      });
+      if (refused.ok) throw new Error("接回后窗给自己改线竟然成功了");
+      expect(refused.error.code).toBe("breath-refused");
+      expect(refused.error.message).toContain("回合已起");
+    } finally {
+      await second.close();
+    }
+  });
+});
+
 function foreignDraft(): CanonicalEventDraft {
   // 形状照 messageDraft，role 故意写本层读不懂的 "system"（意见 4 的反对照夹具）。
   const actor = { kind: "viewport", id: "w-foreign" } as const;
@@ -1462,6 +1979,16 @@ function foreignDraft(): CanonicalEventDraft {
     artifactRef: null,
     payload: { role: "system", text: "x" },
   };
+}
+
+/**
+ * 进程内的「硬杀」：同一进程里旧 runtime 不 close 就开不出第二个 writer（WriterOwnershipError），
+ * 所以先 close 再删掉暂停记录——close() 落盘的只有暂停记录（#234），删掉后盘面与没走到
+ * close 的进程留下的一样。真进程 SIGKILL 见 resident-runtime-host-boundary.test.ts 与 RT-09。
+ */
+async function closeLikeHardKill(runtime: ResidentRuntime, dataDir: string): Promise<void> {
+  await runtime.close();
+  rmSync(join(dataDir, "sessions", "paused"), { recursive: true, force: true });
 }
 
 function activateResident(runtime: ResidentRuntime, residentId: string): void {

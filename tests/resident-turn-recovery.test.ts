@@ -137,6 +137,15 @@ async function failedAckTurn(f: Fixture, turnId?: string) {
   f.repairAck();
   return { request, failure };
 }
+/**
+ * In-process hard kill: a second runtime cannot open while the first writer is open, so close it
+ * and drop the pause record (#234). close() writes nothing else, so the data root then looks like
+ * one left by a process that never reached close(): the reopen is a new generation (D8).
+ */
+async function closeLikeHardKill(f: Fixture) {
+  await f.runtime.close();
+  rmSync(join(f.dataDir, "sessions", "paused"), { recursive: true, force: true });
+}
 function blockAssistantAfterUser(f: Fixture) {
   const original = CanonicalStreamStore.prototype.append;
   const blocker = join(f.dataDir, "streams", `${f.residentId}.stream.json.tmp`);
@@ -199,10 +208,10 @@ describe("Resident turn recovery", () => {
     expect(f.requests.filter((r) => r.text === request.text)).toHaveLength(1);
   });
 
-  it("close/reopen must retain the incomplete ledger distinction", async () => {
+  it("hard-kill reopen must retain the incomplete ledger distinction", async () => {
     const f = make(true, "r-ack-restart");
     const { request } = await failedAckTurn(f, "restart-turn");
-    await f.runtime.close();
+    await closeLikeHardKill(f);
     const reopened = f.open();
     const replay = await reopened.say(request);
     expect
@@ -310,7 +319,7 @@ describe("Resident turn recovery", () => {
     expect(stream(f).events).toHaveLength(2);
   });
 
-  it("close/reopen must not regenerate a conflicting user draft for an existing half turn", async () => {
+  it("hard-kill reopen must not regenerate a conflicting user draft for an existing half turn", async () => {
     const f = make(false, "r-half-restart");
     const repair = blockAssistantAfterUser(f);
     const request = { residentId: f.residentId, text: "half turn", turnId: "half-restart" };
@@ -318,7 +327,7 @@ describe("Resident turn recovery", () => {
     expect(first).toMatchObject({ ok: false, error: { code: "writer-unavailable" } });
     expect(stream(f).events).toHaveLength(1);
     repair();
-    await f.runtime.close();
+    await closeLikeHardKill(f);
     const reopened = f.open();
     const retried = await reopened.say(request);
     const retriedAgain = await reopened.say(request);

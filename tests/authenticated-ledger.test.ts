@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { MessageTreeService, MessageTreeStore } from "../src/message-tree/index.ts";
 import { SessionRegistry } from "../src/session/session-registry.ts";
 import { type TurnGateEvent, ViewportTurnGate } from "../src/session/turn-gate.ts";
-import { FactLedger } from "../src/store/fact-ledger.ts";
+import { FactLedger, LedgerAuthenticationError } from "../src/store/fact-ledger.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -321,5 +321,132 @@ describe("authenticated fact ledger", () => {
     }
     writeFileSync(file, raw);
     expect(new FactLedger({ dataDir: dir }).entries("resident")[0]).toEqual(original);
+  });
+});
+
+describe("authenticated fact ledger: resuming a paused activation (#234)", () => {
+  /** One process's view of a shared durable data root: window journal + ledger directory. */
+  function processOn(root: string) {
+    const sessions = new SessionRegistry<null>({ archivePath: join(root, "windows.journal") });
+    const { ledger, host } = FactLedger.createAuthenticated({
+      dataDir: join(root, "ledger"),
+      dispatchAuthority: sessions,
+    });
+    return { sessions, ledger, host };
+  }
+  function identityOf(window: {
+    residentId: string;
+    windowId: string;
+    scopeId: string;
+    scopeGeneration: number;
+    generation: number;
+  }) {
+    const { residentId, windowId, scopeId, scopeGeneration, generation } = window;
+    return { residentId, windowId, scopeId, scopeGeneration, generation };
+  }
+  /** First process: deliver the initial snapshot plus one fact, then leave a second fact undelivered. */
+  function pausedRoot() {
+    const root = mkdtempSync(join(tmpdir(), "mist-auth-ledger-pause-"));
+    dirs.push(root);
+    const first = processOn(root);
+    first.ledger.createLedger("resident");
+    first.host.system("host").append("resident", { kind: "ruling", body: "before" }, "seed");
+    const window = first.sessions.open("resident", { context: null });
+    const identity = identityOf(window);
+    first.host.registerViewport(identity);
+    first.host.system("host").append("resident", { kind: "ruling", body: "delivered" }, "seed");
+    const receipt = first.sessions.issueDispatch(window.windowId);
+    const delivery = first.host.prepareDelivery(receipt);
+    expect(delivery.initial.map((entry) => entry.body)).toEqual(["before"]);
+    delivery.commit(first.sessions.settleDispatch(receipt) as never);
+    first.host.system("host").append("resident", { kind: "ruling", body: "gap" }, "seed");
+    const file = join(root, "ledger", "resident.facts.json");
+    return { root, first, identity, file };
+  }
+
+  it("re-claims the persisted row of the same activation without moving baseline or acked", () => {
+    const { root, first, identity, file } = pausedRoot();
+    expect(first.host.initialDelivered(identity)).toBe(true);
+    expect(first.ledger.gap("resident", identity.windowId)).toEqual({ latestSeq: 3, ackedSeq: 2 });
+    const persisted = readFileSync(file, "utf8");
+
+    const second = processOn(root);
+    expect(second.sessions.resumePaused(identity, null)).not.toBeNull();
+    expect(second.host.initialDelivered(identity)).toBe(false);
+    expect(second.host.resumeViewport(identity)).toBe(1);
+    expect(readFileSync(file, "utf8")).toBe(persisted);
+    expect(second.host.initialDelivered(identity)).toBe(true);
+    // Registering the same identity again is the idempotent no-op it always was.
+    expect(second.host.registerViewport(identity)).toBe(1);
+
+    const receipt = second.sessions.issueDispatch(identity.windowId);
+    const delivery = second.host.prepareDelivery(receipt);
+    expect(delivery.initial).toEqual([]);
+    expect(delivery.entries.map((entry) => entry.body)).toEqual(["gap"]);
+    delivery.commit(second.sessions.settleDispatch(receipt) as never);
+    expect(second.ledger.gap("resident", identity.windowId)).toEqual({ latestSeq: 3, ackedSeq: 3 });
+    const row = (
+      JSON.parse(readFileSync(file, "utf8")) as {
+        viewports: { baselineSeq: number; ackedSeq: number }[];
+      }
+    ).viewports[0];
+    expect(row).toMatchObject({ baselineSeq: 1, ackedSeq: 3 });
+    expect(() => second.host.resumeViewport(identity)).toThrow(LedgerAuthenticationError);
+  });
+
+  it("refuses another generation of the same window without side effects", () => {
+    const { root, identity, file } = pausedRoot();
+    const persisted = readFileSync(file, "utf8");
+    const second = processOn(root);
+    // Not the current registry activation: refused before the ledger is consulted.
+    expect(() => second.host.resumeViewport(identity)).toThrow(LedgerAuthenticationError);
+    second.sessions.resumePaused(identity, null);
+    second.sessions.kill(identity.windowId);
+    const reopened = second.sessions.open("resident", {
+      windowId: identity.windowId,
+      context: null,
+    });
+    expect(reopened.generation).toBe(2);
+    // The persisted row belongs to generation 1: a generation-2 resume is refused.
+    expect(() => second.host.resumeViewport(identityOf(reopened))).toThrow(
+      /no persisted alignment of this exact activation/,
+    );
+    expect(readFileSync(file, "utf8")).toBe(persisted);
+    const receipt = second.sessions.issueDispatch(reopened.windowId);
+    expect(() => second.host.prepareDelivery(receipt)).toThrow(/register/);
+    expect(second.host.initialDelivered(identityOf(reopened))).toBe(false);
+  });
+
+  it("refuses an activation whose initial snapshot is still pending, and an already registered one", () => {
+    const root = mkdtempSync(join(tmpdir(), "mist-auth-ledger-pending-"));
+    dirs.push(root);
+    const live = processOn(root);
+    live.ledger.createLedger("resident");
+    live.host.system("host").append("resident", { kind: "ruling", body: "initial" }, "seed");
+    const window = live.sessions.open("resident", { context: null });
+    const identity = identityOf(window);
+    live.host.registerViewport(identity);
+    expect(live.host.initialDelivered(identity)).toBe(false);
+    expect(() => live.host.resumeViewport(identity)).toThrow(/initial delivery .* still pending/);
+    expect(live.ledger.pendingInitial("resident", window.windowId)).toHaveLength(1);
+
+    const receipt = live.sessions.issueDispatch(window.windowId);
+    const delivery = live.host.prepareDelivery(receipt);
+    expect(delivery.initial.map((entry) => entry.body)).toEqual(["initial"]);
+    delivery.commit(live.sessions.settleDispatch(receipt) as never);
+    expect(live.host.initialDelivered(identity)).toBe(true);
+    expect(() => live.host.resumeViewport(identity)).toThrow(/already registered/);
+  });
+
+  it("registerViewport keeps the PR #98 restart semantics: a restored row is realigned at latestSeq", () => {
+    const { root, identity } = pausedRoot();
+    const second = processOn(root);
+    second.sessions.resumePaused(identity, null);
+    expect(second.host.registerViewport(identity)).toBe(3);
+    expect(second.ledger.gap("resident", identity.windowId)).toEqual({ latestSeq: 3, ackedSeq: 3 });
+    expect(second.ledger.pendingInitial("resident", identity.windowId)?.map((e) => e.body)).toEqual(
+      ["before", "delivered", "gap"],
+    );
+    expect(() => second.host.resumeViewport(identity)).toThrow(/initial delivery/);
   });
 });
