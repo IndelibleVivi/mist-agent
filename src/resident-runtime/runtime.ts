@@ -5,8 +5,14 @@
  * 真源归 mist（D28 二）：一窗流的唯一 writer 是 `CanonicalStreamWriter`（D9，
  * 全仓唯一构造点在 window-host/window-history-host.ts 的 openCanonicalStreamWriter
  * 开把手上，本类经它拿句柄），启动包由 `buildBootPack` 从存储装配（RT-07 按定义判
- * 唯一），代际由 `SessionRegistry` 发（1 起点，宿主重启后代际递增——硬杀即猝死，
- * 继任者接代）。pi 只当零件库：模型走传输层（channels.ts），不持有会话副本。
+ * 唯一），代际由 `SessionRegistry` 发（1 起点）。正常退出（`close()`：终端 `/exit`、
+ * stdin 结束、Ctrl-C，宿主子进程 `stop`）给每扇活窗落一笔「这一代暂停」，下次启动对得上
+ * 就接着同一 windowId、同一代（#234 主笔裁定 A）；硬杀、崩溃，或暂停记录缺失、损坏、
+ * 对不上，宿主重启后代际递增——即猝死，继任者接代（D8 三）。一位住户同一时刻只在一个
+ * 宿主进程里开窗（`sessions/active/<residentId>.lock`，D9 一流一写方）：另一个活进程
+ * 开着、本进程的锁被接管或读不出，就在调模型、写流之前以 writer-unavailable 拒绝（每回合
+ * 开头核对令牌），硬杀留下的锁下次启动接管。pi 只当零件库：模型走
+ * 传输层（channels.ts），不持有会话副本。
  *
  * 失败纪律（RT-01）：凭证没配（credential-missing）与凭证失效（credential-invalid）
  * 机器可分、都带可操作 remedy；**往返失败不落账**——一窗流不许出现伪造回复，
@@ -91,6 +97,9 @@ import {
   resolveChannelRoute,
 } from "./channels.ts";
 import { CredentialStore } from "./credentials.ts";
+import { PauseRecordStore } from "./pause-records.ts";
+import { ResidentHostLockError, ResidentHostLocks } from "./resident-lock.ts";
+import { type TurnLedgerTarget, TurnReceiptStore, readTurnLedgerTarget } from "./turn-receipts.ts";
 import { TurnUsageLog, type TurnUsageView } from "./usage-log.ts";
 
 const WINDOW_INDEX_SCHEMA = 1;
@@ -167,6 +176,13 @@ function fail<T>(
   return { ok: false, error };
 }
 
+type TurnAnchorState =
+  | { kind: "complete"; result: TurnResult }
+  | { kind: "pending" }
+  | { kind: "partial"; windowId: string; generation: number; followed: boolean }
+  | { kind: "mismatch" }
+  | { kind: "open" };
+
 function identityFailure<T>(reason: ResidentIdentityFailureReason, referenceId: string): Result<T> {
   if (reason === "candidate-pending") {
     return fail(
@@ -216,6 +232,12 @@ export class ResidentRuntime {
   readonly #residentsDir: string;
   readonly #lettersDir: string;
   readonly #logsDir: string;
+  /**
+   * 原交付确认元数据：每户一份 `<residentId>.turns.json`，仅在真实 ACK 后发布。
+   * 不复制正文；正文与原 target 仍以唯一 writer 写入的 assistant 事件为准。
+   */
+  readonly #turnsDir: string;
+  readonly #turnReceipts: TurnReceiptStore;
   readonly #windowIndexPath: string;
   readonly #residents: ResidentStore;
   readonly #identities: ResidentIdentityStore;
@@ -253,6 +275,11 @@ export class ResidentRuntime {
   readonly #turnQueues = new Map<string, Promise<unknown>>();
   readonly #windows = new Map<string, string>();
   #windowIndex: Record<string, string> = {};
+  /** 正常退出的「这一代暂停」记录（#234）：close() 写，开窗时认领一次即作废。 */
+  readonly #pauseRecords: PauseRecordStore;
+  /** 跨进程的住户宿主锁（D9 一流一写方）：本进程第一次给住户开窗时拿，close() 放。 */
+  readonly #hostLocks: ResidentHostLocks;
+  #closed = false;
 
   constructor(options: ResidentRuntimeOptions) {
     if (options.ledger !== undefined && options.factLedger !== undefined) {
@@ -267,8 +294,11 @@ export class ResidentRuntime {
     this.#residentsDir = join(dataDir, "residents");
     this.#lettersDir = join(dataDir, "letters");
     this.#logsDir = join(dataDir, "logs");
+    this.#turnsDir = join(dataDir, "turns");
     mkdirSync(this.#streamsDir, { recursive: true });
     mkdirSync(this.#residentsDir, { recursive: true });
+    mkdirSync(this.#turnsDir, { recursive: true, mode: 0o700 });
+    this.#turnReceipts = new TurnReceiptStore(this.#turnsDir);
     this.#residents = new ResidentStore({ dataDir: this.#residentsDir });
     this.#identities = new ResidentIdentityStore({ dataDir: join(dataDir, "identities") });
     this.#streams = new CanonicalStreamStore({ dataDir: this.#streamsDir });
@@ -318,6 +348,8 @@ export class ResidentRuntime {
       now: () => new Date().toISOString(),
     });
     this.#windowIndexPath = join(dataDir, "sessions", "window-index.json");
+    this.#pauseRecords = new PauseRecordStore(dataDir);
+    this.#hostLocks = new ResidentHostLocks(dataDir);
     const restoredIndex = this.#readWindowIndex();
     this.#windowIndex = restoredIndex.windows;
     this.#publicWindowIndex = restoredIndex.publicWindows;
@@ -352,6 +384,11 @@ export class ResidentRuntime {
 
   inspectCandidate(candidateId: string): IdentityResult<CandidateSnapshot> {
     return this.#identities.inspectCandidate(candidateId);
+  }
+
+  /** 终端第一次启动用：按安装里写的住户号找最近一份候选（只读，不建不改）。 */
+  latestCandidateFor(requestedResidentId: string): CandidateSnapshot | null {
+    return this.#identities.latestCandidateFor(requestedResidentId);
   }
 
   requireActiveResident(referenceId: string): IdentityResult<ActiveResidentIdentity> {
@@ -403,10 +440,13 @@ export class ResidentRuntime {
    * 落账」全程占坑，后一个 say() 排队等前一回合落完账——回合不许拆散交错。
    */
   say(input: SayInput): Promise<Result<TurnResult>> {
-    if (input.text.trim().length === 0) return this.#runTurn(input);
-    const active = this.#identities.requireResident(input.residentId);
-    if (!active.ok) return Promise.resolve(identityFailure(active.reason, input.residentId));
-    return this.#enqueue(input.residentId, () => this.#runTurn(input));
+    const request = { ...input, turnId: input.turnId ?? randomUUID() };
+    const run = async (): Promise<Result<TurnResult>> => {
+      const result = await this.#runTurn(request);
+      return result.ok ? result : { ok: false, error: { ...result.error, turnId: request.turnId } };
+    };
+    if (input.text.trim().length === 0) return run();
+    return this.#enqueue(input.residentId, run);
   }
 
   #enqueue<T>(residentId: string, task: () => Promise<T>): Promise<T> {
@@ -422,7 +462,7 @@ export class ResidentRuntime {
     return run;
   }
 
-  async #runTurn(request: SayInput): Promise<Result<TurnResult>> {
+  async #runTurn(request: SayInput & { readonly turnId: string }): Promise<Result<TurnResult>> {
     if (request.text.trim().length === 0) {
       // runtime 层自己拦（评审意见 4）：IPC 层的形状检查不是实现的防线。
       // 归 channel-unavailable 是沿用本层先例（specFailure 也把输入不合法归这码）——
@@ -437,24 +477,55 @@ export class ResidentRuntime {
     const active = this.#identities.requireResident(request.residentId);
     if (!active.ok) return identityFailure(active.reason, request.residentId);
     const input = request;
-    const requestedTurnId = input.turnId;
-    const turnId = requestedTurnId ?? randomUUID();
-    if (requestedTurnId !== undefined) {
-      // 回执先行（验收席意见 3）：同一 turnId 的回合若已完成，直接返回已记录结果，
-      // 模型不再被调用第二次——重试的正确姿势是幂等读，不是再生成一遍然后撞
-      // 幂等冲突。回合没完成（user 已落、assistant 没落的半截）则同锚续跑，
-      // user 腿经幂等去重不写重。
-      const state = this.#turnState(input.residentId, requestedTurnId, input.text);
-      if (state.kind === "complete") return ok(state.result);
-      if (state.kind === "mismatch") {
-        // fail-closed（协助审查 1 / 验收席 5312646838）：turnId 复用于不同文本本来
-        // 就是调用方 bug，静默换锚会让重试越走越偏（每次重试都新开一回合、写重复
-        // 内容）。独立错误码机器可分于通道故障——不调模型、不落账，重复提交同一
-        // 冲突永远得到同一个结构化失败。
+    const turnId = input.turnId;
+    let state: TurnAnchorState;
+    try {
+      state = this.#turnState(input.residentId, turnId, input.text);
+    } catch (error) {
+      return fail(
+        "reconciliation-needed",
+        `回合确认材料读不出：${(error as Error).message}`,
+        "保留原 turnId 与正文，修复 turns/ 的确认记录或原 assistant 交付材料后重试；不要重新生成已落流回复",
+        input.residentId,
+      );
+    }
+    if (state.kind === "complete") return ok(state.result);
+    if (state.kind === "pending") {
+      return fail(
+        "reconciliation-needed",
+        "回复已落流，但原回合缺少合法的耐久确认依据",
+        "保留原 turnId；修复落盘故障后，由同一 scope/window/generation 的后续合法交付覆盖原 target，再回放。旧代或 legacy 缺材料须宿主协调；重试不调用模型",
+        input.residentId,
+      );
+    }
+    if (state.kind === "mismatch") {
+      // fail-closed（协助审查 1 / 验收席 5312646838）：turnId 复用于不同文本本来
+      // 就是调用方 bug，静默换锚会让重试越走越偏（每次重试都新开一回合、写重复
+      // 内容）。独立错误码机器可分于通道故障——不调模型、不落账，重复提交同一
+      // 冲突永远得到同一个结构化失败。
+      return fail(
+        "turn-id-conflict",
+        `turnId 已被另一条文本占用：${turnId}`,
+        "这个 turnId 记着别的文本——新消息换一个新 turnId 重发；若这是同一回合的重试，把原文照抄带回来",
+        input.residentId,
+      );
+    }
+    if (state.kind === "partial" && state.followed) {
+      return fail(
+        "reconciliation-needed",
+        "孤立 user 之后已有同窗同代事件，不能在流尾补写旧回复",
+        "保留原 turnId 和孤立 user，交给宿主协调；后续事件不改序，重试不再次调用模型",
+        input.residentId,
+      );
+    }
+    if (this.#ledgerAuthority !== null) {
+      try {
+        this.#turnReceipts.assertReadable(input.residentId);
+      } catch {
         return fail(
-          "turn-id-conflict",
-          `turnId 已被另一条文本占用：${requestedTurnId}`,
-          "这个 turnId 记着别的文本——新消息换一个新 turnId 重发；若这是同一回合的重试，把原文照抄带回来",
+          "writer-unavailable",
+          "回合确认存储损坏或不可读取，尚未调用模型",
+          "人工检查 turns/ 下本户确认文件及权限，并从可靠备份恢复损坏记录；不要覆盖或自动重建确认材料，修好后保留原锚重试",
           input.residentId,
         );
       }
@@ -489,10 +560,24 @@ export class ResidentRuntime {
     try {
       window = this.#windowFor(input.residentId);
     } catch (error) {
+      if (error instanceof ResidentHostLockError) {
+        return fail("writer-unavailable", error.message, error.remedy, input.residentId);
+      }
       return fail(
         "channel-unavailable",
         `窗开工失败：${(error as Error).message}`,
         "检查窗身份与代际账（sessions/windows.journal）是否完好，修复后重试",
+        input.residentId,
+      );
+    }
+    if (
+      state.kind === "partial" &&
+      (state.windowId !== window.windowId || state.generation !== window.generation)
+    ) {
+      return fail(
+        "reconciliation-needed",
+        "未完成回合属于旧窗或旧代，不能合法补写",
+        "原回复尚未耐久保存；保留 turnId 和孤立 user 记录，交给宿主协调。跨代重试不会再次调用模型或冒写旧代",
         input.residentId,
       );
     }
@@ -542,7 +627,7 @@ export class ResidentRuntime {
     // 当前一窗流上下文随请求进模型（验收席意见 1）：本代此前回合的 user/assistant
     // 消息按流序送进模型，第二轮起不是失忆的单轮调用。按**代界**划定（D8 三）：
     // 猝死那代的原始流水不自动进继任者上下文，接续靠交接信 + 归档查询。
-    const history = this.#streamHistory(input.residentId, window.generation);
+    const history = this.#streamHistory(input.residentId, window.generation, turnId);
     // 密钥原文只在这一刻解析、只进传输层；此后任何地方都不许再出现（RT-06）。
     // find 与 readSecret 之间的 revoke 窗口（验收席观察 A）也落成结构化失败，
     // 不许异常冲出 say()。
@@ -602,6 +687,19 @@ export class ResidentRuntime {
     if (!this.#streams.has(input.residentId)) {
       this.#streams.createStream(input.residentId);
     }
+    const ledgerTarget: TurnLedgerTarget | null =
+      ledgerTurn === null
+        ? null
+        : {
+            residentId: ledgerTurn.receipt.residentId,
+            scopeId: ledgerTurn.receipt.scopeId,
+            scopeGeneration: ledgerTurn.receipt.scopeGeneration,
+            windowId: ledgerTurn.receipt.windowId,
+            generation: ledgerTurn.receipt.generation,
+            dispatchId: ledgerTurn.receipt.dispatchId,
+            targetSeq: ledgerTurn.delivery.latestSeq,
+          };
+    let assistantReceipt: { eventId: string; streamSeq: number };
     try {
       await this.#writer.submit({
         residentId: input.residentId,
@@ -617,7 +715,7 @@ export class ResidentRuntime {
           turnId,
         }),
       });
-      await this.#writer.submit({
+      assistantReceipt = await this.#writer.submit({
         residentId: input.residentId,
         idempotencyKey: `say-assistant-${turnId}`,
         draft: messageDraft({
@@ -629,6 +727,7 @@ export class ResidentRuntime {
           turnId,
           streamed: chunks >= 2,
           model: route.model,
+          ledgerDelivery: ledgerTarget === null ? null : { ...ledgerTarget },
         }),
       });
     } catch (error) {
@@ -639,17 +738,47 @@ export class ResidentRuntime {
         input.residentId,
       );
     }
-    // 回复已交付且落流后确认账；必须在换代前消费旧代回执。
+    // 正文耐久后立即计入 D8；后续 ACK/确认落盘失败也不能漏计或跳过到线换气。
+    const config = this.#breathState.update(input.residentId, (state) => {
+      state.accumulated += estimateTokens(input.text);
+    });
+    let confirmationFailure: Extract<Result<TurnResult>, { ok: false }> | null = null;
+    // 回复已交付且落流后确认账；必须在换代前尝试消费原代回执。
     if (ledgerTurn !== null) {
       try {
         this.#settleAuthenticatedTurn(ledgerTurn);
       } catch (error) {
-        return fail(
-          "writer-unavailable",
-          `回复已落流，但事实账交付确认失败：${(error as Error).message}`,
-          "修复权威事实账的落盘目录后再说话；未确认的账缺口会在下一回合重新交付，已落流的回复保留",
-          input.residentId,
-        );
+        confirmationFailure = {
+          ok: false,
+          error: {
+            code: "writer-unavailable",
+            message: `回复已落流，但事实账交付确认失败：${(error as Error).message}`,
+            remedy:
+              "修复权威事实账的落盘目录后再说话；未确认的账缺口会在下一回合重新交付，已落流的回复保留",
+            residentId: input.residentId,
+          },
+        };
+      }
+      // ACK 耐久成功后才发布确认元数据；失败不能吞掉，否则成功结果无法跨重启证明。
+      try {
+        if (confirmationFailure === null && ledgerTarget !== null)
+          this.#turnReceipts.record(input.residentId, {
+            turnId,
+            assistantEventId: assistantReceipt.eventId,
+            streamSeq: assistantReceipt.streamSeq,
+            target: ledgerTarget,
+          });
+      } catch (error) {
+        confirmationFailure = {
+          ok: false,
+          error: {
+            code: "writer-unavailable",
+            message: `事实账已确认，但回合确认记录落盘失败：${(error as Error).message}`,
+            remedy:
+              "人工检查 turns/ 的写入权限与确认材料；原正文和 ACK 保留，同 turnId 重试不重新生成。同代后续合法交付可补确认依据，已换代则由宿主协调",
+            residentId: input.residentId,
+          },
+        };
       }
     }
     // 逐回合 usage 运行日志（#227 第 2 项）：回合已经落流+确认账，这里只把上游**成功
@@ -666,28 +795,29 @@ export class ResidentRuntime {
     });
     // 到线换气（D8 一）：本回合落账后按累积 token 判线，到线就亲笔写信换代。
     // 累积按 estimateTokens（handover-letter 的保守估算，同尺子量到底）。
-    const config = this.#breathState.update(input.residentId, (state) => {
-      state.accumulated += estimateTokens(input.text);
-    });
     if (config.accumulated >= config.current) {
       // 直呼内芯：#runTurn 本身就在住户级串行域里，再排队会自锁。
       const breathed = await this.#breatheNow({ residentId: input.residentId, via: "new" });
       if (!breathed.ok) {
         // 回合已完整落账，但到线没换成代——如实报换气的结构化失败，不粉饰。
         return fail(
-          breathed.error.code,
-          `回合到线但换气失败：${breathed.error.message}`,
-          breathed.error.remedy,
+          confirmationFailure?.error.code ?? breathed.error.code,
+          [confirmationFailure?.error.message, `回合到线但换气失败：${breathed.error.message}`]
+            .filter(Boolean)
+            .join("\n"),
+          [confirmationFailure?.error.remedy, breathed.error.remedy].filter(Boolean).join("\n"),
           input.residentId,
         );
       }
     }
+    if (confirmationFailure !== null) return confirmationFailure;
     return ok({
       residentId: input.residentId,
       model: route.model,
       generation: window.generation,
       reply,
       streamed: chunks >= 2,
+      turnId,
     });
   }
 
@@ -837,6 +967,9 @@ export class ResidentRuntime {
     try {
       window = this.#windowFor(input.residentId);
     } catch (error) {
+      if (error instanceof ResidentHostLockError) {
+        return fail("writer-unavailable", error.message, error.remedy, input.residentId);
+      }
       return fail(
         "breath-refused",
         `窗开工失败：${(error as Error).message}`,
@@ -924,6 +1057,9 @@ export class ResidentRuntime {
     try {
       window = this.#windowFor(input.residentId);
     } catch (error) {
+      if (error instanceof ResidentHostLockError) {
+        return fail("writer-unavailable", error.message, error.remedy, input.residentId);
+      }
       return fail(
         "breath-refused",
         `窗开工失败：${(error as Error).message}`,
@@ -1000,7 +1136,9 @@ export class ResidentRuntime {
   }
 
   /** 猝死：没来得及写信就杀（D8 三）。继任者下次 say 同窗接代，原始流水归档可查。
-   * 与 say()/breathe() 同一串行域：换代动作不插进回合中途。 */
+   * 与 say()/breathe() 同一串行域：换代动作不插进回合中途。写窗账与换气配置之前先过住户
+   * 宿主锁：别的进程拿着、本进程已被挤掉或已 close()，就以 `ResidentHostLockError` 拒绝
+   * （fail-closed，什么都不写）。 */
   suddenDeath(input: { residentId: string }): Promise<void> {
     return this.#enqueue(input.residentId, async () => {
       this.#suddenDeathNow(input);
@@ -1008,6 +1146,7 @@ export class ResidentRuntime {
   }
 
   #suddenDeathNow(input: { residentId: string }): void {
+    this.#hostLocks.acquire(input.residentId);
     const knownId = this.#windows.get(input.residentId) ?? this.#windowIndex[input.residentId];
     if (knownId !== undefined) {
       try {
@@ -1153,6 +1292,7 @@ export class ResidentRuntime {
       { surface: "stream", files: this.#filesUnder(this.#streamsDir, input.residentId) },
       { surface: "bootpack", files: this.#filesUnder(this.#residentsDir, input.residentId) },
       { surface: "letter", files: this.#filesUnder(this.#lettersDir, input.residentId) },
+      { surface: "turn-receipt", files: this.#filesUnder(this.#turnsDir, input.residentId) },
       { surface: "log", files: this.#filesUnder(this.#logsDir, null) },
     ];
     const hits: SecretHit[] = [];
@@ -1184,64 +1324,129 @@ export class ResidentRuntime {
   #streamHistory(
     residentId: string,
     generation: number,
+    excludeTurnId?: string,
   ): { role: "user" | "assistant"; text: string }[] {
     if (!this.#streams.has(residentId)) return [];
     return this.#streams
       .eventsAfter(residentId, 0)
       .filter((event) => event.origin.viewport?.generation === generation)
+      .filter((event) => event.payload.turnId !== excludeTurnId)
       .map(toStreamEventView)
       .map((view) => ({ role: view.kind, text: view.text }));
   }
 
-  /**
-   * 回执查询（验收席意见 3）：turnId 在一窗流里的落账状态。
-   * complete = user/assistant 两腿都落了、且 user 文本就是这句话 → 已记录结果可回放；
-   * mismatch = 锚被另一条文本占用 → fail-closed 报锚冲突（协助审查 1），不悄悄开新回合；
-   * open = 还没落账（含「user 落了、assistant 没落」的半截——同文本重试续跑补齐，
-   * 不同文本的重试被锚冲突拒绝，不再留新孤儿，协助审查 4）。
-   */
-  #turnState(
-    residentId: string,
-    turnId: string,
-    text: string,
-  ): { kind: "complete"; result: TurnResult } | { kind: "mismatch" } | { kind: "open" } {
+  /** 完成取原流与真实确认元数据；不从当前 latestSeq 或登记 baseline 推导。 */
+  #turnState(residentId: string, turnId: string, text: string): TurnAnchorState {
     if (!this.#streams.has(residentId)) return { kind: "open" };
-    let userText: string | null = null;
-    let assistant: { text: string; model: string; streamed: boolean; generation: number } | null =
-      null;
-    for (const event of this.#streams.eventsAfter(residentId, 0)) {
-      const payload = event.payload;
-      if (payload.turnId !== turnId) continue;
-      if (payload.role === "user" && typeof payload.text === "string") {
-        userText = payload.text;
-      }
-      if (payload.role === "assistant" && typeof payload.text === "string") {
-        assistant = {
-          text: payload.text,
-          model: typeof payload.model === "string" ? payload.model : "unknown",
-          streamed: payload.streamed === true,
-          generation: event.origin.viewport?.generation ?? 0,
-        };
-      }
-    }
-    if (assistant !== null && userText === text) {
+    const allEvents = this.#streams.eventsAfter(residentId, 0);
+    const events = allEvents.filter((event) => event.payload.turnId === turnId);
+    const user = events.find((event) => event.payload.role === "user");
+    const assistant = events.find((event) => event.payload.role === "assistant");
+    if (user !== undefined && user.payload.text !== text) return { kind: "mismatch" };
+    if (user === undefined) return { kind: "open" };
+    const origin = user.origin.viewport;
+    if (origin === null) throw new Error("turn user has no viewport identity");
+    if (assistant === undefined)
       return {
-        kind: "complete",
-        result: {
-          residentId,
-          model: assistant.model,
-          generation: assistant.generation,
-          reply: assistant.text,
-          streamed: assistant.streamed,
-        },
+        kind: "partial",
+        ...origin,
+        followed: allEvents.some(
+          (event) =>
+            event.streamSeq > user.streamSeq &&
+            event.origin.viewport?.windowId === origin.windowId &&
+            event.origin.viewport.generation === origin.generation,
+        ),
       };
+    if (
+      assistant.origin.viewport?.windowId !== origin.windowId ||
+      assistant.origin.viewport.generation !== origin.generation
+    )
+      throw new Error("turn legs belong to different windows");
+    const delivery = assistant.payload.ledgerDelivery;
+    if (delivery === undefined && this.#ledgerAuthority !== null) return { kind: "pending" };
+    if (delivery !== undefined && delivery !== null) {
+      const target = readTurnLedgerTarget(delivery);
+      if (
+        target.residentId !== residentId ||
+        target.windowId !== origin.windowId ||
+        target.generation !== origin.generation
+      ) {
+        throw new Error("turn delivery belongs to another identity");
+      }
+      if (
+        !this.#turnReceipts.confirms(
+          residentId,
+          turnId,
+          assistant.eventId,
+          assistant.streamSeq,
+          target,
+        )
+      )
+        return { kind: "pending" };
     }
-    if (userText !== null && userText !== text) return { kind: "mismatch" };
-    return { kind: "open" };
+    if (typeof assistant.payload.text !== "string") throw new Error("turn assistant has no reply");
+    return {
+      kind: "complete",
+      result: {
+        residentId,
+        turnId,
+        reply: assistant.payload.text,
+        model: typeof assistant.payload.model === "string" ? assistant.payload.model : "unknown",
+        generation: origin.generation,
+        streamed: assistant.payload.streamed === true,
+      },
+    };
   }
 
+  /**
+   * 正常关闭（终端 `/exit`、stdin 结束、Ctrl-C 与宿主子进程 `stop` 都走这里）：先给本进程
+   * 每扇活窗落一笔「这一代暂停」（#234），再关唯一 writer，最后放掉本进程拿着的住户宿主锁。
+   * 暂停记录写不成不挡关闭——那位住户下次启动按猝死开新一代（#234 代价行：住户忘这一次）。
+   * 一开头就停止认锁：关闭中与关闭后的说话、换气、改线都在调模型、写盘之前拒绝。
+   * 重复调用是空操作。
+   */
   async close(): Promise<void> {
-    await this.#writer.close();
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#hostLocks.close();
+    try {
+      this.#pauseActiveWindows();
+    } finally {
+      try {
+        await this.#writer.close();
+      } finally {
+        this.#hostLocks.releaseAll();
+      }
+    }
+  }
+
+  /**
+   * 给每扇活窗落暂停记录。认证账的初始快照（pendingInitial）只在内存里：这一代还没交付
+   * 就暂停，接回后它再也送不到——这种窗不落记录，下次启动按新一代重新对齐（PR #98 口径）。
+   * 锁已不是本进程的（被接管、被删、读不出）也不落：内存里那一代可能早被继任者接走，盖掉
+   * 继任者的暂停记录就是把它退回旧代。
+   */
+  #pauseActiveWindows(): void {
+    const pausedAt = new Date().toISOString();
+    for (const windowId of this.#windows.values()) {
+      const window = this.#sessions.get(windowId);
+      if (window === undefined) continue;
+      const identity = {
+        residentId: window.residentId,
+        scopeId: window.scopeId,
+        scopeGeneration: window.scopeGeneration,
+        windowId: window.windowId,
+        generation: window.generation,
+      };
+      try {
+        if (!this.#hostLocks.stillHolds(window.residentId)) continue;
+        const authority = this.#ledgerAuthority;
+        if (authority !== null && !authority.host.initialDelivered(identity)) continue;
+        this.#pauseRecords.write({ ...identity, pausedAt });
+      } catch {
+        // 写不成就是没有暂停记录：下次启动按 D8 三猝死开新一代（#234 代价行），不挡关闭。
+      }
+    }
   }
 
   // —— 认证权威事实账（#163 seam / MV-A05） ——
@@ -1325,7 +1530,15 @@ export class ResidentRuntime {
 
   // —— 窗口与代际（SessionRegistry 是代际真源） ——
 
+  /**
+   * 这位住户当前开工的窗与代际。三条路：本进程的活窗照用；认下的窗不在活窗表里（重启后）
+   * 就先认领暂停记录，对得上接回同一代（#234 正常退出），对不上或没有就按同一 windowId
+   * 开下一代（D8 三猝死）；从没开过窗就开新窗。三条路之前都先过住户宿主锁（D9 一流一写方）：
+   * 第一次拿锁，之后每次核对锁里还是本进程的令牌；别的活进程开着、锁被接管或删掉、锁读不出、
+   * 或本运行时已 close()，都抛 `ResidentHostLockError`，什么都不开、不认领、不调模型。
+   */
   #windowFor(residentId: string): { windowId: string; generation: number } {
+    this.#hostLocks.acquire(residentId);
     const cachedId = this.#windows.get(residentId);
     if (cachedId !== undefined) {
       const active = this.#activeWindow(cachedId);
@@ -1343,8 +1556,12 @@ export class ResidentRuntime {
     // 新代醒来信已在上下文里（MV-D04）：注入的是信时间线里的原件，不是转抄。
     const wakeContext = { letter: this.#letters.latest(residentId) };
     if (knownId !== undefined) {
+      // 正常退出暂停的那一代：认领暂停记录（只用一次），对得上就原地接回（#234）。
+      const resumed = this.#resumePaused(residentId, knownId, wakeContext);
+      if (resumed !== null) return resumed;
       try {
-        // 同一 windowId 重开 = 新一代（宿主硬杀即猝死，继任者接代，D8 三）。
+        // 没有可用的暂停记录：同一 windowId 重开 = 新一代（硬杀、崩溃或暂停记录缺失、
+        // 损坏、对不上即猝死，继任者接代，D8 三）。
         const reopened = this.#sessions.open(residentId, {
           context: wakeContext,
           windowId: knownId,
@@ -1364,6 +1581,46 @@ export class ResidentRuntime {
     this.#saveWindowIndex();
     this.#registerLedgerViewport(residentId, opened.windowId);
     return { windowId: opened.windowId, generation: opened.generation };
+  }
+
+  /**
+   * 接回正常退出时暂停的那一代（#234 主笔裁定 A）。暂停记录先认领（原子 rename：只用一次，
+   * 两个进程同时起至多一边拿到），再逐项核对：记录里的窗就是这位住户认下的那扇；registry
+   * 认这一代是最新发出、未归档、scope 仍在；认证账认回同一身份那行确认位（不重登记）。
+   * 任何一步对不上返回 null，调用方照旧按猝死开新一代；账不认时先把接回的这代归档，
+   * 不留半接回的窗。
+   */
+  #resumePaused(
+    residentId: string,
+    knownId: string,
+    context: { letter: SealedLetter | null },
+  ): { windowId: string; generation: number } | null {
+    const record = this.#pauseRecords.claim(residentId);
+    if (record === null || record.windowId !== knownId) return null;
+    const resumed = this.#sessions.resumePaused(record, context);
+    if (resumed === null) return null;
+    const authority = this.#ledgerAuthority;
+    if (authority !== null) {
+      try {
+        authority.host.resumeViewport({
+          residentId: resumed.residentId,
+          scopeId: resumed.scopeId,
+          scopeGeneration: resumed.scopeGeneration,
+          windowId: resumed.windowId,
+          generation: resumed.generation,
+        });
+      } catch {
+        // 账不认这次接回：归档这一代，回到猝死那条路（新一代按当时现行有效集重新对齐）。
+        this.#sessions.kill(resumed.windowId);
+        return null;
+      }
+    }
+    this.#windows.set(residentId, resumed.windowId);
+    // D8 一：这一代暂停前已起过回合，接回后窗照旧无权给自己改线。
+    if (this.#flowOfGeneration(residentId, resumed.generation).length > 0) {
+      this.#turnStarted.add(`${resumed.windowId}#${resumed.generation}`);
+    }
+    return { windowId: resumed.windowId, generation: resumed.generation };
   }
 
   /** 活窗拿得到就拿，拿不到（被杀 / 被归档 / 未开过）返回 null——不在这层伪造活窗。 */
@@ -1451,6 +1708,7 @@ interface MessageDraftInput {
   readonly streamed?: boolean;
   /** assistant 腿专有：回放时照实说当时走的哪个模型。 */
   readonly model?: string;
+  readonly ledgerDelivery?: JsonObject | null;
 }
 
 function messageDraft(input: MessageDraftInput): CanonicalEventDraft {
@@ -1465,7 +1723,11 @@ function messageDraft(input: MessageDraftInput): CanonicalEventDraft {
     text: input.text,
     turnId: input.turnId,
     ...(input.role === "assistant"
-      ? { streamed: input.streamed === true, model: input.model ?? "unknown" }
+      ? {
+          streamed: input.streamed === true,
+          model: input.model ?? "unknown",
+          ledgerDelivery: input.ledgerDelivery ?? null,
+        }
       : {}),
   };
   return {

@@ -49,6 +49,16 @@ mist 是一个个人 agent harness（建造中）。它的设计从一句话长�
 模型回复成功落流后、换代前确认（ack）；通道或落流失败不确认、缺口下轮重拉。装配口径见
 [docs/runtime-config.md](docs/runtime-config.md)。
 
+`say()` 成功与失败都返回本回合的 `turnId`；宿主保存它和原文，显式重试时原样带回。
+认证回合的完成必须有原交付的耐久确认依据，两条正文齐全还不够。回复已落流而 ACK
+或确认记录失败时，原回复保留；同锚重试报 `reconciliation-needed`，不再调用模型。
+认证新回合在调用模型前读取确认存储；文件损坏或不可读时停止，须人工检查权限或从可靠备份
+恢复，不自动覆盖。TUI 在回复后附上错误，重试等待协调时仍保留原回复。正文落流后立即计入
+D8，即使之后确认失败，到线仍尝试换代，旧代未确认回合则继续等待宿主协调。
+同一 scope/window/generation 的后续真实交付覆盖原 target 后，才可回放原回复；新代登记的
+baseline 不能替旧回合确认。完整行为与旧数据边界见
+[回合恢复补充回归](acceptance/resident-runtime.md#回合恢复补充回归)。
+
 换代后的模型请求随启动包携带该住户最新的交接信，pi 通道的 system prompt 保留标题、
 署名、写信时间和 commitment / fact / judgment 分档原文。没有信时照常对话；信档无法
 解析或条目结构无法读出时，在调用模型前报 `letter-invalid`。旧代原始对话保留在流水里，
@@ -58,7 +68,11 @@ mist 是一个个人 agent harness（建造中）。它的设计从一句话长�
 承诺、记忆和现行事实每轮从真源重读，放在历史之前，本轮用户输入仍在历史之后发送。
 材料不变时，上一轮输入保留为下一轮的消息前缀；材料变化会让该前缀失效一次。
 pi 使用稳定 cwd 和回合私有临时 session；session、prompt 与私有配置在结束、失败或取消后删除。
-子进程的自动 compaction 被关闭，prompt 前核实有效策略，遇到压缩事件则拒绝本轮；不改用户全局配置。
+私有配置只投影原 settings 的普通运行设置并去掉 `packages`，models.json 以原路径引用；
+`auth.json`、`trust.json`、`models-store.json` 及其他配置根状态不复制。因此 `pi install`
+装的 npm / git 包清单不会进入此根，避免每回合重新安装或克隆；项目信任与动态模型缓存也不随之
+继承。若项目 settings 原本会被加载并仍启用压缩，prompt 前会被拒绝。子进程的自动 compaction
+被关闭，遇到压缩事件也会拒绝本轮；不改用户全局配置。
 
 成功完成的聊天回合会向 `logs/<residentId>.usage.jsonl` 追加运行读数，默认合成通道的读数
 为未知。真实 pi 终态报告的 input、output、cacheRead、cacheWrite、totalTokens 与 costTotal
@@ -73,13 +87,14 @@ pi / bridge 可能用默认 0 表示未收到计数，因此报告的 0 不证�
 真实 pi 通道要求外部 `@earendil-works/pi-coding-agent` ≥0.86.1；所核 0.86.1 / 1.2.0 包要求
 Node ≥22.19，不随 Mist 安装。可用 `npm run verify:pi-wire -- /path/to/pi` 核实际请求：真实 pi 连接
 本机假 Anthropic 端点、使用合成 key，验证稳定前缀、最新上下文与长历史不压缩，不测真实缓存收益。
+探针会带 `packages` 设置且不设 `PI_OFFLINE`，用本地 npm/git 陷阱核零包管理器调用。
 Claude 订阅的 bridge 启动修复已从本项撤回，待 #232 路线决定后另件处理；本项不宣称 bridge
 真实往返或其磁盘历史已清理。配置边界见 [运行时配置](docs/runtime-config.md)。
 
 现状限制：交接信 `intent` 半仍是确定性装配，当刻亲笔（D8）按主笔
 排期单列；旧字符串承诺的确认/迁移工具另单，本运行时只做 fail-closed 拒绝并给出宿主 API
 入口，不做自动迁移。住户入住先经过 #182 的 candidate / self-attestation 生产闸，只有 active 身份物化 room 与账；
-通道配置不代签身份。setup 到聊天尚待桥接，#213 仅修诊断。
+通道配置不代签身份。装完到聊天怎么接，见下面[装完就能聊](#装完就能聊182)。
 
 ## 仓库地图
 
@@ -114,13 +129,27 @@ Claude 订阅的 bridge 启动修复已从本项撤回，待 #232 路线决定�
 npm run resident -- --resident <residentId> --data-dir <dataDir>
 ```
 
-默认使用合成传输；真实 pi 通道与所需凭证见 [runtime 配置](docs/runtime-config.md)。
-`npm run setup` 的安装快照尚未接到该入口，不能将上面命令作为 setup 后即能聊天的教程。
+带 `--resident` 时默认使用合成传输；真实 pi 通道与所需凭证见 [runtime 配置](docs/runtime-config.md)。
+从安装开始聊，用不带 `--resident` 的 `npm run resident`，见[装完就能聊](#装完就能聊182)。
 
 在聊天框输入 `/new`、`/clear` 或 `/compact`，都会请求现役 `breathe` 流程：
 先封缄并落盘交接信，再开始下一代；三个命令保留同一窗号和旧流水，不清空历史。
 命令本身不作为用户消息发给模型。成功时显示代际和信标题；失败时显示错误与处理建议，
-仍可继续输入普通文本。`/exit` 退出，Ctrl+C 关闭进程。
+仍可继续输入普通文本。`/retry` 复用当前 TUI 最近失败回合的锚、原文和显示行；后续普通
+回合成功仍保留该锚，原失败回合恢复成功才清除，后来的新失败则接替它。没有失败回合时
+显示错误。普通输入同一句话仍是新回合。这个重试入口只记当前 TUI 的失败锚。
+孤立 user 只有仍是同窗同代的尾部事件时可补写；中间已有别的事件就等待协调，避免把旧回复
+追加在后来回合之后。允许立即重试时，原 user 不会同时出现在历史与当前输入中。
+跨进程恢复由宿主保存的 `turnId` 发起。`/exit` 退出，Ctrl+C 关闭进程。
+
+正常退出（`/exit`、stdin 结束、Ctrl+C）是暂停这扇窗：下次用同一数据目录启动，接着同一窗号、
+同一代，上一段对话照旧读回给模型。硬杀或崩溃不留暂停记录，下次启动照旧换下一代、不带旧流水
+（D8 三猝死）；退出时暂停记录没写成，下次也按猝死算，忘一次（[D33](docs/decisions.md)）。
+同一位住户同一时刻只能在一个终端或宿主进程里聊：另一个进程开着时，第二个会报
+writer-unavailable 并给出那边的 pid，先到那边 `/exit`；若确认没有别的 mist 进程在跑，按提示
+删掉 `<dataDir>/sessions/active/<residentId>.lock`。硬杀留下的锁下次启动会自动接管。
+同一个数据目录别在同一刻起两个进程：认证账启动时用固定临时文件名重写账档，撞上时其中一个会在
+启动阶段报 ENOENT 退出（main 上就有的老问题，见 [D33](docs/decisions.md) 代价行），隔一下再起即可。
 
 这条接线不代表出信已满足全部 D8 语义：现役生成器对已有承诺缺 `ledgerSeq` 时会拒绝换代，
 固定模板的 intent 也不构成当刻亲笔的证据。真实 CLI 输入回归与底层判卷边界见
@@ -158,17 +187,43 @@ npm run resident -- --resident <residentId> --data-dir <dataDir>
 
 全量版带代价和推论，见 `docs/principles.md`。
 
-## 安装状态与终端入口的边界
+## 装完就能聊（#182）
 
-`npm run setup -- --resident <residentId> --data-dir <dataDir>` 保存安装器配置与私有凭证，
-通过 `current.json` 指向安装快照。`npm run resident -- --resident <residentId> --data-dir <dataDir>`
-读取另一个 runtime 凭证面与住户档案；当前尚未消费安装快照。因此 setup 成功后，
-即使使用同一个数据根，终端仍不能据此直接开始对话，重复 setup 也不会补齐 runtime 状态。
+终端经 pi 调模型，机器上要有 `pi` 命令（npm 包 `@earendil-works/pi-coding-agent`；旧名
+`@mariozechner/pi-coding-agent` 已停更）。然后：
 
-runtime 会明确显示这条边界，保留 `credential-missing` / `credential-invalid` /
-`resident-not-found` 的机器区分。已有宿主嵌入路径可通过 `provisionChannel()` 显式配置模型
-和通道；这不是终端首次入住的替代流程。完整交接还需接入 D22 的住户自认（[#182](https://github.com/mist-agent-harness/mist-agent/issues/182)）
-与明确的模型/provider 路由；安装器不能自动激活默认身份。隔离复现和验证范围见
+```bash
+npm run setup      # 存一把 API key（OpenRouter、Kimi Code、Claude、Codex、Grok 都行），前端选不装皮肤
+npm run resident   # 第一次：给人格稿、选模型，住户自己决定认不认，认了就进聊天
+```
+
+第一次启动依次做这几件事（`src/resident-runtime/onboarding.ts`）：
+
+1. 读当前安装（`current.json` 指向的快照）；没装过就提示先跑 setup，什么都不建。
+2. 人格稿由你递：`--persona <文件>`，或者按提示给路径。它只是候选（D22 一），mist 不预置默认人格。
+3. 选模型：`--model <provider/model>`，或者按提示写，比如 `openrouter/deepseek/deepseek-v4-flash`、
+   `kimi-coding/kimi-for-coding`。provider 要和安装里那把 key 是同一家。
+4. 把人格稿交给住户本人，请它第一行只写「认」或「不认」（「我认」「我不认」也算）。认了，住户
+   才成立；不认，记成拒绝，下次启动要换一份人格稿。这两种回答之后才把候选落账；没答清、模型
+   名写错或通道不通，什么都不记，下次启动重新递稿（可以换一份）。人和安装器都按不了这一步，
+   自认这一轮也不进一窗流。
+5. 认了以后，把安装里的 key 和选的模型配进 runtime 凭证面，接着进聊天。
+
+以后再启动直接进聊天。setup 里换了 key，下次启动会问一句用哪个模型（回车沿用原来的）：安装
+快照不记 key 是哪一家的，新 key 换了家就要写那一家的模型。`--model` 点名就不问，直接换。
+从安装启动时，没设 `MIST_RESIDENT_RUNTIME_TRANSPORT` 就走 pi。setup 存完打印的下一步命令总是带上这次的
+`--data-dir`，照着粘贴就不会被 `MIST_DATA_DIR` 带去别的安装。哪一步失败都会打出错误码和处理建议，比如人格稿读不了是
+`persona-invalid`，安装快照或 key 读不出来是 `install-unreadable`。
+
+现在的限制：主通道只接 API key，Claude 订阅和 Codex 订阅等 #232 定了住处再接；自认那一轮的
+回答只显示在终端，不另存档；runtime 凭证面里多存一份安装里的 key（同样是 0600 私有文件）。
+
+## 指名住户的老入口
+
+`npm run resident -- --resident <residentId> --data-dir <dataDir>` 不读安装，只读 runtime 凭证面
+与住户档案，留给已经由宿主经 `provisionChannel()` 配好通道的住户。这条入口照旧显示
+`credential-missing` / `credential-invalid` / `resident-not-found` 的机器区分，重复 setup
+不会补齐它的 runtime 状态。隔离复现和验证范围见
 [resident-runtime 安装边界](acceptance/resident-runtime.md#安装快照与-runtime-的边界)。
 
 终端还会先过 D22 住户自认这道身份闸：`--resident` 接受 candidateId 并在 CLI 边界

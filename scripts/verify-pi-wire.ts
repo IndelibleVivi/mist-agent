@@ -4,7 +4,7 @@
  * 验输入前缀和不压缩，不宣称真实 cache hit 或费用。公开 CI 不要求安装 pi。
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,6 +30,8 @@ function inputContent(value: unknown): unknown {
 const piBin = process.argv[2];
 if (piBin === undefined) throw new Error("Usage: npm run verify:pi-wire -- /path/to/pi");
 const dir = mkdtempSync(join(tmpdir(), "mist-pi-wire-"));
+const packageTrapDir = mkdtempSync(join(tmpdir(), "mist-pi-package-trap-"));
+const packageTrapLog = join(packageTrapDir, "attempts.log");
 const requests: WireRequest[] = [];
 const answer = "synthetic-wire-answer";
 const server = createServer(async (incoming, response) => {
@@ -77,11 +79,21 @@ try {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   assert(address !== null && typeof address !== "string");
+  for (const manager of ["npm", "git"]) {
+    const trap = join(packageTrapDir, manager);
+    writeFileSync(
+      trap,
+      `#!/bin/sh\nprintf '%s %s\\n' "$0" "$*" >> "$MIST_PACKAGE_TRAP_LOG"\nexit 42\n`,
+      { mode: 0o700 },
+    );
+    chmodSync(trap, 0o700);
+  }
   const settings = JSON.stringify({
     compaction: { enabled: true },
     enableAnalytics: false,
     enableInstallTelemetry: false,
     cacheWarming: "off",
+    packages: ["npm:pi-claude-bridge", "git:https://example.invalid/pi-extension.git"],
   });
   writeFileSync(join(dir, "settings.json"), settings, { mode: 0o600 });
   writeFileSync(
@@ -107,9 +119,16 @@ try {
     }),
     { mode: 0o600 },
   );
+  Reflect.deleteProperty(process.env, "PI_OFFLINE");
+  assert.equal(process.env.PI_OFFLINE, undefined);
+  const originalSettings = readFileSync(join(dir, "settings.json"), "utf8");
   const transport = new PiCliTransport({
     piBin,
-    extraEnv: { PI_CODING_AGENT_DIR: dir, PI_OFFLINE: "1" },
+    extraEnv: {
+      PI_CODING_AGENT_DIR: dir,
+      MIST_PACKAGE_TRAP_LOG: packageTrapLog,
+      PATH: `${packageTrapDir}:${process.env.PATH ?? ""}`,
+    },
     timeoutMs: 30000,
   });
   const request: ModelCompletionRequest = {
@@ -200,13 +219,18 @@ try {
   assert.equal(serialized.split("wire-long-current").length - 1, 1);
   assert.equal(
     readFileSync(join(dir, "settings.json"), "utf8"),
-    settings,
+    originalSettings,
     "original settings must remain unchanged",
   );
+  const packageManagerAttempts = existsSync(packageTrapLog)
+    ? readFileSync(packageTrapLog, "utf8").trim()
+    : "";
+  assert.equal(packageManagerAttempts, "", "settings packages must not reach the private root");
   process.stdout.write(
-    `${JSON.stringify({ ok: true, modelRequests: requests.length, stableFullSystem: true, previousInputIsMessagePrefix: true, updatedContext: true, longHistoryOriginalMessages: longHistory.length, summarizationRequests: 0, originalSettingsUnchanged: true })}\n`,
+    `${JSON.stringify({ ok: true, modelRequests: requests.length, packageManagerAttempts: 0, stableFullSystem: true, previousInputIsMessagePrefix: true, updatedContext: true, longHistoryOriginalMessages: longHistory.length, summarizationRequests: 0, originalSettingsUnchanged: true })}\n`,
   );
 } finally {
   await new Promise<void>((resolve) => server.close(() => resolve()));
   rmSync(dir, { recursive: true, force: true });
+  rmSync(packageTrapDir, { recursive: true, force: true });
 }

@@ -1,5 +1,5 @@
 /**
- * #194 RT-01～RT-07 的七盏可执行判卷。
+ * #194 RT-01～RT-09 的九盏可执行判卷。
  *
  * 清单真源：`acceptance/resident-runtime.md`。两边必须同步改，判卷以代码为准。
  *
@@ -19,13 +19,21 @@ import { fileURLToPath } from "node:url";
 import type {
   BootPackView,
   ChannelSpec,
+  ContendedTurn,
+  HostDescriptor,
   JsonValue,
+  LedgerAlignmentView,
+  LedgerViewportAlignmentView,
   LetterView,
+  ModelHistoryMessageView,
+  ModelRequestView,
+  PauseRecordFault,
   ResidentRuntimeCheck,
   ResidentRuntimeCheckResult,
   ResidentRuntimeDriver,
   StreamEventView,
   StreamSnapshot,
+  TurnResult,
 } from "./resident-runtime-driver.ts";
 import {
   WRITE_PATH_MARKERS,
@@ -226,6 +234,174 @@ export function buildBootPack(store, residentId) {
   return residentId;
 }
 `;
+
+// —— RT-09 的取证工具（#234：正常退出接回同一代） ——
+
+/** 一窗流事件与模型请求历史比同一形状：只比角色与正文，比字节、不判措辞。 */
+function eventsAsHistory(events: readonly StreamEventView[]): string {
+  return stableJson(events.map((event) => ({ role: event.kind, text: event.text })));
+}
+
+function historyShape(history: readonly ModelHistoryMessageView[]): string {
+  return stableJson(history.map((message) => ({ role: message.role, text: message.text })));
+}
+
+function alignmentFingerprint(view: LedgerAlignmentView): string {
+  return stableJson({
+    residentId: view.residentId,
+    latestSeq: view.latestSeq,
+    viewports: view.viewports.map((row) => ({
+      windowId: row.windowId,
+      generation: row.generation,
+      baselineSeq: row.baselineSeq,
+      ackedSeq: row.ackedSeq,
+    })),
+  });
+}
+
+const PAUSE_FAULT_LABEL: Readonly<Record<PauseRecordFault, string>> = {
+  missing: "缺失",
+  garbled: "损坏",
+  foreign: "身份对不上",
+};
+
+async function provisionOrFail(driver: ResidentRuntimeDriver, residentId: string): Promise<void> {
+  const provisioned = await driver.provisionChannel({
+    residentId,
+    channel: CHANNEL_A,
+    canarySecret: CANARY_SECRET,
+  });
+  if (!provisioned.ok) fatal(`给 ${residentId} 配通道失败：${provisioned.error.code}`);
+}
+
+async function sayOrFail(
+  driver: ResidentRuntimeDriver,
+  residentId: string,
+  text: string,
+  where: string,
+): Promise<TurnResult> {
+  const said = await driver.say({ residentId, text });
+  if (!said.ok) fatal(`${where}：say 失败：${said.error.code} ${said.error.message}`);
+  return said.value;
+}
+
+async function readOrFail(
+  driver: ResidentRuntimeDriver,
+  residentId: string,
+  where: string,
+): Promise<StreamSnapshot> {
+  const snapshot = await driver.readStream({ residentId });
+  if (!snapshot.ok) fatal(`${where}：读流失败：${snapshot.error.code}`);
+  return snapshot.value;
+}
+
+/** 观察口确实看到了**这一回合**的请求；看不到就是观察口空转，后面的历史断言判不了。 */
+async function requestOf(
+  driver: ResidentRuntimeDriver,
+  residentId: string,
+  text: string,
+  where: string,
+): Promise<ModelRequestView> {
+  const request = await driver.lastModelRequest({ residentId });
+  if (request === null) {
+    fatal(`${where}：观察口没看到这位住户的模型请求——观察口空转，历史断言判不了`);
+  }
+  expect(
+    request.residentId === residentId && request.text === text,
+    `${where}：观察口看到的不是这一回合的请求——观察的不是 transport 实际收到的那份`,
+  );
+  return request;
+}
+
+async function alignmentOf(
+  driver: ResidentRuntimeDriver,
+  residentId: string,
+  where: string,
+): Promise<LedgerAlignmentView> {
+  const view = await driver.ledgerAlignment({ residentId });
+  if (!view.ok) fatal(`${where}：读认证账确认位失败：${view.error.code} ${view.error.message}`);
+  expect(view.value.residentId === residentId, `${where}：确认位读成了别的住户的账`);
+  return view.value;
+}
+
+function onlyViewport(view: LedgerAlignmentView, where: string): LedgerViewportAlignmentView {
+  expect(
+    view.viewports.length === 1,
+    `${where}：认证账上有 ${view.viewports.length} 行窗确认位，应恰好 1 行——一位住户一扇窗`,
+  );
+  const row = view.viewports[0];
+  if (row === undefined) fatal(`${where}：认证账上没有窗确认位`);
+  return row;
+}
+
+function assertRestarted(before: HostDescriptor, after: HostDescriptor, where: string): void {
+  expect(after.pid !== before.pid, `${where}：pid 还是 ${after.pid}——没真的换进程`);
+  expect(after.bootId !== before.bootId, `${where}：bootId 没变——没真的换进程`);
+  expect(after.dataDir === before.dataDir, `${where}：换了落盘目录，读回的不是同一份底`);
+}
+
+/** 旧事件逐项不动，且只多了这一回合的 user→assistant 两条：不重写、不丢、不补。 */
+function assertGrewByOneTurn(
+  before: StreamSnapshot,
+  after: StreamSnapshot,
+  turn: { readonly text: string; readonly reply: string },
+  where: string,
+): void {
+  expect(
+    after.events.length === before.events.length + 2,
+    `${where}：一窗流从 ${before.events.length} 条变成 ${after.events.length} 条，应只多这一回合的 2 条——旧流水不许再写一遍，也不许丢`,
+  );
+  const old = snapshotFingerprint(before);
+  const now = snapshotFingerprint(after);
+  for (let index = 0; index < old.length; index += 1) {
+    expect(old[index] === now[index], `${where}：第 ${index} 条旧事件的指纹变了——换进程不许动流`);
+  }
+  const user = after.events[before.events.length];
+  const assistant = after.events[before.events.length + 1];
+  expect(
+    user?.kind === "user" &&
+      user.text === turn.text &&
+      assistant?.kind === "assistant" &&
+      assistant.text === turn.reply,
+    `${where}：新增的两条不是这一回合的 user→assistant`,
+  );
+}
+
+/**
+ * D8 三双面：死去那代的原始流水在归档里按代查得到（带着那条标记），且一条都没进继任者
+ * 的模型请求。拿归档当参照集，判的是「不自动进」，不是「历史必须为空」。
+ */
+async function assertNotCarried(
+  driver: ResidentRuntimeDriver,
+  input: {
+    readonly residentId: string;
+    readonly deadGeneration: number;
+    readonly marker: string;
+    readonly request: ModelRequestView;
+    readonly where: string;
+  },
+): Promise<StreamSnapshot> {
+  const archived = await driver.archivedTranscript({
+    residentId: input.residentId,
+    generation: input.deadGeneration,
+  });
+  if (!archived.ok) {
+    fatal(
+      `${input.where}：第 ${input.deadGeneration} 代的原始流水在归档里查不到：${archived.error.code}——D8 三要求原始流水进归档可查，不是无声消失`,
+    );
+  }
+  expect(
+    archived.value.events.some((event) => event.text.includes(input.marker)),
+    `${input.where}：归档里第 ${input.deadGeneration} 代没有那条标记——原始流水被丢了，不是「不自动进但可查」`,
+  );
+  const dead = new Set(archived.value.events.map((event) => event.text));
+  const carried = input.request.history.filter((message) => dead.has(message.text));
+  expect(
+    carried.length === 0,
+    `${input.where}：第 ${input.deadGeneration} 代有 ${carried.length} 条原始流水进了继任者的模型请求——D8 三：猝死不自动进继任者上下文`,
+  );
+  return archived.value;
+}
 
 export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
   {
@@ -1001,6 +1177,532 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
       } finally {
         rmSync(fixtureRoot, { recursive: true, force: true });
       }
+    },
+  },
+
+  {
+    id: "RT-08",
+    title: "恢复：缺确认不假绿，孤立 user 不跨代补写，重试不调模型也不添正文",
+    uses: [
+      "provisionChannel",
+      "say",
+      "readStream",
+      "modelInvocationCount",
+      "armTurnConfirmationWriteFault",
+      "repairTurnConfirmationWriteFault",
+      "crashAfterUserWrite",
+      "breathe",
+    ],
+    async run(driver) {
+      const PENDING = residentFor("RT-08-pending");
+      const ORPHAN = residentFor("RT-08-orphan");
+      for (const residentId of [PENDING, ORPHAN]) {
+        const provisioned = await driver.provisionChannel({
+          residentId,
+          channel: CHANNEL_A,
+          canarySecret: CANARY_SECRET,
+        });
+        if (!provisioned.ok) fatal(`给 ${residentId} 配通道失败：${provisioned.error.code}`);
+      }
+
+      // —— 缺确认不能把完整正文假报为成功；runtime 自造的锚须经 IPC 原样返回 ——
+      await driver.armTurnConfirmationWriteFault({ residentId: PENDING });
+      const pendingText = markerFor("RT-08", "pending");
+      const callsBeforeFailure = await driver.modelInvocationCount();
+      const failed = await driver.say({ residentId: PENDING, text: pendingText });
+      expect(!failed.ok, "确认记录写失败却返回成功——缺确认假绿");
+      if (failed.ok) fatal("确认记录写失败却返回成功");
+      expect(
+        failed.error.code === "writer-unavailable",
+        `确认记录写失败报 ${failed.error.code}，应为 writer-unavailable`,
+      );
+      const pendingTurnId = failed.error.turnId;
+      expect(
+        typeof pendingTurnId === "string" && pendingTurnId.length > 0,
+        "写后失败没有把 runtime 自造的 turnId 经 IPC 返回，调用方无法重试原回合",
+      );
+      if (pendingTurnId === undefined) fatal("写后失败缺 turnId");
+      const callsAfterFailure = await driver.modelInvocationCount();
+      expect(
+        callsAfterFailure === callsBeforeFailure + 1,
+        `故障正对照没有恰好调用一次模型：${callsBeforeFailure}→${callsAfterFailure}`,
+      );
+      const pendingStream = await driver.readStream({ residentId: PENDING });
+      if (!pendingStream.ok) fatal(`确认故障后读流失败：${pendingStream.error.code}`);
+      expect(
+        pendingStream.value.events.length === 2 &&
+          pendingStream.value.events[0]?.kind === "user" &&
+          pendingStream.value.events[1]?.kind === "assistant",
+        `确认故障正对照不是完整 user→assistant：${pendingStream.value.events.map((event) => event.kind).join("→")}`,
+      );
+
+      await driver.repairTurnConfirmationWriteFault({ residentId: PENDING });
+      const pendingBeforeRetry = snapshotFingerprint(pendingStream.value);
+      const retry = await driver.say({
+        residentId: PENDING,
+        text: pendingText,
+        turnId: pendingTurnId,
+      });
+      expect(!retry.ok, "缺确认的同锚重试假报成功");
+      if (retry.ok) fatal("缺确认的同锚重试假报成功");
+      expect(
+        retry.error.code === "reconciliation-needed" && retry.error.turnId === pendingTurnId,
+        `缺确认重试没有保留锚并报 reconciliation-needed：${retry.error.code}/${String(retry.error.turnId)}`,
+      );
+      const callsAfterRetry = await driver.modelInvocationCount();
+      expect(
+        callsAfterRetry === callsAfterFailure,
+        `缺确认重试又调了模型：${callsAfterFailure}→${callsAfterRetry}`,
+      );
+      const pendingAfterRetry = await driver.readStream({ residentId: PENDING });
+      if (!pendingAfterRetry.ok) fatal(`缺确认重试后读流失败：${pendingAfterRetry.error.code}`);
+      expect(
+        stableJson(pendingBeforeRetry) === stableJson(snapshotFingerprint(pendingAfterRetry.value)),
+        "缺确认重试改动了一窗流——零新正文没有成立",
+      );
+
+      // 后续真实交付覆盖原 target 后，旧锚只能回放；成功 TurnResult 仍须带原锚。
+      const later = await driver.say({
+        residentId: PENDING,
+        text: markerFor("RT-08", "later-delivery"),
+      });
+      if (!later.ok) fatal(`后续真实交付失败：${later.error.code}`);
+      expect(later.value.turnId.length > 0, "成功 TurnResult 没有必填 turnId");
+      const callsBeforeReplay = await driver.modelInvocationCount();
+      const streamBeforeReplay = await driver.readStream({ residentId: PENDING });
+      if (!streamBeforeReplay.ok) fatal(`回放前读流失败：${streamBeforeReplay.error.code}`);
+      const replay = await driver.say({
+        residentId: PENDING,
+        text: pendingText,
+        turnId: pendingTurnId,
+      });
+      if (!replay.ok) fatal(`后续交付覆盖后仍不能回放：${replay.error.code}`);
+      expect(replay.value.turnId === pendingTurnId, "成功回放没有原样返回 IPC 传入的 turnId");
+      expect((await driver.modelInvocationCount()) === callsBeforeReplay, "已确认回放又调用了模型");
+      const streamAfterReplay = await driver.readStream({ residentId: PENDING });
+      if (!streamAfterReplay.ok) fatal(`回放后读流失败：${streamAfterReplay.error.code}`);
+      expect(
+        stableJson(snapshotFingerprint(streamBeforeReplay.value)) ===
+          stableJson(snapshotFingerprint(streamAfterReplay.value)),
+        "已确认回放追加了正文",
+      );
+
+      // —— 真宿主死在 user 耐久之后：重启并换代，旧锚须在模型前 fail-closed ——
+      const orphanText = markerFor("RT-08", "orphan");
+      const orphanTurnId = markerFor("RT-08", "orphan-anchor");
+      const seeded = await driver.say({
+        residentId: ORPHAN,
+        text: orphanText,
+        turnId: orphanTurnId,
+      });
+      if (!seeded.ok) fatal(`孤立 user 夹具的正对照回合失败：${seeded.error.code}`);
+      expect(seeded.value.turnId === orphanTurnId, "显式 turnId 没经 IPC 原样回到 TurnResult");
+      await driver.crashAfterUserWrite({ residentId: ORPHAN, turnId: orphanTurnId });
+      const orphaned = await driver.readStream({ residentId: ORPHAN });
+      if (!orphaned.ok) fatal(`崩溃夹具后读流失败：${orphaned.error.code}`);
+      expect(
+        orphaned.value.events.length === 1 && orphaned.value.events[0]?.kind === "user",
+        `崩溃夹具没有留下恰一条孤立 user：${orphaned.value.events.map((event) => event.kind).join("→")}`,
+      );
+      const breathed = await driver.breathe({ residentId: ORPHAN, via: "new" });
+      if (!breathed.ok) fatal(`孤立 user 后换代失败：${breathed.error.code}`);
+      expect(
+        breathed.value.toGeneration === breathed.value.fromGeneration + 1,
+        "孤立 user 场景没有真的跨代",
+      );
+      const orphanBeforeRetry = snapshotFingerprint(orphaned.value);
+      const callsBeforeOrphanRetry = await driver.modelInvocationCount();
+      const refused = await driver.say({
+        residentId: ORPHAN,
+        text: orphanText,
+        turnId: orphanTurnId,
+      });
+      expect(!refused.ok, "跨代孤立 user 重试被当成新回合成功了");
+      if (refused.ok) fatal("跨代孤立 user 重试被当成新回合成功了");
+      expect(
+        refused.error.code === "reconciliation-needed" && refused.error.turnId === orphanTurnId,
+        `跨代孤立 user 没保留锚并报 reconciliation-needed：${refused.error.code}/${String(refused.error.turnId)}`,
+      );
+      expect(
+        (await driver.modelInvocationCount()) === callsBeforeOrphanRetry,
+        "跨代孤立 user 的拒绝发生在模型调用之后",
+      );
+      const orphanAfterRetry = await driver.readStream({ residentId: ORPHAN });
+      if (!orphanAfterRetry.ok) fatal(`跨代拒绝后读流失败：${orphanAfterRetry.error.code}`);
+      expect(
+        stableJson(orphanBeforeRetry) === stableJson(snapshotFingerprint(orphanAfterRetry.value)),
+        "跨代孤立 user 重试追加或改写了正文",
+      );
+
+      return pass(
+        `确认写失败落 user→assistant 且返回锚 ${pendingTurnId.slice(0, 12)}…；` +
+          `立即重试 ${retry.error.code}，模型调用与 2 条正文均不增；后续真实交付后原锚零调用回放；` +
+          `崩溃后恰 1 条孤立 user，跨 ${breathed.value.fromGeneration}→${breathed.value.toGeneration} 代重试在模型前拒绝且流逐项不变`,
+      );
+    },
+  },
+
+  {
+    id: "RT-09",
+    title: "暂停：正常退出接回同一代，硬杀与坏暂停记录照旧猝死，暂停记录只用一次",
+    uses: [
+      "provisionChannel",
+      "say",
+      "readStream",
+      "lastModelRequest",
+      "appendLedgerFact",
+      "ledgerAlignment",
+      "hostDescriptor",
+      "stopHost",
+      "startHost",
+      "killHost",
+      "archivedTranscript",
+      "tamperPauseRecord",
+      "raceHosts",
+    ],
+    async run(driver) {
+      // 每段场景各用自己的住户。stopHost / killHost 管的是整个宿主进程，里面的每位住户
+      // 一起暂停或一起猝死；暂停记录是在启动时一并接回还是第一句时才接回，属于施工
+      // 选择。所以任何「暂停中、还没接回」的住户都不跨一次硬杀再被判——判卷不替施工选。
+      const MAIN = residentFor("RT-09");
+      const KILLED = residentFor("RT-09-killed");
+      const CONTROL = residentFor("RT-09-control");
+      const TAMPERED = (["missing", "garbled", "foreign"] as const).map((fault) => ({
+        fault,
+        residentId: residentFor(`RT-09-${fault}`),
+      }));
+      const RACER = residentFor("RT-09-race");
+
+      // —— 一、退出前：同一进程里第二句看得到第一句（历史观察口的正对照） ——
+      await provisionOrFail(driver, MAIN);
+      const m1 = markerFor("RT-09", "m1");
+      const first = await sayOrFail(driver, MAIN, m1, "第一句");
+      const firstRequest = await requestOf(driver, MAIN, m1, "第一句");
+      expect(
+        firstRequest.history.length === 0,
+        `第一句的模型请求就带了 ${firstRequest.history.length} 条历史——这位住户还没说过话`,
+      );
+      const fact1 = await driver.appendLedgerFact({
+        residentId: MAIN,
+        body: markerFor("RT-09", "fact-1"),
+      });
+      if (!fact1.ok) fatal(`往认证账追加事实失败：${fact1.error.code} ${fact1.error.message}`);
+      const m2 = markerFor("RT-09", "m2");
+      const second = await sayOrFail(driver, MAIN, m2, "第二句");
+      expect(
+        second.generation === first.generation,
+        `同一进程里第二句落在第 ${second.generation} 代、第一句在第 ${first.generation} 代——还没退出就换了代，后面判不了「接着同一代」`,
+      );
+      const pausedGeneration = first.generation;
+      const beforeStop = await readOrFail(driver, MAIN, "退出前");
+      expect(
+        beforeStop.events.map((event) => event.kind).join("→") === "user→assistant→user→assistant",
+        `退出前一窗流是 ${beforeStop.events.map((event) => event.kind).join("→")}，应为两轮 user→assistant`,
+      );
+      const secondRequest = await requestOf(driver, MAIN, m2, "第二句");
+      expect(
+        historyShape(secondRequest.history) === eventsAsHistory(beforeStop.events.slice(0, 2)),
+        "同一进程里第二句的模型请求没逐条带上第一句的 user/assistant——历史观察口或本代历史本身不成立，后面「接回后带上上一段」判不了",
+      );
+
+      // 正对照：账上有一条窗还没确认到的事实，且这扇窗的 baseline 落在第一条事实之前——
+      // 不然「接回时按同一身份重新登记」与「接回原来那次激活」在确认位上长得一样。
+      const fact2 = await driver.appendLedgerFact({
+        residentId: MAIN,
+        body: markerFor("RT-09", "fact-2"),
+      });
+      if (!fact2.ok) fatal(`往认证账追加事实失败：${fact2.error.code} ${fact2.error.message}`);
+      const alignedBeforeStop = await alignmentOf(driver, MAIN, "退出前");
+      const rowBeforeStop = onlyViewport(alignedBeforeStop, "退出前");
+      expect(
+        rowBeforeStop.generation === pausedGeneration,
+        `退出前确认位绑在第 ${String(rowBeforeStop.generation)} 代，回合在第 ${pausedGeneration} 代——确认位没跟着窗登记`,
+      );
+      expect(
+        rowBeforeStop.ackedSeq === fact1.value.seq,
+        `第二句交付后确认位停在 ${rowBeforeStop.ackedSeq}，应确认到第一条事实 ${fact1.value.seq}——确认位不随真实交付前进，后面的确认位断言判不了`,
+      );
+      expect(
+        alignedBeforeStop.latestSeq === fact2.value.seq &&
+          rowBeforeStop.ackedSeq < alignedBeforeStop.latestSeq,
+        `退出前账尾是 ${alignedBeforeStop.latestSeq}、确认到 ${rowBeforeStop.ackedSeq}——第二条事实（${fact2.value.seq}）应还没交付，缺口不在`,
+      );
+      expect(
+        rowBeforeStop.baselineSeq < fact1.value.seq,
+        `退出前 baseline 已是 ${rowBeforeStop.baselineSeq}——开窗时账上就有第一条事实了，重登记挪不挪 baseline 看不出来`,
+      );
+
+      // —— 二、正常退出：走正常关闭路径、子进程自己退出；暂停本身不动确认位 ——
+      const hostBeforeStop = await driver.hostDescriptor();
+      await driver.stopHost();
+      const alignedWhilePaused = await alignmentOf(driver, MAIN, "暂停中");
+      expect(
+        alignmentFingerprint(alignedWhilePaused) === alignmentFingerprint(alignedBeforeStop),
+        "正常退出改了认证账的确认位——暂停不是交付，不许确认、也不许重登记任何东西",
+      );
+
+      // —— 三、再启动：换了进程，接着同一代（#234 第 1 条） ——
+      assertRestarted(hostBeforeStop, await driver.startHost(), "正常退出后再启动");
+      const m3 = markerFor("RT-09", "m3");
+      const resumed = await sayOrFail(driver, MAIN, m3, "正常退出后再启动");
+      expect(
+        resumed.generation === pausedGeneration,
+        `正常退出（stopHost）后再启动，回合落在第 ${resumed.generation} 代，退出前是第 ${pausedGeneration} 代——正常退出被当成猝死换了代（#234 裁定 A：暂停记录对得上就接着同一代）`,
+      );
+      const resumedRequest = await requestOf(driver, MAIN, m3, "接回后第一句");
+      expect(
+        historyShape(resumedRequest.history) === eventsAsHistory(beforeStop.events),
+        `接回同一代后模型请求带了 ${resumedRequest.history.length} 条历史，应逐条等于退出前那段的 ${beforeStop.events.length} 条 user/assistant——上一段没从一窗流读回，或读多、读重了`,
+      );
+      const afterResume = await readOrFail(driver, MAIN, "接回后");
+      assertGrewByOneTurn(beforeStop, afterResume, { text: m3, reply: resumed.reply }, "接回后");
+
+      // #234 第 5 条：接回的是原来那次激活——窗号、代际、baseline 都不动；acked 只经
+      // 这一回合的真实交付从原位前进到账尾（暂停前没交付的那条这时才交付）。
+      const alignedAfterResume = await alignmentOf(driver, MAIN, "接回后");
+      const rowAfterResume = onlyViewport(alignedAfterResume, "接回后");
+      expect(
+        rowAfterResume.windowId === rowBeforeStop.windowId,
+        `接回后窗号从 ${rowBeforeStop.windowId} 变成 ${rowAfterResume.windowId}——接的不是同一扇窗（新窗的第 1 代不是「同一代」）`,
+      );
+      expect(
+        rowAfterResume.generation === pausedGeneration,
+        `接回后确认位绑在第 ${String(rowAfterResume.generation)} 代，应仍是第 ${pausedGeneration} 代`,
+      );
+      expect(
+        rowAfterResume.baselineSeq === rowBeforeStop.baselineSeq,
+        `接回后确认位的 baseline 从 ${rowBeforeStop.baselineSeq} 挪到了 ${rowAfterResume.baselineSeq}——认证账把接回当成一次新激活重新登记了（#234 第 5 条：确认位不能被重登记成新一代）`,
+      );
+      expect(
+        rowAfterResume.ackedSeq === alignedAfterResume.latestSeq &&
+          alignedAfterResume.latestSeq === fact2.value.seq,
+        `接回后第一句交付完，确认位是 ${rowAfterResume.ackedSeq}、账尾是 ${alignedAfterResume.latestSeq}——暂停前那条缺口（第 ${fact2.value.seq} 条）没经接回的这次激活交付确认`,
+      );
+
+      // —— 四、硬杀照旧猝死（D8 三）；暂停记录只用一次 ——
+      await provisionOrFail(driver, KILLED);
+      const k1 = markerFor("RT-09", "k1");
+      const killedFirst = await sayOrFail(driver, KILLED, k1, "硬杀前");
+      const killedBefore = await readOrFail(driver, KILLED, "硬杀前");
+      const mainBeforeKill = await readOrFail(driver, MAIN, "硬杀前");
+      const hostBeforeKill = await driver.hostDescriptor();
+      await driver.killHost();
+      assertRestarted(hostBeforeKill, await driver.startHost(), "硬杀后再启动");
+
+      // 4a. 从没正常退出过的住户：没有暂停记录，开新一代，上一代原始流水不进模型请求。
+      const k2 = markerFor("RT-09", "k2");
+      const killedNext = await sayOrFail(driver, KILLED, k2, "硬杀后");
+      expect(
+        killedNext.generation > killedFirst.generation,
+        `硬杀（killHost）后再启动，回合仍落在第 ${killedNext.generation} 代——没有暂停记录也接着跑，硬杀被当成了正常退出（D8 三：猝死开新一代）`,
+      );
+      await assertNotCarried(driver, {
+        residentId: KILLED,
+        deadGeneration: killedFirst.generation,
+        marker: k1,
+        request: await requestOf(driver, KILLED, k2, "硬杀后"),
+        where: "硬杀后",
+      });
+      assertGrewByOneTurn(
+        killedBefore,
+        await readOrFail(driver, KILLED, "硬杀后"),
+        { text: k2, reply: killedNext.reply },
+        "硬杀后",
+      );
+
+      // 4b. 接回过一次的住户：那笔暂停记录已经用掉，硬杀后再启动照样是新一代。
+      const m4 = markerFor("RT-09", "m4");
+      const afterKill = await sayOrFail(driver, MAIN, m4, "接回后硬杀再启动");
+      expect(
+        afterKill.generation > pausedGeneration,
+        `接回第 ${pausedGeneration} 代之后硬杀再启动，回合仍落在第 ${afterKill.generation} 代——那笔暂停记录被用了第二次（只许用一次，接回即作废）`,
+      );
+      const mainArchive = await assertNotCarried(driver, {
+        residentId: MAIN,
+        deadGeneration: pausedGeneration,
+        marker: m3,
+        request: await requestOf(driver, MAIN, m4, "接回后硬杀再启动"),
+        where: "接回后硬杀再启动",
+      });
+      expect(
+        mainArchive.events.some((event) => event.text.includes(m1)),
+        `归档里第 ${pausedGeneration} 代没有暂停前那段——接回同一代的两段流水应同归这一代`,
+      );
+      assertGrewByOneTurn(
+        mainBeforeKill,
+        await readOrFail(driver, MAIN, "接回后硬杀再启动"),
+        { text: m4, reply: afterKill.reply },
+        "接回后硬杀再启动",
+      );
+      // 确认位观察口的正对照：真重登记时 baseline 确实挪到登记那一刻的账尾——否则上面
+      // 「接回后 baseline 没动」可能只是观察口读不到变化。
+      const alignedAfterKill = await alignmentOf(driver, MAIN, "硬杀后");
+      const rowAfterKill = alignedAfterKill.viewports.find(
+        (row) => row.generation === afterKill.generation,
+      );
+      if (rowAfterKill === undefined) {
+        fatal(
+          `硬杀后新一代（第 ${afterKill.generation} 代）在认证账上没有确认位——认证回合跑通了却没对齐，或观察口读的不是落盘那份`,
+        );
+      }
+      expect(
+        rowAfterKill.baselineSeq === alignedAfterKill.latestSeq &&
+          rowAfterKill.baselineSeq !== rowBeforeStop.baselineSeq,
+        `硬杀后新一代的 baseline 是 ${rowAfterKill.baselineSeq}，应是重登记那一刻的账尾 ${alignedAfterKill.latestSeq}——观察口看不出重登记，前面「接回没重登记」的判断不成立`,
+      );
+
+      // —— 五、坏暂停记录一律按猝死（#234 第 3 条：宁可忘，不冒认）；同一轮干净记录照接 ——
+      const seeded = new Map<
+        string,
+        { readonly generation: number; readonly marker: string; readonly stream: StreamSnapshot }
+      >();
+      for (const residentId of [CONTROL, ...TAMPERED.map((entry) => entry.residentId)]) {
+        await provisionOrFail(driver, residentId);
+        const marker = markerFor("RT-09", `${residentId}-before`);
+        const said = await sayOrFail(driver, residentId, marker, `${residentId} 退出前`);
+        seeded.set(residentId, {
+          generation: said.generation,
+          marker,
+          stream: await readOrFail(driver, residentId, `${residentId} 退出前`),
+        });
+      }
+      const seedOf = (residentId: string) => {
+        const seed = seeded.get(residentId);
+        if (seed === undefined) fatal(`${residentId} 没有退出前的夹具`);
+        return seed;
+      };
+      const hostBeforeTamper = await driver.hostDescriptor();
+      await driver.stopHost();
+      for (const { residentId, fault } of TAMPERED) {
+        await driver.tamperPauseRecord({ residentId, fault });
+      }
+      assertRestarted(hostBeforeTamper, await driver.startHost(), "弄坏暂停记录后再启动");
+
+      // 正对照：同一次正常退出、同一次启动，没被弄坏的那笔照样接回——下面几位换了代，
+      // 是记录坏了的结果，不是这一轮根本接不回，也不是夹具把整个数据根弄坏了。
+      const control = seedOf(CONTROL);
+      const controlMarker = markerFor("RT-09", "control-after");
+      const controlNext = await sayOrFail(driver, CONTROL, controlMarker, "对照住户再启动");
+      expect(
+        controlNext.generation === control.generation,
+        `同一轮里暂停记录完好的对照住户没接回（第 ${control.generation} → ${controlNext.generation} 代）——这一轮接不回，「坏记录按猝死」成了空断言`,
+      );
+      expect(
+        historyShape((await requestOf(driver, CONTROL, controlMarker, "对照住户")).history) ===
+          eventsAsHistory(control.stream.events),
+        "对照住户接回同一代，模型请求却没逐条带上上一段",
+      );
+
+      for (const { residentId, fault } of TAMPERED) {
+        const seed = seedOf(residentId);
+        const where = `暂停记录${PAUSE_FAULT_LABEL[fault]}后再启动`;
+        const marker = markerFor("RT-09", `${residentId}-after`);
+        const next = await sayOrFail(driver, residentId, marker, where);
+        expect(
+          next.generation > seed.generation,
+          `暂停记录${PAUSE_FAULT_LABEL[fault]}（${fault}），再启动仍接着第 ${seed.generation} 代（得到第 ${next.generation} 代）——坏暂停记录被冒接了（#234 第 3 条：缺失、损坏、身份对不上一律按猝死）`,
+        );
+        await assertNotCarried(driver, {
+          residentId,
+          deadGeneration: seed.generation,
+          marker: seed.marker,
+          request: await requestOf(driver, residentId, marker, where),
+          where,
+        });
+        assertGrewByOneTurn(
+          seed.stream,
+          await readOrFail(driver, residentId, where),
+          { text: marker, reply: next.reply },
+          where,
+        );
+      }
+
+      // —— 六、两个进程同时开同一住户：不许拿到同一代，至多一边接回暂停那代（#234 第 4 条） ——
+      // 两宿主顺序起、都 ready 后同时说（既有的认证账启动竞态会让同时起的一边在 ready 前崩，
+      // PR #235 验收席 P1-1）：暂停记录认领与住户锁在第一句上真撞。起不来、请求抛错都不算
+      // 「被拒」，输的一边只认 say 自己返回的 writer-unavailable。
+      await provisionOrFail(driver, RACER);
+      const raceSeed = await sayOrFail(driver, RACER, markerFor("RT-09", "race-before"), "并发前");
+      await driver.stopHost();
+      const contended: readonly ContendedTurn[] = await driver.raceHosts({
+        residentId: RACER,
+        texts: [markerFor("RT-09", "race-a"), markerFor("RT-09", "race-b")],
+      });
+      const sideLabel = (side: ContendedTurn): string =>
+        `${side.stage}（pid ${String(side.pid)}，ready pid ${String(side.readyPid)}${
+          side.failure === null ? "" : `：${side.failure}`
+        }${side.result === null ? "" : side.result.ok ? "，说成" : `，${side.result.error.code}`}）`;
+      const raceSides = contended.map(sideLabel).join("；");
+      expect(
+        contended.length === 2,
+        `并发夹具返回了 ${contended.length} 个结局，应为 2 个——两个宿主进程各一个`,
+      );
+      expect(
+        contended.every(
+          (side) => side.stage !== "not-ready" && Number.isSafeInteger(side.readyPid),
+        ),
+        `并发夹具里有一边没起到 ready（${raceSides}）——起不来不是被住户锁拒绝，这一段根本没撞到暂停记录认领与住户锁（PR #235 验收席 P1-1）`,
+      );
+      const [earlier, later] = contended;
+      expect(
+        earlier !== undefined &&
+          later !== undefined &&
+          Number.isSafeInteger(earlier.readyPid) &&
+          Number.isSafeInteger(later.readyPid) &&
+          earlier.readyPid !== later.readyPid,
+        `并发夹具两边 ready 的是同一个进程（${raceSides}）——不是两个进程同时开同一住户`,
+      );
+      expect(
+        contended.every((side) => side.stage === "said" && side.result !== null),
+        `并发夹具里有一边的 say 没真返回（${raceSides}）——请求抛错或宿主崩溃不是被住户锁拒绝`,
+      );
+      expect(
+        contended.every(
+          (side) =>
+            side.result === null ||
+            side.result.ok ||
+            side.result.error.code === "writer-unavailable",
+        ),
+        `并发夹具里输的一边不是 say 返回的 writer-unavailable（${raceSides}）——另一个进程开着这位住户时，拒绝必须是结构化的 writer-unavailable`,
+      );
+      const won: { readonly pid: number | null; readonly turn: TurnResult }[] = [];
+      for (const side of contended) {
+        if (side.result?.ok === true) won.push({ pid: side.readyPid, turn: side.result.value });
+      }
+      expect(
+        won.length >= 1,
+        `两个宿主都 ready 后同时说，一边都没说成（${raceSides}）——并发夹具没真跑起来，「不许拿到同一代」成了空断言`,
+      );
+      expect(
+        won.filter((side) => side.turn.generation === raceSeed.generation).length <= 1,
+        `两个宿主进程都接回了暂停的第 ${raceSeed.generation} 代——暂停记录被两边同时认领（#234 第 4 条）`,
+      );
+      const [left, right] = won;
+      if (left !== undefined && right !== undefined) {
+        expect(
+          left.pid !== null && right.pid !== null && left.pid !== right.pid,
+          "并发夹具两边说成话的是同一个进程——不是两个进程同时开",
+        );
+        expect(
+          left.turn.generation !== right.turn.generation,
+          `两个宿主进程都拿到了第 ${left.turn.generation} 代——同一住户同一代有了两个活实例（#234 第 4 条）`,
+        );
+      }
+      const raceSummary = contended
+        .map((side) =>
+          side.result === null
+            ? side.stage
+            : side.result.ok
+              ? `第 ${side.result.value.generation} 代`
+              : side.result.error.code,
+        )
+        .join(" / ");
+
+      return pass(
+        `正常退出前后同为第 ${pausedGeneration} 代，接回后请求带回上一段 ${beforeStop.events.length} 条、流只多 2 条、确认位窗号与 baseline ${rowBeforeStop.baselineSeq} 不动且缺口经接回交付；` +
+          `硬杀开新代（${killedFirst.generation}→${killedNext.generation}），接回过的再硬杀也开新代（${pausedGeneration}→${afterKill.generation}，重登记 baseline→${rowAfterKill.baselineSeq}），旧流水不进请求、归档可查；` +
+          `暂停记录缺失 / 损坏 / 身份对不上各开新代，同轮对照接回；并发两宿主：${raceSummary}`,
+      );
     },
   },
 ];

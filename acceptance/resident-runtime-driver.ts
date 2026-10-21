@@ -1,9 +1,9 @@
 /**
- * #194（RT-01～RT-07）的验收驱动契约。
+ * #194（RT-01～RT-09）的验收驱动契约。
  *
  * 判卷只通过本接口观察住户运行时，不 import `src/` 实现。实现方在
  * `src/resident-runtime-acceptance-driver.ts` 导出 `createResidentRuntimeDriver()`；
- * 驱动缺失时七盏灯全部保持红色——那是判卷先行的起点，不是故障。
+ * 驱动缺失时九盏灯全部保持红色——那是判卷先行的起点，不是故障。
  *
  * 判卷对象是 D28 那条最小闭环：醒来（读启动包 + 真实对话往返）、写流（一窗流唯一
  * writer）、换代（亲笔交接信）、通道（D25 订阅 / API key）、TUI、凭证、真源。
@@ -51,6 +51,11 @@ export type ResidentRuntimeErrorCode =
    * message/remedy 的自由文本不作机器判据）。
    */
   | "turn-id-conflict"
+  /**
+   * 正文已落流但缺少原交付的耐久确认依据，或孤立 user 腿已跨窗/跨代。
+   * 这类重试保留原锚与正文，停止在模型调用前，不能当作重新生成的信号。
+   */
+  | "reconciliation-needed"
   /** 换气被拒：临线改阈值、不写信就想换代、代际不对。 */
   | "breath-refused"
   /** 交接信不合模板：缺标题、超长度上限、tier 非法。 */
@@ -67,6 +72,11 @@ export interface ResidentRuntimeError {
    */
   readonly remedy: string;
   readonly residentId: string | null;
+  /**
+   * say() 的重试锚：显式传入时原样返回，省略时由运行时分配。
+   * 其他动作的错误不一定有锚；同回合重试必须保留该锚与原文。
+   */
+  readonly turnId?: string;
 }
 
 export type Result<T> =
@@ -130,6 +140,11 @@ export interface TurnResult {
   readonly reply: string;
   /** 是否流式产出（RT-05 的正对照）。 */
   readonly streamed: boolean;
+  /**
+   * 本回合的幂等锚。显式传入时原样返回，省略时返回运行时分配的锚。
+   * 与原文一起保存，供同回合重试使用。
+   */
+  readonly turnId: string;
 }
 
 // —— 一窗流只读 ——
@@ -147,6 +162,80 @@ export interface StreamSnapshot {
   readonly residentId: string;
   /** 按 `streamSeq` 升序。 */
   readonly events: readonly StreamEventView[];
+}
+
+// —— 模型请求观察（RT-09） ——
+
+/** 随请求进模型的一条历史消息：只有角色与正文。 */
+export interface ModelHistoryMessageView {
+  readonly role: "user" | "assistant";
+  readonly text: string;
+}
+
+/**
+ * 某位住户最近一次真实模型请求的观察视图（transport 实际收到的那份）。
+ *
+ * 只带判卷要比的三样：住户、本回合用户那句、随请求进模型的历史。**不带凭证原文**，
+ * 也不带启动包——这个观察口不许变成 RT-06 扫描面之外的第二个漏密钥的口子。
+ */
+export interface ModelRequestView {
+  readonly residentId: string;
+  readonly text: string;
+  readonly history: readonly ModelHistoryMessageView[];
+}
+
+// —— 认证事实账的确认位（RT-09） ——
+
+/** 认证事实账上一扇窗的确认位（落盘那份）。 */
+export interface LedgerViewportAlignmentView {
+  readonly windowId: string;
+  /** 这行确认位登记时绑定的窗代际；没有认证身份的旧档行为 null。 */
+  readonly generation: number | null;
+  /** 登记那一刻的账序号：这一次激活的对齐起点。 */
+  readonly baselineSeq: number;
+  /** 已确认交付到的账序号；只前进不后退。 */
+  readonly ackedSeq: number;
+}
+
+export interface LedgerAlignmentView {
+  readonly residentId: string;
+  /** 账上最后一条的 seq；空账为 0。 */
+  readonly latestSeq: number;
+  readonly viewports: readonly LedgerViewportAlignmentView[];
+}
+
+// —— 暂停记录与并发（RT-09，#234） ——
+
+/** 暂停记录的三种坏法。#234 第 3 条：一律按猝死处理，宁可忘，不冒认。 */
+export type PauseRecordFault =
+  /** 记录不在：等同正常退出时那笔记录没写成。 */
+  | "missing"
+  /** 记录在但读不懂：字节损坏或截断，解析、校验过不去。 */
+  | "garbled"
+  /** 记录完好可读，但身份对不上：不是这位住户、这扇窗、这一代的那笔。 */
+  | "foreign";
+
+/**
+ * 并发夹具里一个宿主进程走到了哪一步（PR #235 验收席 P1-1）：起不来、请求抛错都照实报，
+ * 不许折成 `say` 的结果——否则「没起来」会冒充「被锁拒绝」，并发段成了假绿。
+ *
+ * - `said`：起到 ready，`say` 真返回了（成功，或 say 自己返回的结构化失败）；
+ * - `not-ready`：ready 之前就退出或超时，根本没走到 `say`；
+ * - `request-failed`：起到 ready，但 `say` 请求本身抛错（宿主崩溃、IPC 断开、超时），
+ *   没拿到 say 的返回。
+ */
+export type ContendedStage = "said" | "not-ready" | "request-failed";
+
+export interface ContendedTurn {
+  readonly stage: ContendedStage;
+  /** spawn 出来的宿主进程 pid；连进程都没起来为 null。 */
+  readonly pid: number | null;
+  /** 宿主 ready 时自报的 pid；没走到 ready 为 null。 */
+  readonly readyPid: number | null;
+  /** `say` 自己返回的结果；只有 `said` 有，别的阶段为 null。 */
+  readonly result: Result<TurnResult> | null;
+  /** 没走到 say 返回时的原因（`not-ready` / `request-failed`）；`said` 为 null。 */
+  readonly failure: string | null;
 }
 
 /**
@@ -237,9 +326,16 @@ export interface TuiTranscript {
   readonly errorText: string | null;
 }
 
-/** TUI 脚本步骤：敲一行、等回复、或注入一次故障看错误呈现。 */
+/**
+ * TUI 脚本步骤：敲一行、等回复、显式重试、或注入一次故障看错误呈现。
+ *
+ * `retry` 与 `input` 是两条不同的路径：`input` 是普通提交，
+ * 同文本也是**新回合**；`retry` 是显式重试动作，复用上一次失败回合的锚与原文。
+ */
 export type TuiStep =
   | { readonly kind: "input"; readonly text: string }
+  /** 显式重试：复用上一条失败回合的 turnId 与原文，不把重试当新回合。 */
+  | { readonly kind: "retry" }
   | { readonly kind: "breakChannel" }
   | { readonly kind: "input-after-break"; readonly text: string };
 
@@ -264,6 +360,17 @@ export interface ResidentRuntimeDriver {
   startHost(): Promise<HostDescriptor>;
   /** 硬杀宿主进程，不给优雅 flush 的机会。 */
   killHost(): Promise<void>;
+  /**
+   * 正常关闭宿主：走宿主自己的正常关闭路径——与终端 `/exit`、stdin 结束是**同一条**
+   * （现役是 `runtime.close()`），然后由子进程自己退出。驱动只等它退出，不许拿 SIGKILL
+   * 冒充；限时内没自己退出、或退出码非 0，就抛错（那是红，不是暂停）。宿主没在跑时
+   * 是空操作。施工若把「这一代暂停」挂在别处，宿主子进程必须同走那条路径，否则本方法
+   * 判不到终端的真实行为。
+   *
+   * RT-09 拿它与 `killHost` 对照：同样换进程，一个是正常退出（#234 裁定 A：接着同一代），
+   * 一个是硬杀（D8 三：猝死开新一代）。
+   */
+  stopHost(): Promise<void>;
   hostDescriptor(): Promise<HostDescriptor>;
 
   // —— 通道（D25） ——
@@ -282,7 +389,79 @@ export interface ResidentRuntimeDriver {
   resolveChannelRoute(input: { channel: ChannelSpec }): Promise<Result<ChannelRoute>>;
 
   // —— 对话往返 ——
-  say(input: { residentId: string; text: string }): Promise<Result<TurnResult>>;
+  say(input: { residentId: string; text: string; turnId?: string }): Promise<Result<TurnResult>>;
+
+  /**
+   * 验收观察口：真实模型 transport 的调用次数。RT-08 用前后差证明恢复拒绝发生在
+   * 模型调用之前；只看结构化错误码不足以排除「先调用、再报错」的假绿。
+   */
+  modelInvocationCount(): Promise<number>;
+
+  /** RT-08 故障夹具：让下一次认证回合在正文与 ACK 落盘后，确认记录写入失败。 */
+  armTurnConfirmationWriteFault(input: { residentId: string }): Promise<void>;
+  /** 清掉上面的确定性落盘故障；不补造确认记录。 */
+  repairTurnConfirmationWriteFault(input: { residentId: string }): Promise<void>;
+  /**
+   * RT-08 崩溃夹具：把一个已完成回合裁成只剩耐久 user 腿，随后用同一数据根拉起
+   * 新宿主。夹具只负责造状态；判卷仍须独立读流确认只剩一条 user，再执行换代与重试。
+   */
+  crashAfterUserWrite(input: { residentId: string; turnId: string }): Promise<void>;
+
+  /**
+   * 验收观察口：本宿主进程启动以来，这位住户最近一次真实模型请求（见
+   * `ModelRequestView`）；没有就 null，宿主重启后从 null 起算。
+   *
+   * RT-09 要判「接回同一代时，上一段的 user/assistant 确实随请求进了模型」与「猝死后
+   * 上一代原始流水没进」。只看 `TurnResult.generation` 排除不了「代号接上了、上下文却是
+   * 空的」与「代号换了、旧流水却塞进来了」两种假绿；读流只证明落了账，不证明进了模型。
+   */
+  lastModelRequest(input: { residentId: string }): Promise<ModelRequestView | null>;
+
+  // —— 认证事实账（RT-09） ——
+  /**
+   * RT-09 夹具：以宿主维护身份往这位住户的认证事实账追加一条现行事实。不经任何窗、
+   * 不动任何窗的确认位，只造「账上有东西、窗还没确认到」的状态；判卷经
+   * `ledgerAlignment` 独立读回。
+   */
+  appendLedgerFact(input: { residentId: string; body: string }): Promise<Result<{ seq: number }>>;
+  /**
+   * 验收观察口：这位住户认证事实账**落盘**的确认位（只读）。宿主停着也要读得到——判卷
+   * 要在正常退出与下次启动之间核「暂停本身没动确认位」，这时调别的方法会把宿主拉起来。
+   *
+   * 为什么只有它能排除假绿（#234 第 5 条）：接回同一代后认证回合跑得通，只说明窗登记
+   * 上了，分不清「接回原来那次激活」与「按同一身份重新登记一次」。后者把 baseline 挪到
+   * 接回那一刻、把 acked 抬平到 latestSeq：暂停前没交付的缺口被吞掉，已交付的初始事实
+   * 重新冻结成新一轮初始交付。两者在模型请求与一窗流上都不留痕，只在确认位上分得开。
+   */
+  ledgerAlignment(input: { residentId: string }): Promise<Result<LedgerAlignmentView>>;
+
+  // —— 暂停记录与并发（RT-09，#234） ——
+  /**
+   * RT-09 故障夹具：宿主停着时（正常退出之后、下次启动之前）把这位住户的暂停记录按
+   * `fault` 弄坏，别的住户的记录一字不动；宿主在跑时调用直接抛错。夹具只造状态，判卷
+   * 独立判下次启动的结局：新一代、上一代原始流水不进模型请求、归档可查、旧事件不动。
+   *
+   * 现役代码还没有暂停记录：施工前实现方明桩（申报进 `STUBBED`），判卷在走到这里之前
+   * 就已判红；施工落下暂停记录时一并实现本夹具，并从 `STUBBED` 划掉。
+   */
+  tamperPauseRecord(input: { residentId: string; fault: PauseRecordFault }): Promise<void>;
+  /**
+   * RT-09 并发夹具：驱动自己的宿主停着时（先 `stopHost`，否则抛错），在同一数据根上另起
+   * 两个宿主进程——**先起一个等它 ready，再起第二个等它 ready**（同一刻起两个会撞上既有的
+   * 认证账启动竞态，一边在 ready 前崩掉，那不是这里要验的东西）；两边都 ready 后**同一时刻**
+   * 各对同一住户说一句（`texts[0]` 给先起的那个），暂停记录认领与住户锁在这一句上真撞；
+   * 两边答完后正常关闭（同 `stopHost`）并等它们自己退出，没起来或请求抛错的一边直接杀掉。
+   * 按起进程顺序返回两边的结局。
+   *
+   * 每一边走到哪一步照实报在 `stage` 上：起不来是 `not-ready`，请求抛错是 `request-failed`，
+   * 都不许折成 say 的结果；「第二个进程被拒」必须是 `said` 且 say 自己返回的结构化失败。
+   * 夹具只负责真并发；判卷独立判「两边都 ready 且是两个进程、两边的 say 都真返回、输的一边
+   * 是 say 返回的 writer-unavailable、两边没拿到同一代、至多一边接回暂停的那代」。
+   */
+  raceHosts(input: {
+    residentId: string;
+    texts: readonly [string, string];
+  }): Promise<readonly [ContendedTurn, ContendedTurn]>;
 
   // —— 一窗流只读 ——
   readStream(input: { residentId: string }): Promise<Result<StreamSnapshot>>;

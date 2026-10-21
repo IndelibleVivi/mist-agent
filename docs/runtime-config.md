@@ -14,9 +14,9 @@
 
 | 变量 | 读取点 | 默认 | 用途 |
 |---|---|---|---|
-| `MIST_DATA_DIR` | `src/installer/cli.ts`、`src/resident-runtime/cli.ts` | `~/.mist` | 安装器与终端的数据根；各入口的 `--data-dir` 优先。共用根目录不表示安装快照已接到 runtime |
-| `MIST_RESIDENT_RUNTIME_TRANSPORT` | `src/resident-runtime/channels.ts` | `synthetic`（未设或空字符串） | `synthetic` 为确定性合成通道；`pi` 经外部 pi CLI 调真实模型。其他值拒绝启动；设为 pi 不自动完成通道配置 |
-| `PI_CODING_AGENT_DIR`（pi 上游变量） | `src/resident-runtime/pi-transport.ts`、外部 pi CLI | `~/.pi/agent` | 原配置根只读：每回合将 settings 投影到 0700 私有临时配置根，强制 `compaction.enabled=false`，models.json 以原路径引用，不复制 auth.json 或凭证。子进程用临时根，启动后先读有效策略；仍启用 compaction 就在 prompt 前拒绝，不写用户全局或项目 settings |
+| `MIST_DATA_DIR` | `src/installer/cli.ts`、`src/resident-runtime/cli.ts` | `~/.mist` | 安装器与终端的数据根；各入口的 `--data-dir` 优先。不带 `--resident` 的 `npm run resident` 从这里的当前安装启动（#182）；带 `--resident` 的老入口不读安装 |
+| `MIST_RESIDENT_RUNTIME_TRANSPORT` | `src/resident-runtime/channels.ts`、`src/resident-runtime/cli.ts` | `synthetic`（未设或空字符串）；不带 `--resident` 从安装启动时为 `pi` | `synthetic` 为确定性合成通道；`pi` 经外部 pi CLI 调真实模型。其他值拒绝启动。从安装启动时由第一次启动按安装配通道；带 `--resident` 时设为 pi 不自动完成通道配置 |
+| `PI_CODING_AGENT_DIR`（pi 上游变量） | `src/resident-runtime/pi-transport.ts`、外部 pi CLI | `~/.pi/agent`；单独 `~` 展开为 HOME（与 pi 相同） | 原配置根只读：每回合把 settings 去掉 `packages` 后投影到 0700 私有临时配置根，强制 `compaction.enabled=false`，models.json 以原路径符号链接。不复制 `auth.json`、`trust.json`、`models-store.json` 或其他配置根状态，也不把 `packages` 带进新根，避免 npm / git 包每回合重装或克隆。子进程用临时根，启动后先读有效策略；仅当项目 settings 经有效信任加载且仍启用 compaction 时，在 prompt 前拒绝。不写用户全局或项目 settings |
 | `MIST_RESIDENT_RUNTIME_DIR` | `src/resident-runtime/host-process.ts` | 无；缺失拒绝启动 | runtime IPC 宿主的落盘根，判卷 adapter 显式注入。普通 `npm run resident` 的数据根仍走 `--data-dir` / `MIST_DATA_DIR` |
 | `MIST_GROUP_CHAT_DATA_ROOT` | `src/group-chat/host-process.ts` | 无；缺失拒绝启动 | 群聊 IPC 宿主的落盘根，由群聊判卷 adapter（`src/group-chat-acceptance-driver.ts`）显式注入 |
 | `MIST_WINDOW_ARCHIVE_PATH` | `tests/fixtures/session-registry-host.ts` | 空 = 纯内存 | 窗生命周期 JSONL 归档路径（`window_opened` / `window_archived` 追加写）。不设则不持久化，供无持久化需求的嵌入方 |
@@ -57,7 +57,7 @@ pi 通道在子进程中仅按当前 provider 设置一项专属凭证变量，�
 ## 住户运行时的账装配
 
 CLI 与宿主子进程共用 `src/resident-runtime/assembly.ts`，沿用现役
-`MIST_RESIDENT_RUNTIME_TRANSPORT`（默认 synthetic）与宿主 `MIST_RESIDENT_RUNTIME_DIR`，
+`MIST_RESIDENT_RUNTIME_TRANSPORT`（默认 synthetic；终端从安装启动时默认 pi）与宿主 `MIST_RESIDENT_RUNTIME_DIR`，
 不新增变量。认证账跟着 `dataDir` 落在
 `residents/<id>.facts.json`。candidate 本人接受后，room 与账在同一物化入口创建；
 启动时为 active 身份恢复 room / 账，查询与 `provisionChannel()` 不负责开户。
@@ -73,9 +73,20 @@ Pi 模型输入布局：system prompt 放身份、原交接信与固定权威说
 仍经 RPC `prompt` 只发一次。session 文件与 prompt 共用 0700 临时目录、文件 0600，
 回合结束或取消后删除。header 的 cwd 取进程 cwd，不取随机临时目录；材料不变时上一轮
 模型输入是下一轮的消息前缀，材料变化会让该前缀失效一次。
-私有配置关闭 compaction，`get_state` 确认 `autoCompactionEnabled=false` 后才发送 prompt；
-项目配置若覆盖为 true，调用在 prompt 前拒绝。收到 compaction 事件也拒绝，用户 global/project
-settings 均不写。真实通道的外部包已迁至 `@earendil-works/pi-coding-agent`，要求 pi ≥0.86.1；
+私有配置关闭 compaction，`get_state` 确认 `autoCompactionEnabled=false` 后才发送 prompt。
+这项预检只在项目 settings 实际被加载时能看到项目覆盖：私有根不继承 `trust.json`，所以用户
+曾在原根信任的项目目录不会因此自动获得信任；项目配置若没被加载，预检只确认投影后的
+`false`。收到 compaction 事件也拒绝，用户 global/project settings 均不写。
+
+私有根故意只投影 settings（去掉 `packages`）和 models.json：`pi install` 的 npm/git 扩展不会
+每回合被安装或克隆，但子进程也看不到这些包；`--no-extensions` 本来就不加载它们。原根的
+`auth.json` 不复制（凭证按 RT-06 走环境变量），`trust.json` 不继承（原根逐项目的信任不沿用；
+settings 中显式的 `defaultProjectTrust` 策略仍会投影），
+`models-store.json` 等动态模型缓存不继承（自定义静态模型仍从 models.json 读取，动态目录可能
+缺项或由 pi 在新根重建）。其余配置根状态也不会出现。代价是项目级设置/信任和动态模型状态
+与用户原 `pi` 会话不完全一致；mist 每回合都建一次小配置投影，不承诺原根扩展在 mist 通道内可用。
+
+真实通道的外部包已迁至 `@earendil-works/pi-coding-agent`，要求 pi ≥0.86.1；
 核过的 0.86.1 / 1.2.0 要求 Node ≥22.19。bridge 启动修复及其持久聊天史处理待 #232 后另件，
 本项撤回显式 bridge loader。
 
@@ -91,5 +102,7 @@ Usage 无新增环境变量：成功回合追加到 `dataDir/logs/<residentId>.u
 
 `npm run verify:pi-wire -- /path/to/pi` 使用已有真实 pi、回合私有配置与本机假 Anthropic
 端点验证请求；不读真实 auth.json、不用真实 key、不请求真实 provider，不要求公开 CI 安装 pi。
+探针的 settings 带 npm/git `packages`，且不设 `PI_OFFLINE`；PATH 前置只记录并失败的 npm/git
+替身，核零安装/克隆尝试。该探针仍不证明真实 provider、真实缓存命中或费用。
 模型输入投影由 `pi-transport.ts` 维护，usage 由 `usage-log.ts` 维护；相关回归在
 `tests/pi-transport.test.ts` / `tests/resident-runtime.test.ts`，其验证边界见 resident-runtime 清单。

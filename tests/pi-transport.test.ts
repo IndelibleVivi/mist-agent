@@ -41,7 +41,13 @@ interface FakeRecord {
   sessionDirMode: number | null;
   sessionRaw: string | null;
   agentDir: string;
-  agentSettings: { compaction?: { enabled?: boolean }; reviewSetting?: string } | null;
+  agentEntries: string[];
+  agentSettings: {
+    compaction?: { enabled?: boolean };
+    packages?: unknown;
+    reviewSetting?: string;
+  } | null;
+  agentModelsTarget: string | null;
 }
 
 interface SessionEntry {
@@ -152,8 +158,12 @@ require("readline").createInterface({input:process.stdin}).on("line", (line) => 
     sessionDirMode: sessionPath ? (fs.statSync(require("path").dirname(sessionPath)).mode & 0o777) : null,
     sessionRaw: sessionPath ? fs.readFileSync(sessionPath, "utf8") : null,
     agentDir: process.env.PI_CODING_AGENT_DIR,
+    agentEntries: fs.readdirSync(process.env.PI_CODING_AGENT_DIR),
     agentSettings: fs.existsSync(require("path").join(process.env.PI_CODING_AGENT_DIR,"settings.json"))
       ? JSON.parse(fs.readFileSync(require("path").join(process.env.PI_CODING_AGENT_DIR,"settings.json"),"utf8")) : null,
+    agentModelsTarget: fs.existsSync(require("path").join(process.env.PI_CODING_AGENT_DIR,"models.json"))
+      && fs.lstatSync(require("path").join(process.env.PI_CODING_AGENT_DIR,"models.json")).isSymbolicLink()
+      ? fs.readlinkSync(require("path").join(process.env.PI_CODING_AGENT_DIR,"models.json")) : null,
     commands,
     secretEnvs: { ${envRecord} },
   }));
@@ -174,7 +184,7 @@ require("readline").createInterface({input:process.stdin}).on("line", (line) => 
   }
   emit({ type: "response", id: "mist-prompt", command: "prompt", success: true });
   if (mode.startsWith("compact-")) {
-    emit({ type: mode === "compact-start" ? "auto_compaction_start" : "auto_compaction_end", reason:"threshold" });
+    emit({ type: mode === "compact-start" ? "compaction_start" : "compaction_end", reason:"threshold" });
   }
   if (mode === "malformed") {
     process.stdout.write("{\\"type\\":\\"message_update\\"\\n");
@@ -808,13 +818,19 @@ describe("#231 policy and history regressions", () => {
     expect(parseSession(second.sessionRaw)[0]).toMatchObject({ cwd: process.cwd() });
   });
 
-  it("disables compaction in private settings and verifies it before prompt without mutating the original", async () => {
+  it("projects settings without installed packages and without copying private Pi state", async () => {
     const original = tempDir();
     const settings = JSON.stringify({
       compaction: { enabled: true },
+      packages: ["npm:pi-claude-bridge", "git:https://example.invalid/extension.git"],
       reviewSetting: "preserve-me",
     });
+    const models = JSON.stringify({ providers: { synthetic: { models: [] } } });
     writeFileSync(join(original, "settings.json"), settings);
+    writeFileSync(join(original, "models.json"), models);
+    writeFileSync(join(original, "auth.json"), '{"anthropic":{"apiKey":"AUTH-CANARY"}}');
+    writeFileSync(join(original, "trust.json"), '{"project":"TRUST-CANARY"}');
+    writeFileSync(join(original, "models-store.json"), '{"dynamic":"MODEL-CANARY"}');
     const { bin, recordPath } = fakePi();
     await collect(
       new PiCliTransport({
@@ -829,10 +845,90 @@ describe("#231 policy and history regressions", () => {
       compaction: { enabled: false },
       reviewSetting: "preserve-me",
     });
+    expect(record.agentSettings).not.toHaveProperty("packages");
+    expect(record.agentEntries.sort()).toEqual(["models.json", "settings.json"]);
+    expect(record.agentModelsTarget).toBe(join(original, "models.json"));
     expect(record.commands).toEqual(["get_state", "prompt"]);
     expect(record.agentDir).not.toBe(original);
     expect(existsSync(record.agentDir)).toBe(false);
     expect(readFileSync(join(original, "settings.json"), "utf8")).toBe(settings);
+    expect(readFileSync(join(original, "models.json"), "utf8")).toBe(models);
+    expect(readFileSync(join(original, "auth.json"), "utf8")).toContain("AUTH-CANARY");
+    expect(readFileSync(join(original, "trust.json"), "utf8")).toContain("TRUST-CANARY");
+    expect(readFileSync(join(original, "models-store.json"), "utf8")).toContain("MODEL-CANARY");
+  });
+
+  it("expands PI_CODING_AGENT_DIR='~' like pi and projects that root", async () => {
+    const home = tempDir();
+    const original = home;
+    writeFileSync(
+      join(home, "settings.json"),
+      JSON.stringify({ compaction: { enabled: true }, reviewSetting: "home-settings" }),
+    );
+    const { bin, recordPath } = fakePi();
+    await collect(
+      new PiCliTransport({
+        piBin: bin,
+        extraEnv: {
+          FAKE_PI_RECORD: recordPath,
+          PI_CODING_AGENT_DIR: "~",
+          HOME: home,
+        },
+      }).complete(request()),
+    );
+    const record = JSON.parse(readFileSync(recordPath, "utf8")) as FakeRecord;
+    expect(record.agentDir).not.toBe(original);
+    expect(record.agentSettings).toMatchObject({
+      compaction: { enabled: false },
+      reviewSetting: "home-settings",
+    });
+  });
+
+  it("reports malformed settings without echoing their contents and never starts pi", async () => {
+    const original = tempDir();
+    writeFileSync(join(original, "settings.json"), '{"secret":"SETTINGS-CONTENT-CANARY",');
+    const { bin, recordPath } = fakePi();
+    const completion = collect(
+      new PiCliTransport({
+        piBin: bin,
+        extraEnv: { FAKE_PI_RECORD: recordPath, PI_CODING_AGENT_DIR: original },
+      }).complete(request()),
+    );
+    await expect(completion).rejects.toThrow(/settings\.json 不是有效 JSON/);
+    await expect(completion).rejects.not.toThrow(/SETTINGS-CONTENT-CANARY/);
+    expect(existsSync(recordPath)).toBe(false);
+  });
+
+  it("reports unreadable settings specifically and never starts pi", async () => {
+    const original = tempDir();
+    mkdirSync(join(original, "settings.json"));
+    const { bin, recordPath } = fakePi();
+    await expect(
+      collect(
+        new PiCliTransport({
+          piBin: bin,
+          extraEnv: { FAKE_PI_RECORD: recordPath, PI_CODING_AGENT_DIR: original },
+        }).complete(request()),
+      ),
+    ).rejects.toThrow(/settings\.json 不可读取/);
+    expect(existsSync(recordPath)).toBe(false);
+  });
+
+  it("settings projection failure does not invoke the model", async () => {
+    const original = tempDir();
+    writeFileSync(join(original, "settings.json"), "{not-json");
+    const { bin, recordPath } = fakePi();
+    const calls: unknown[] = [];
+    await expect(
+      collect(
+        new PiCliTransport({
+          piBin: bin,
+          extraEnv: { FAKE_PI_RECORD: recordPath, PI_CODING_AGENT_DIR: original },
+        }).complete(request({ onUsage: (usage) => calls.push(usage) })),
+      ),
+    ).rejects.toThrow(/settings\.json 不是有效 JSON/);
+    expect(calls).toEqual([]);
+    expect(existsSync(recordPath)).toBe(false);
   });
 
   it("refuses an effective compaction policy that is still enabled before any prompt", async () => {
@@ -848,47 +944,47 @@ describe("#231 policy and history regressions", () => {
     expect(existsSync(recordPath)).toBe(false);
   });
 
-  it.each(["compact-start", "compact-end"])(
-    "rejects %s before committing a runtime turn",
-    async (mode) => {
-      const { bin } = fakePi();
-      const runtime = new ResidentRuntime({
-        dataDir: tempDir(),
-        transport: new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_MODE: mode } }),
+  it.each([
+    { mode: "compact-start", event: "compaction_start" },
+    { mode: "compact-end", event: "compaction_end" },
+  ])("rejects $event before committing a runtime turn", async ({ mode }) => {
+    const { bin } = fakePi();
+    const runtime = new ResidentRuntime({
+      dataDir: tempDir(),
+      transport: new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_MODE: mode } }),
+    });
+    try {
+      const candidate = runtime.createCandidate({
+        residentId: "review-compact",
+        persona: "synthetic",
+        proposedBy: { kind: "installer", id: "test" },
       });
-      try {
-        const candidate = runtime.createCandidate({
-          residentId: "review-compact",
-          persona: "synthetic",
-          proposedBy: { kind: "installer", id: "test" },
-        });
-        runtime.attestCandidate(
-          candidate.candidateId,
-          { kind: "candidate", candidateId: candidate.candidateId },
-          "accepted",
-        );
-        runtime.provisionChannel({
-          residentId: "review-compact",
-          channel: {
-            claudeSubscription: false,
-            credentialKind: "api-key",
-            model: "anthropic/claude-test",
-          },
-          canarySecret: "SYNTHETIC-KEY",
-        });
-        expect(await runtime.say({ residentId: "review-compact", text: "current" })).toMatchObject({
-          ok: false,
-          error: { code: "channel-unavailable" },
-        });
-        expect(runtime.readStream({ residentId: "review-compact" })).toMatchObject({
-          ok: false,
-          error: { code: "stream-not-found" },
-        });
-      } finally {
-        await runtime.close();
-      }
-    },
-  );
+      runtime.attestCandidate(
+        candidate.candidateId,
+        { kind: "candidate", candidateId: candidate.candidateId },
+        "accepted",
+      );
+      runtime.provisionChannel({
+        residentId: "review-compact",
+        channel: {
+          claudeSubscription: false,
+          credentialKind: "api-key",
+          model: "anthropic/claude-test",
+        },
+        canarySecret: "SYNTHETIC-KEY",
+      });
+      expect(await runtime.say({ residentId: "review-compact", text: "current" })).toMatchObject({
+        ok: false,
+        error: { code: "channel-unavailable" },
+      });
+      expect(runtime.readStream({ residentId: "review-compact" })).toMatchObject({
+        ok: false,
+        error: { code: "stream-not-found" },
+      });
+    } finally {
+      await runtime.close();
+    }
+  });
 });
 
 /**

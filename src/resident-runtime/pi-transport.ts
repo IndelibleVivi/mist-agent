@@ -182,6 +182,12 @@ export class PiCliTransport implements ModelTransport {
     const promptPath = join(promptDir, "system-prompt.txt");
     try {
       preparePrivatePiSettings(env, promptDir);
+    } catch (error) {
+      rmSync(promptDir, { recursive: true, force: true });
+      if (error instanceof Error) throw error;
+      throw new Error("pi 配置投影失败");
+    }
+    try {
       writeFileSync(promptPath, renderSystemPrompt(request), {
         encoding: "utf8",
         flag: "wx",
@@ -539,28 +545,45 @@ export class PiCliTransport implements ModelTransport {
 
 /**
  * 每回合只在私有配置投影中关自动压缩，不用会写全局 settings 的 RPC setter。
- * 保留原 settings 与自定义模型定义；API key 仍只走本回合 provider 环境变量，
- * auth.json 不复制。项目 settings 可能覆盖它，所以 prompt 前还核 get_state。
+ * 投影原 settings 时排除 packages，避免新配置根
+ * 每回合重装/克隆扩展；保留自定义模型定义。API key 仍只走本回合 provider 环境变量，
+ * auth.json、trust.json、models-store.json 与其他配置根状态都不复制。项目 settings
+ * 只有在私有根的有效配置仍信任该项目时才会加载，所以 prompt 前还核 get_state。
  */
 function preparePrivatePiSettings(env: NodeJS.ProcessEnv, promptDir: string): void {
-  const configured = env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+  const home = env.HOME ?? homedir();
+  const configured = env.PI_CODING_AGENT_DIR || join(home, ".pi", "agent");
   const original = resolve(
-    configured.startsWith("~/") ? join(homedir(), configured.slice(2)) : configured,
+    configured === "~"
+      ? home
+      : configured.startsWith("~/")
+        ? join(home, configured.slice(2))
+        : configured,
   );
   let settings: Record<string, unknown> = {};
   try {
-    const parsed: unknown = JSON.parse(readFileSync(join(original, "settings.json"), "utf8"));
-    if (!isRecord(parsed)) throw new Error("invalid pi settings");
+    const raw = readFileSync(join(original, "settings.json"), "utf8");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error("pi settings.json 不是有效 JSON");
+    }
+    if (!isRecord(parsed)) throw new Error("pi settings.json 不是有效 JSON");
     settings = parsed;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("pi 配置不可读取");
+    if (error instanceof Error && error.message.startsWith("pi settings.json ")) throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new Error("pi settings.json 不可读取");
+    }
   }
+  const { packages: _packages, ...projectedSettings } = settings;
   const agentDir = join(promptDir, "agent");
   mkdirSync(agentDir, { mode: 0o700 });
   writeFileSync(
     join(agentDir, "settings.json"),
     JSON.stringify({
-      ...settings,
+      ...projectedSettings,
       compaction: { ...(isRecord(settings.compaction) ? settings.compaction : {}), enabled: false },
     }),
     { flag: "wx", mode: 0o600 },
@@ -580,6 +603,12 @@ export function splitModelId(model: string): { provider: string; model: string }
   const slash = model.indexOf("/");
   if (slash <= 0 || slash === model.length - 1) return { provider: "", model };
   return { provider: model.slice(0, slash), model: model.slice(slash + 1) };
+}
+
+/** 这个 `provider/model` 能不能走 pi 的 API key 通道：provider 必须在上面那张密钥变量表里。 */
+export function piApiKeyModelSupported(model: string): boolean {
+  const { provider } = splitModelId(model);
+  return provider.length > 0 && Object.hasOwn(PROVIDER_SECRET_ENV, provider);
 }
 
 /**

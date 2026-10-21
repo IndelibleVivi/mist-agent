@@ -14,6 +14,9 @@ import { type ScopeActivation, ScopeInactiveError, ScopeRegistry } from "./scope
  * - 代际归窗，不归住户；住户级不存在「当前代际」。
  * - `kill(windowId)` 幂等归档，归档后只读；`killResident` 才杀全部活窗。
  * - 派发回执同时绑定 scopeId/scopeGeneration 与 windowId/generation。
+ * - 宿主重启后，journal 里只有 opened、没有 archived 的最新代视为已停止：按同一 windowId
+ *   重开就发下一代。唯一的例外是宿主显式接回一代**暂停**的窗（`resumePaused`，#234）——
+ *   终端正常退出是窗暂停，不是关窗归档；接回不发新代号、不写 journal。
  */
 
 /** 缺省 scope 是私聊，任何路径都不得默认「全局」。 */
@@ -415,7 +418,8 @@ export class SessionRegistry<TContext> {
    * 两窗皆活；旧语义「重复 open 原地换代」不再存在（MV-A01）。
    * 给 windowId 时是按同一身份重开一扇已停止的窗，起新一代（#66 B5）。同一进程的
    * 活窗不能重开；宿主重启后，journal 中只有 opened 但没有 archived 的最新代也视为已停止，
-   * 继续发下一代而不复活旧 active context。
+   * 继续发下一代而不复活旧 active context——除非宿主先用 `resumePaused` 显式接回那一代
+   * 暂停的窗（#234），本方法本身永远发新代。
    */
   open(residentId: string, options: OpenOptions<TContext>): ActiveWindow<TContext> {
     const scopeId = options.scopeId ?? PRIVATE_SCOPE;
@@ -462,6 +466,53 @@ export class SessionRegistry<TContext> {
         });
       }
     }
+    return { ...window };
+  }
+
+  /**
+   * 接回一代暂停的窗（#234 主笔裁定 A：终端正常退出是窗暂停，不是关窗归档）。
+   *
+   * 只认 journal 里**最新发出、没有归档**的那一代：住户与 scope 身份对得上、代际就是
+   * 这扇窗发过的最新代、scope 仍在同一 scopeGeneration 上 active、本进程里这扇窗既不活
+   * 也没归档。对得上就把那一代原地放回活窗表——不发新代号、不写 journal、不发开窗通知
+   * （这一代早在开出时登记过）；任何一条对不上都返回 null 且什么都不改，调用方照旧走
+   * `open` 发下一代（D8 三猝死）。「这一代确实是正常暂停的」由宿主的暂停记录担保，
+   * 本方法不判，也判不了。
+   *
+   * 代价：活窗的 headId 不在 journal 里，接回的窗 headId 从 null 起；需要 head 的宿主
+   * 要自己从持久存储读回。
+   */
+  resumePaused(
+    paused: Readonly<WindowOpenedEvent>,
+    context: TContext,
+  ): ActiveWindow<TContext> | null {
+    const { residentId, windowId, scopeId, scopeGeneration, generation } = paused;
+    if (this.#active.has(windowId) || this.#archived.has(windowId)) return null;
+    const identity = this.#windowIdentity.get(windowId);
+    if (
+      identity === undefined ||
+      identity.residentId !== residentId ||
+      identity.scopeId !== scopeId
+    )
+      return null;
+    if (
+      this.#lastGeneration.get(windowId) !== generation ||
+      this.#windowScopeGeneration.get(windowId) !== scopeGeneration
+    )
+      return null;
+    const scope = this.#scopes.get(residentId, scopeId);
+    if (scope?.status !== "active" || scope.scopeGeneration !== scopeGeneration) return null;
+    const window: ActiveWindow<TContext> = {
+      residentId,
+      windowId,
+      scopeId,
+      scopeGeneration,
+      generation,
+      headId: null,
+      context,
+    };
+    this.#active.set(windowId, window);
+    this.recordActivity(windowId);
     return { ...window };
   }
 
